@@ -180,7 +180,7 @@ Debounce is applied on the **periodic checks** (every `CHECK_INTERVAL_SEC`), not
 
 | Issue | Solution |
 |-------|----------|
-| `Failed to read video` | Verify `data/parking_lot_sample.mp4` exists and path is correct |
+| `Failed to read video` | Verify `data/easy1.mp4` exists and path is correct |
 | Slow/laggy video | Implement frame skipping in `main_detection.py` (process every 3rd-5th frame) |
 | Cars detected but spots stay green | Lower IoU threshold to `0.3` if polygons are larger than vehicles |
 

@@ -94,6 +94,28 @@ html, body {
   gap: 4px;
 }
 
+.zoneTitleRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.zoneToggle {
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.zoneToggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
 .zoneTitle {
   font-weight: 700;
 }

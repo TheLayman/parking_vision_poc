@@ -1,2 +1,5 @@
 *.pt
 *.pyc
+*.yaml
+*.jsonl
+*.mp4

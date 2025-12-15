@@ -21,6 +21,7 @@ function humanEvent(e) {
 
 let slots = [];
 let stateById = {};
+let collapsedZones = new Set();
 
 function getSlotStatus(slotId) {
   const raw = stateById[slotId] || "FREE";
@@ -79,24 +80,49 @@ function renderZoneSections(zones) {
   const zoneKeys = Object.keys(zones || {}).sort();
   for (const zoneKey of zoneKeys) {
     const z = zones[zoneKey];
+    const isCollapsed = collapsedZones.has(zoneKey);
 
     const section = document.createElement("section");
     section.className = "zoneSection";
+    if (isCollapsed) section.classList.add("collapsed");
 
     const header = document.createElement("div");
     header.className = "zoneHeader";
+
+    const titleRow = document.createElement("div");
+    titleRow.className = "zoneTitleRow";
+
+    const toggle = document.createElement("button");
+    toggle.className = "zoneToggle";
+    toggle.type = "button";
+    toggle.setAttribute("aria-label", isCollapsed ? `Expand Zone ${zoneKey}` : `Collapse Zone ${zoneKey}`);
+    toggle.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+    toggle.textContent = isCollapsed ? "▸" : "▾";
+    toggle.addEventListener("click", () => {
+      if (collapsedZones.has(zoneKey)) collapsedZones.delete(zoneKey);
+      else collapsedZones.add(zoneKey);
+      refreshLayout();
+    });
 
     const title = document.createElement("div");
     title.className = "zoneTitle";
     title.textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
 
+    titleRow.appendChild(toggle);
+    titleRow.appendChild(title);
+
     const subtitle = document.createElement("div");
     subtitle.className = "zoneSubtitle";
     subtitle.textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
 
-    header.appendChild(title);
+    header.appendChild(titleRow);
     header.appendChild(subtitle);
     section.appendChild(header);
+
+    if (isCollapsed) {
+      container.appendChild(section);
+      continue;
+    }
 
     const grid = document.createElement("div");
     grid.className = "zoneSlotGrid";
