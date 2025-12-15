@@ -1,0 +1,191 @@
+* { box-sizing: border-box; }
+
+:root {
+  --bg: #0b0f19;
+  --panel: #121a2a;
+  --text: #e7eefc;
+  --muted: #a6b3cf;
+  --border: #22304b;
+
+  --free: #1f9d55;
+  --occupied: #d64545;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(18, 26, 42, 0.85);
+}
+
+.title {
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.summary {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  gap: 12px;
+  padding: 12px;
+  height: calc(100% - 50px);
+}
+
+.gridPane, .sidePane {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.gridPane {
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.zoneBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.zoneChip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.zoneSections {
+  padding: 10px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+}
+
+.zoneSection {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.zoneHeader {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 4px;
+}
+
+.zoneTitle {
+  font-weight: 700;
+}
+
+.zoneSubtitle {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.zoneSlotGrid {
+  --cols: 4;
+  display: grid;
+  grid-template-columns: repeat(var(--cols), minmax(120px, 1fr));
+  gap: 10px;
+  padding: 10px;
+}
+
+.slot {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+  min-height: 76px;
+}
+
+.slot.free { background: rgba(31, 157, 85, 0.18); }
+.slot.occupied { background: rgba(214, 69, 69, 0.18); }
+
+.slotTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.slotName {
+  font-weight: 700;
+}
+
+.slotMeta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.slotState {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.sidePane {
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.sideHeader {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sideTitle {
+  font-weight: 700;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.logList {
+  padding: 10px 12px;
+  overflow: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.logItem {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.logLine {
+  font-size: 13px;
+}
+
+.logTs {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}

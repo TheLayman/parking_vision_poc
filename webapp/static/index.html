@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parking Vision Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title">Parking Dashboard</div>
+      <div class="summary" id="summary"></div>
+    </header>
+
+    <main class="layout">
+      <section class="gridPane">
+        <div class="zoneBar" id="zoneBar"></div>
+        <div class="zoneSections" id="zoneSections"></div>
+      </section>
+
+      <aside class="sidePane">
+        <div class="sideHeader">
+          <div class="sideTitle">Change Log</div>
+          <div class="hint">Newest first</div>
+        </div>
+        <div class="logList" id="logList"></div>
+      </aside>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,35 @@
+# Optional metadata for dashboard (setup_zones.py does not touch this file)
+# You can change zones/names without redrawing polygons.
+- id: 1
+  name: A01
+  zone: A
+- id: 2
+  name: A02
+  zone: A
+- id: 3
+  name: A03
+  zone: A
+- id: 4
+  name: A04
+  zone: A
+- id: 5
+  name: A05
+  zone: A
+- id: 6
+  name: B06
+  zone: B
+- id: 7
+  name: B07
+  zone: B
+- id: 8
+  name: B08
+  zone: B
+- id: 9
+  name: C09
+  zone: C
+- id: 10
+  name: C10
+  zone: C
+- id: 11
+  name: C11
+  zone: C
