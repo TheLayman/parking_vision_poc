@@ -6,7 +6,7 @@ import numpy as np
 drawing = False
 current_points = []
 all_polygons = []
-video_path = 'data/easy1.mp4' 
+video_path = 'data/easy1.mp4'
 config_path = 'config/parking_slots.yaml'
 
 def draw_polygon(event, x, y, flags, param):

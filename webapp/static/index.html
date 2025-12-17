@@ -5,10 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Parking Vision Dashboard</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   </head>
   <body>
     <header class="topbar">
-      <div class="title">Parking Dashboard</div>
+      <div class="title">
+        <svg class="logo-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+          <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+          <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+          <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+        </svg>
+        Parking Vision
+      </div>
       <div class="summary" id="summary"></div>
     </header>
 
