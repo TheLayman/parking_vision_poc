@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import yaml
+import threading
+import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,12 +16,145 @@ from fastapi.staticfiles import StaticFiles
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent
 
-PARKING_SLOTS_PATH = REPO_ROOT / "config" / "parking_slots.yaml"
 SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
 EVENT_LOG_PATH = REPO_ROOT / "data" / "occupancy_events.jsonl"
+EXTERNAL_API_URL = "http://localhost:3000/slots"
 
 app = FastAPI(title="Parking Vision Dashboard")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
+
+def poll_external_api():
+    """Background task to poll external API (simulated via data.txt) and log events."""
+    data_file_path = REPO_ROOT / "data.txt"
+    previous_states: Dict[int, str] = {}
+    
+    while True:
+        try:
+            # Simulate API call by reading local file
+            if data_file_path.exists():
+                with open(data_file_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                
+                if content:
+                    try:
+                        data = json.loads(content)
+                        # Expected format: [{"id": 1, "unique_id": "slot_7", "status": "{\"r\":0,\"y\":0,\"b\":0}"}]
+                        
+                        occupied_ids = []
+                        # Reload slot ids to ensure we have current config
+                        current_slots = load_slot_ids()
+                        
+                        for item in data:
+                            try:
+                                # Extract slot ID
+                                slot_id = item.get("id")
+                                if slot_id is None:
+                                    continue
+                                slot_id = int(slot_id)
+                                
+                                # Extract status
+                                status_str = item.get("status")
+                                if not status_str:
+                                    continue
+                                
+                                # Parse nested JSON
+                                status = json.loads(status_str)
+                                r = status.get("r", 0)
+                                y = status.get("y", 0)
+                                b = status.get("b", 0)
+                                
+                                # Logic: if r,y,b are 1 -> occupied. else -> free (defaulting to free for 0,0,0)
+                                # Explicit check for occupied state:
+                                if r == 1 and y == 1 and b == 1:
+                                    occupied_ids.append(slot_id)
+                            except Exception as e:
+                                print(f"Error parsing item: {e}")
+                                continue
+                        
+                        meta_by_id = load_slot_meta_by_id()
+                        all_configured_ids = load_slot_ids()
+                        
+                        # Calculate current states
+                        current_states = {}
+                        for sid in all_configured_ids:
+                            current_states[sid] = "OCCUPIED" if sid in occupied_ids else "FREE"
+
+                        # Detect changes
+                        events_to_log = []
+                        timestamp = datetime.now(timezone.utc).isoformat()
+                        
+                        for sid, state in current_states.items():
+                            prev_state = previous_states.get(sid)
+                            if prev_state and prev_state != state:
+                                # State changed
+                                meta = meta_by_id.get(sid, {})
+                                change_event = {
+                                    "event": "slot_state_changed",
+                                    "ts": timestamp,
+                                    "slot_id": sid,
+                                    "slot_name": meta.get("name", str(sid)),
+                                    "zone": meta.get("zone", "A"),
+                                    "prev_state": prev_state,
+                                    "new_state": state
+                                }
+                                events_to_log.append(change_event)
+                        
+                        # Update previous states
+                        previous_states = current_states.copy()
+
+                        # Calculate metrics
+                        zones_stats = {}
+                        total_count = len(all_configured_ids)
+                        free_count = 0
+                        
+                        for sid in all_configured_ids:
+                            is_occupied = sid in occupied_ids
+                            # Get zone
+                            meta = meta_by_id.get(sid, {})
+                            zone = meta.get("zone", "A")
+                            
+                            if zone not in zones_stats:
+                                zones_stats[zone] = {"total": 0, "free": 0, "occupied": 0}
+                            
+                            zones_stats[zone]["total"] += 1
+                            if is_occupied:
+                                zones_stats[zone]["occupied"] += 1
+                            else:
+                                zones_stats[zone]["free"] += 1
+                                free_count += 1
+
+                        snapshot_event = {
+                            "event": "snapshot",
+                            "ts": timestamp,
+                            "occupied_ids": occupied_ids,
+                            "zone_stats": zones_stats,
+                            "total_count": total_count,
+                            "free_count": free_count
+                        }
+                        events_to_log.append(snapshot_event)
+                        
+                        # Append to log
+                        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                            for evt in events_to_log:
+                                f.write(json.dumps(evt) + "\n")
+                            
+                    except json.JSONDecodeError:
+                        print(f"Error decoding JSON from {data_file_path}")
+                else:
+                    print(f"File {data_file_path} is empty")
+            else:
+                print(f"File {data_file_path} not found")
+                
+        except Exception as e:
+            print(f"Error polling data source: {e}")
+            
+        time.sleep(10)
+
+
+@app.on_event("startup")
+def start_polling():
+    thread = threading.Thread(target=poll_external_api, daemon=True)
+    thread.start()
 
 
 def _load_yaml(path: Path):
@@ -30,16 +165,8 @@ def _load_yaml(path: Path):
 
 
 def load_slot_ids() -> List[int]:
-    data = _load_yaml(PARKING_SLOTS_PATH) or []
-    slot_ids: List[int] = []
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict) and "id" in item:
-                try:
-                    slot_ids.append(int(item["id"]))
-                except Exception:
-                    pass
-    return sorted(set(slot_ids))
+    meta = load_slot_meta_by_id()
+    return sorted(meta.keys())
 
 
 def load_slot_meta_by_id() -> Dict[int, dict]:
@@ -85,6 +212,7 @@ def build_state_from_log(
     max_events: int = 200,
 ) -> dict:
     state_by_id: Dict[int, str] = {slot_id: "FREE" for slot_id in slot_ids}
+    since_by_id: Dict[int, str] = {slot_id: "" for slot_id in slot_ids}
     last_events: List[dict] = []
 
     if EVENT_LOG_PATH.exists():
@@ -99,10 +227,23 @@ def build_state_from_log(
                     continue
 
                 event_type = obj.get("event")
+                ts = obj.get("ts", "")
+                
                 if event_type == "snapshot":
                     occupied_ids = set(obj.get("occupied_ids") or [])
                     for slot_id in slot_ids:
-                        state_by_id[slot_id] = "OCCUPIED" if slot_id in occupied_ids else "FREE"
+                        new_state = "OCCUPIED" if slot_id in occupied_ids else "FREE"
+                        if state_by_id[slot_id] != new_state:
+                             # If state changed abruptly via snapshot (e.g. restart), update since time
+                             # Note: Ideally snapshot shouldn't be the primary source of truth for change times 
+                             # if we rely on state_changed events, but for robustness we update.
+                             # However, based on user request "update for every state change", 
+                             # strict adherence to change events is better.
+                             # Let's trust the snapshot for state but maybe not update 'since' unless we have to?
+                             # Actually, if we miss an event, snapshot corrects the state.
+                             # We should update 'since' if the state flips.
+                             since_by_id[slot_id] = ts
+                        state_by_id[slot_id] = new_state
                 elif event_type == "slot_state_changed":
                     try:
                         slot_id = int(obj.get("slot_id"))
@@ -110,6 +251,7 @@ def build_state_from_log(
                         continue
                     if slot_id in state_by_id and obj.get("new_state") in ("FREE", "OCCUPIED"):
                         state_by_id[slot_id] = obj["new_state"]
+                        since_by_id[slot_id] = ts
 
                 if event_type in ("slot_state_changed",):
                     last_events.append(obj)
@@ -135,6 +277,7 @@ def build_state_from_log(
     return {
         "slots": slots,
         "state_by_id": state_by_id,
+        "since_by_id": since_by_id,
         "zones": zones,
         "free_count": free_count,
         "total_count": len(slot_ids),

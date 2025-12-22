@@ -2,7 +2,7 @@ function fmtTs(ts) {
   try {
     const d = new Date(ts);
     if (!isNaN(d.getTime())) return d.toLocaleString();
-  } catch {}
+  } catch { }
   return String(ts || "");
 }
 
@@ -25,12 +25,12 @@ function switchTab(tabId) {
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tabId);
   });
-  
+
   // Update tab content
   document.querySelectorAll('.tab-content').forEach(content => {
     content.classList.toggle('active', content.id === `${tabId}-tab`);
   });
-  
+
   // Load analytics data when switching to analytics tab
   if (tabId === 'analytics') {
     loadAnalytics();
@@ -78,26 +78,26 @@ const chartDefaults = {
 
 async function loadAnalytics() {
   const range = document.getElementById('timeRange')?.value || '24h';
-  
+
   try {
     const res = await fetch(`/analytics/summary?range=${range}`);
     const data = await res.json();
-    
+
     const hasData = data.occupancy_series && data.occupancy_series.length > 0;
-    
+
     // Show/hide empty state
     document.querySelector('.analytics-grid').style.display = hasData ? 'grid' : 'none';
     document.querySelector('.stats-row').style.display = hasData ? 'grid' : 'none';
     document.getElementById('analyticsEmpty').style.display = hasData ? 'none' : 'flex';
-    
+
     if (!hasData) return;
-    
+
     renderOccupancyChart(data.occupancy_series);
     renderDwellChart(data.dwell_stats);
     renderPredictionChart(data.predictions, data.current_occupancy);
     renderStatsRow(data);
     renderPredictionsGrid(data.predictions, data.current_occupancy);
-    
+
   } catch (err) {
     console.error('Failed to load analytics:', err);
   }
@@ -106,18 +106,18 @@ async function loadAnalytics() {
 function renderOccupancyChart(series) {
   const ctx = document.getElementById('occupancyChart')?.getContext('2d');
   if (!ctx) return;
-  
+
   // Destroy existing chart
   if (occupancyChart) {
     occupancyChart.destroy();
   }
-  
+
   // Get all zones from data
   const zones = new Set();
   series.forEach(entry => {
     Object.keys(entry.zones).forEach(z => zones.add(z));
   });
-  
+
   // Build datasets
   const datasets = Array.from(zones).sort().map(zone => {
     const color = getZoneColor(zone);
@@ -130,13 +130,13 @@ function renderOccupancyChart(series) {
       tension: 0.3
     };
   });
-  
+
   // Format time labels
   const labels = series.map(entry => {
     const d = new Date(entry.time);
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   });
-  
+
   occupancyChart = new Chart(ctx, {
     type: 'line',
     data: { labels, datasets },
@@ -165,15 +165,15 @@ function renderOccupancyChart(series) {
 function renderDwellChart(dwellStats) {
   const ctx = document.getElementById('dwellChart')?.getContext('2d');
   if (!ctx) return;
-  
+
   if (dwellChart) {
     dwellChart.destroy();
   }
-  
+
   const zones = Object.keys(dwellStats).sort();
   const values = zones.map(z => dwellStats[z]);
   const colors = zones.map(z => getZoneColor(z));
-  
+
   dwellChart = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -210,16 +210,16 @@ function renderDwellChart(dwellStats) {
 function renderPredictionChart(predictions, currentOccupancy) {
   const ctx = document.getElementById('predictionChart')?.getContext('2d');
   if (!ctx) return;
-  
+
   if (predictionChart) {
     predictionChart.destroy();
   }
-  
+
   const zones = Object.keys(predictions).sort();
   const predictedValues = zones.map(z => predictions[z]);
   const currentValues = zones.map(z => currentOccupancy[z]?.percent || 0);
   const colors = zones.map(z => getZoneColor(z));
-  
+
   predictionChart = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -262,7 +262,7 @@ function renderPredictionChart(predictions, currentOccupancy) {
 
 function renderStatsRow(data) {
   const { summary, current_occupancy, dwell_stats } = data;
-  
+
   // Calculate overall stats
   let totalOccupied = 0;
   let totalSlots = 0;
@@ -270,15 +270,15 @@ function renderStatsRow(data) {
     totalOccupied += z.occupied || 0;
     totalSlots += z.total || 0;
   });
-  
+
   const overallPct = totalSlots > 0 ? ((totalOccupied / totalSlots) * 100).toFixed(1) : 0;
-  
+
   // Average dwell time across all zones
   const dwellValues = Object.values(dwell_stats || {});
-  const avgDwell = dwellValues.length > 0 
+  const avgDwell = dwellValues.length > 0
     ? (dwellValues.reduce((a, b) => a + b, 0) / dwellValues.length).toFixed(1)
     : '--';
-  
+
   // Update stat cards
   document.getElementById('statOccupancy').textContent = `${overallPct}%`;
   document.getElementById('statDwell').textContent = avgDwell !== '--' ? `${avgDwell} min` : '--';
@@ -289,14 +289,14 @@ function renderStatsRow(data) {
 function renderPredictionsGrid(predictions, currentOccupancy) {
   const container = document.getElementById('predictionsGrid');
   if (!container) return;
-  
+
   const zones = Object.keys(predictions || {}).sort();
-  
+
   if (zones.length === 0) {
     container.innerHTML = '<div class="prediction-loading">Not enough data for predictions yet</div>';
     return;
   }
-  
+
   const html = zones.map(zone => {
     const current = currentOccupancy[zone]?.percent || 0;
     const predicted = predictions[zone] || 0;
@@ -305,7 +305,7 @@ function renderPredictionsGrid(predictions, currentOccupancy) {
     const trendIcon = diff > 2 ? '↑' : diff < -2 ? '↓' : '→';
     const trendText = diff > 2 ? 'Rising' : diff < -2 ? 'Falling' : 'Stable';
     const color = getZoneColor(zone);
-    
+
     return `
       <div class="prediction-card" style="border-left: 3px solid ${color.border}">
         <div class="prediction-header">
@@ -326,12 +326,13 @@ function renderPredictionsGrid(predictions, currentOccupancy) {
       </div>
     `;
   }).join('');
-  
+
   container.innerHTML = html;
 }
 
 let slots = [];
 let stateById = {};
+let sinceById = {};
 let collapsedZones = new Set();
 
 function getSlotStatus(slotId) {
@@ -466,7 +467,19 @@ function renderZoneSections(zones) {
 
       const meta = document.createElement("div");
       meta.className = "slotMeta";
-      meta.textContent = `id ${s.id}`;
+
+      const sinceTs = sinceById[s.id];
+      let sinceText = "";
+      if (sinceTs) {
+        try {
+          const d = new Date(sinceTs);
+          if (!isNaN(d.getTime())) {
+            sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          }
+        } catch { }
+      }
+
+      meta.innerHTML = sinceText;
 
       tile.appendChild(top);
       tile.appendChild(meta);
@@ -512,10 +525,11 @@ async function init() {
 
   slots = (data.slots || []).slice().sort((a, b) => a.id - b.id);
   stateById = data.state_by_id || {};
+  sinceById = data.since_by_id || {};
 
   refreshLayout();
 
-  const recent = (data.recent_events || []).slice().reverse();
+  const recent = (data.recent_events || []).slice();
   for (const e of recent) {
     prependLog(e);
   }
@@ -536,9 +550,13 @@ async function init() {
       if (obj.event === "slot_state_changed") {
         if (typeof obj.slot_id === "number") {
           stateById[obj.slot_id] = obj.new_state;
+          sinceById[obj.slot_id] = obj.ts;
         } else {
           const id = Number(obj.slot_id);
-          if (!isNaN(id)) stateById[id] = obj.new_state;
+          if (!isNaN(id)) {
+            stateById[id] = obj.new_state;
+            sinceById[id] = obj.ts;
+          }
         }
         refreshLayout();
         prependLog(obj);
