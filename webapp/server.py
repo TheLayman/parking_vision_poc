@@ -18,135 +18,147 @@ REPO_ROOT = APP_ROOT.parent
 
 SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
 EVENT_LOG_PATH = REPO_ROOT / "data" / "occupancy_events.jsonl"
-EXTERNAL_API_URL = "http://localhost:3000/slots"
 
 app = FastAPI(title="Parking Vision Dashboard")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
+import os
+
+# ... (API constants)
+API_URL = os.getenv("PARKING_API_URL", "http://localhost:3000/slots")
+API_TOKEN = os.getenv("PARKING_API_TOKEN", "")
+
 def poll_external_api():
-    """Background task to poll external API (simulated via data.txt) and log events."""
-    data_file_path = REPO_ROOT / "data.txt"
+    """Background task to poll external API and log events."""
     previous_states: Dict[int, str] = {}
     
+    print(f"Starting poller. Target: {API_URL}")
+    if not API_TOKEN:
+        print("WARNING: No PARKING_API_TOKEN set. Requests might fail if auth is required.")
+
     while True:
         try:
-            # Simulate API call by reading local file
-            if data_file_path.exists():
-                with open(data_file_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                
-                if content:
-                    try:
-                        data = json.loads(content)
-                        # Expected format: [{"id": 1, "unique_id": "slot_7", "status": "{\"r\":0,\"y\":0,\"b\":0}"}]
-                        
-                        occupied_ids = []
-                        # Reload slot ids to ensure we have current config
-                        current_slots = load_slot_ids()
-                        
-                        for item in data:
-                            try:
-                                # Extract slot ID
-                                slot_id = item.get("id")
-                                if slot_id is None:
-                                    continue
-                                slot_id = int(slot_id)
-                                
-                                # Extract status
-                                status_str = item.get("status")
-                                if not status_str:
-                                    continue
-                                
-                                # Parse nested JSON
-                                status = json.loads(status_str)
-                                r = status.get("r", 0)
-                                y = status.get("y", 0)
-                                b = status.get("b", 0)
-                                
-                                # Logic: if r,y,b are 1 -> occupied. else -> free (defaulting to free for 0,0,0)
-                                # Explicit check for occupied state:
-                                if r == 1 and y == 1 and b == 1:
-                                    occupied_ids.append(slot_id)
-                            except Exception as e:
-                                print(f"Error parsing item: {e}")
+            headers = {}
+            if API_TOKEN:
+                headers["Authorization"] = f"Bearer {API_TOKEN}"
+
+            response = requests.get(API_URL, headers=headers, timeout=5)
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    occupied_ids = []
+                    # Reload slot ids to ensure we have current config
+                    current_slots = load_slot_ids()
+                    
+                    for item in data:
+                        try:
+                            # Extract slot ID
+                            slot_id = item.get("id")
+                            if slot_id is None:
                                 continue
-                        
-                        meta_by_id = load_slot_meta_by_id()
-                        all_configured_ids = load_slot_ids()
-                        
-                        # Calculate current states
-                        current_states = {}
-                        for sid in all_configured_ids:
-                            current_states[sid] = "OCCUPIED" if sid in occupied_ids else "FREE"
-
-                        # Detect changes
-                        events_to_log = []
-                        timestamp = datetime.now(timezone.utc).isoformat()
-                        
-                        for sid, state in current_states.items():
-                            prev_state = previous_states.get(sid)
-                            if prev_state and prev_state != state:
-                                # State changed
-                                meta = meta_by_id.get(sid, {})
-                                change_event = {
-                                    "event": "slot_state_changed",
-                                    "ts": timestamp,
-                                    "slot_id": sid,
-                                    "slot_name": meta.get("name", str(sid)),
-                                    "zone": meta.get("zone", "A"),
-                                    "prev_state": prev_state,
-                                    "new_state": state
-                                }
-                                events_to_log.append(change_event)
-                        
-                        # Update previous states
-                        previous_states = current_states.copy()
-
-                        # Calculate metrics
-                        zones_stats = {}
-                        total_count = len(all_configured_ids)
-                        free_count = 0
-                        
-                        for sid in all_configured_ids:
-                            is_occupied = sid in occupied_ids
-                            # Get zone
-                            meta = meta_by_id.get(sid, {})
-                            zone = meta.get("zone", "A")
+                            slot_id = int(slot_id)
                             
-                            if zone not in zones_stats:
-                                zones_stats[zone] = {"total": 0, "free": 0, "occupied": 0}
+                            # Extract status
+                            status_str = item.get("status")
+                            if not status_str:
+                                continue
                             
-                            zones_stats[zone]["total"] += 1
-                            if is_occupied:
-                                zones_stats[zone]["occupied"] += 1
+                            # Parse nested JSON
+                            # The external API matches the legacy data.txt format: status is a stringified JSON
+                            if isinstance(status_str, str):
+                                status = json.loads(status_str)
                             else:
-                                zones_stats[zone]["free"] += 1
-                                free_count += 1
-
-                        snapshot_event = {
-                            "event": "snapshot",
-                            "ts": timestamp,
-                            "occupied_ids": occupied_ids,
-                            "zone_stats": zones_stats,
-                            "total_count": total_count,
-                            "free_count": free_count
-                        }
-                        events_to_log.append(snapshot_event)
-                        
-                        # Append to log
-                        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-                            for evt in events_to_log:
-                                f.write(json.dumps(evt) + "\n")
+                                status = status_str # auto-handled if already dict relative to upstream
                             
-                    except json.JSONDecodeError:
-                        print(f"Error decoding JSON from {data_file_path}")
-                else:
-                    print(f"File {data_file_path} is empty")
+                            r = status.get("r", 0)
+                            y = status.get("y", 0)
+                            b = status.get("b", 0)
+                            
+                            # Logic: if r,y,b are 1 -> occupied. else -> free (defaulting to free for 0,0,0)
+                            # Explicit check for occupied state:
+                            if r == 1 and y == 1 and b == 1:
+                                occupied_ids.append(slot_id)
+                        except Exception as e:
+                            print(f"Error parsing item: {e}")
+                            continue
+                    
+                    meta_by_id = load_slot_meta_by_id()
+                    all_configured_ids = load_slot_ids()
+                    
+                    # Calculate current states
+                    current_states = {}
+                    for sid in all_configured_ids:
+                        current_states[sid] = "OCCUPIED" if sid in occupied_ids else "FREE"
+
+                    # Detect changes
+                    events_to_log = []
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    
+                    for sid, state in current_states.items():
+                        prev_state = previous_states.get(sid)
+                        if prev_state and prev_state != state:
+                            # State changed
+                            meta = meta_by_id.get(sid, {})
+                            change_event = {
+                                "event": "slot_state_changed",
+                                "ts": timestamp,
+                                "slot_id": sid,
+                                "slot_name": meta.get("name", str(sid)),
+                                "zone": meta.get("zone", "A"),
+                                "prev_state": prev_state,
+                                "new_state": state
+                            }
+                            events_to_log.append(change_event)
+                    
+                    # Update previous states
+                    previous_states = current_states.copy()
+
+                    # Calculate metrics
+                    zones_stats = {}
+                    total_count = len(all_configured_ids)
+                    free_count = 0
+                    
+                    for sid in all_configured_ids:
+                        is_occupied = sid in occupied_ids
+                        # Get zone
+                        meta = meta_by_id.get(sid, {})
+                        zone = meta.get("zone", "A")
+                        
+                        if zone not in zones_stats:
+                            zones_stats[zone] = {"total": 0, "free": 0, "occupied": 0}
+                        
+                        zones_stats[zone]["total"] += 1
+                        if is_occupied:
+                            zones_stats[zone]["occupied"] += 1
+                        else:
+                            zones_stats[zone]["free"] += 1
+                            free_count += 1
+
+                    snapshot_event = {
+                        "event": "snapshot",
+                        "ts": timestamp,
+                        "occupied_ids": occupied_ids,
+                        "zone_stats": zones_stats,
+                        "total_count": total_count,
+                        "free_count": free_count
+                    }
+                    events_to_log.append(snapshot_event)
+                    
+                    # Append to log
+                    with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                        for evt in events_to_log:
+                            f.write(json.dumps(evt) + "\n")
+                            
+                except json.JSONDecodeError:
+                    print(f"Error decoding JSON response from {API_URL}")
             else:
-                print(f"File {data_file_path} not found")
+                print(f"External API returned status {response.status_code}")
                 
+        except requests.exceptions.RequestException as e:
+            print(f"Error connecting to external API: {e}")
         except Exception as e:
-            print(f"Error polling data source: {e}")
+             print(f"Error in polling loop: {e}")
             
         time.sleep(10)
 
