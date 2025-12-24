@@ -1,42 +1,70 @@
 from __future__ import annotations
-
 import json
-import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
-
+from typing import Dict, List
 import yaml
 import threading
 import requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+
+import math
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent
 
 SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
 EVENT_LOG_PATH = REPO_ROOT / "data" / "occupancy_events.jsonl"
+SNAPSHOT_PATH = REPO_ROOT / "data" / "snapshot.yaml"
+
+# Occupancy detection settings
+DISTANCE_THRESHOLD = 7.5  # Magnetic field distance threshold
+CONSECUTIVE_COUNT_REQUIRED = 3  # Number of consecutive readings to confirm state
 
 app = FastAPI(title="Parking Vision Dashboard")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
-import os
+_shutdown_event = threading.Event()
+
+# Snapshot data lock for thread-safe access
+_snapshot_lock = threading.Lock()
+
+def load_snapshot_data() -> dict:
+    """Load snapshot data from YAML file."""
+    if not SNAPSHOT_PATH.exists():
+        return {"slots": {}}
+    with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data if data else {"slots": {}}
+
+def save_snapshot_data(data: dict):
+    """Save snapshot data to YAML file."""
+    SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, default_flow_style=False)
+
+def calculate_distance(x, y, z, bx, by, bz) -> float:
+    """Calculate Euclidean distance between current and baseline magnetic field vectors."""
+    return math.sqrt((x - bx) ** 2 + (y - by) ** 2 + (z - bz) ** 2)
 
 # ... (API constants)
-API_URL = os.getenv("PARKING_API_URL", "http://localhost:3000/slots")
-API_TOKEN = os.getenv("PARKING_API_TOKEN", "")
+API_URL = "http://localhost:8000/slots"
+API_TOKEN = ""
+ENABLE_POLLING = 1
 
-def poll_external_api():
+def poll_external_api(): 
     """Background task to poll external API and log events."""
-    previous_states: Dict[int, str] = {}
+    previous_states: Dict[int, str] = {} 
     
     print(f"Starting poller. Target: {API_URL}")
     if not API_TOKEN:
         print("WARNING: No PARKING_API_TOKEN set. Requests might fail if auth is required.")
 
-    while True:
+    while not _shutdown_event.is_set():
         try:
             headers = {}
             if API_TOKEN:
@@ -48,8 +76,10 @@ def poll_external_api():
                 try:
                     data = response.json()
                     occupied_ids = []
-                    # Reload slot ids to ensure we have current config
-                    current_slots = load_slot_ids()
+                    
+                    with _snapshot_lock:
+                        snapshot_data = load_snapshot_data()
+                        slots_snapshot = snapshot_data.get("slots", {})
                     
                     for item in data:
                         try:
@@ -59,29 +89,85 @@ def poll_external_api():
                                 continue
                             slot_id = int(slot_id)
                             
-                            # Extract status
+                            # Extract status with magnetic field data
                             status_str = item.get("status")
                             if not status_str:
                                 continue
                             
                             # Parse nested JSON
-                            # The external API matches the legacy data.txt format: status is a stringified JSON
                             if isinstance(status_str, str):
                                 status = json.loads(status_str)
                             else:
-                                status = status_str # auto-handled if already dict relative to upstream
+                                status = status_str
                             
-                            r = status.get("r", 0)
-                            y = status.get("y", 0)
-                            b = status.get("b", 0)
+                            # Get r,y,b magnetic field values
+                            r = float(status.get("r", 0))
+                            y = float(status.get("y", 0))
+                            b = float(status.get("b", 0))
                             
-                            # Logic: if r,y,b are 1 -> occupied. else -> free (defaulting to free for 0,0,0)
-                            # Explicit check for occupied state:
-                            if r == 1 and y == 1 and b == 1:
-                                occupied_ids.append(slot_id)
+                            # Get slot's baseline from snapshot
+                            slot_key = str(slot_id)
+                            slot_snapshot = slots_snapshot.get(slot_key, {})
+                            
+                            baseline_x = slot_snapshot.get("baseline_x")
+                            baseline_y = slot_snapshot.get("baseline_y")
+                            baseline_z = slot_snapshot.get("baseline_z")
+                            consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
+                            
+                            # Check if timestamp is same as last - skip processing but preserve state
+                            timestamp_ms = item.get("timestamp", 0)
+                            last_timestamp = slot_snapshot.get("last_timestamp", 0)
+                            if timestamp_ms == last_timestamp:
+                                # No new data - preserve current occupied state if threshold was met
+                                if consecutive_occupied >= CONSECUTIVE_COUNT_REQUIRED:
+                                    occupied_ids.append(slot_id)
+                                continue
+                            
+                            slot_snapshot["last_timestamp"] = timestamp_ms
+                            slot_snapshot["last_x"] = r
+                            slot_snapshot["last_y"] = y
+                            slot_snapshot["last_z"] = b
+                            
+                            # Check if baseline is calibrated
+                            if baseline_x is not None and baseline_y is not None and baseline_z is not None:
+                                distance = calculate_distance(r, y, b, baseline_x, baseline_y, baseline_z)
+                                
+                                if distance > DISTANCE_THRESHOLD:
+                                    # Distance exceeds threshold, increment consecutive count
+                                    consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
+                                elif distance <= DISTANCE_THRESHOLD*0.9:
+                                    # Distance within threshold, reset consecutive count
+                                    consecutive_occupied = 0
+                                
+                                slot_snapshot["consecutive_occupied"] = consecutive_occupied
+                                slot_snapshot["last_distance"] = round(distance, 2)
+                                
+                                # If the slot is confirmed FREE (based on threshold), slowly update the baseline
+                                if consecutive_occupied == 0:
+                                    # Learning rate (Alpha) - very slow update
+                                    ALPHA = 0.01
+                                    
+                                    # Update snapshots in memory
+                                    slot_snapshot["baseline_x"] = round(baseline_x * (1 - ALPHA) + r * ALPHA, 2)
+                                    slot_snapshot["baseline_y"] = round(baseline_y * (1 - ALPHA) + y * ALPHA, 2)
+                                    slot_snapshot["baseline_z"] = round(baseline_z * (1 - ALPHA) + b * ALPHA, 2)
+                                
+                                # Occupied if consecutive count reaches threshold
+                                if consecutive_occupied >= CONSECUTIVE_COUNT_REQUIRED:
+                                    occupied_ids.append(slot_id)
+                            else:
+                                # No baseline set, treat as free (uncalibrated)
+                                slot_snapshot["consecutive_occupied"] = 0
+                            
+                            slots_snapshot[slot_key] = slot_snapshot
+                            
                         except Exception as e:
                             print(f"Error parsing item: {e}")
                             continue
+                    
+                    # Save updated snapshot data
+                    with _snapshot_lock:
+                        save_snapshot_data({"slots": slots_snapshot})
                     
                     meta_by_id = load_slot_meta_by_id()
                     all_configured_ids = load_slot_ids()
@@ -135,7 +221,7 @@ def poll_external_api():
                             zones_stats[zone]["free"] += 1
                             free_count += 1
 
-                    snapshot_event = {
+                    snapshot_event = { 
                         "event": "snapshot",
                         "ts": timestamp,
                         "occupied_ids": occupied_ids,
@@ -159,22 +245,35 @@ def poll_external_api():
             print(f"Error connecting to external API: {e}")
         except Exception as e:
              print(f"Error in polling loop: {e}")
-            
-        time.sleep(10)
-
+        
+        # Use wait() instead of sleep() so we can be interrupted
+        _shutdown_event.wait(timeout=5)
+    
+    print("Poller thread shutting down gracefully")
 
 @app.on_event("startup")
 def start_polling():
-    thread = threading.Thread(target=poll_external_api, daemon=True)
-    thread.start()
+    # Clear shutdown event in case it was set from previous run
+    _shutdown_event.clear()
+    
+    if ENABLE_POLLING:
+        print(f"Polling enabled. Starting background thread...")
+        thread = threading.Thread(target=poll_external_api, daemon=True)
+        thread.start()
+    else:
+        print("Polling disabled. Set ENABLE_POLLING=true to enable.")
 
+
+@app.on_event("shutdown")
+def stop_polling():
+    print("Shutting down poller...")
+    _shutdown_event.set()
 
 def _load_yaml(path: Path):
     if not path.exists():
         return None
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
 
 def load_slot_ids() -> List[int]:
     meta = load_slot_meta_by_id()
@@ -246,14 +345,6 @@ def build_state_from_log(
                     for slot_id in slot_ids:
                         new_state = "OCCUPIED" if slot_id in occupied_ids else "FREE"
                         if state_by_id[slot_id] != new_state:
-                             # If state changed abruptly via snapshot (e.g. restart), update since time
-                             # Note: Ideally snapshot shouldn't be the primary source of truth for change times 
-                             # if we rely on state_changed events, but for robustness we update.
-                             # However, based on user request "update for every state change", 
-                             # strict adherence to change events is better.
-                             # Let's trust the snapshot for state but maybe not update 'since' unless we have to?
-                             # Actually, if we miss an event, snapshot corrects the state.
-                             # We should update 'since' if the state flips.
                              since_by_id[slot_id] = ts
                         state_by_id[slot_id] = new_state
                 elif event_type == "slot_state_changed":
@@ -309,26 +400,57 @@ def state():
     return build_state_from_log(slot_ids=slot_ids, meta_by_id=meta_by_id)
 
 
+@app.get("/slots")
+def slots():
+    """
+    Returns slot data from data.txt file.
+    Format matches the external API response.
+    """
+    data_txt_path = REPO_ROOT / "data.txt"
+    
+    if not data_txt_path.exists():
+        return []
+    
+    try:
+        with open(data_txt_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return []
+            data = json.loads(content)
+            return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+    except Exception:
+        return []
+
+
 @app.get("/events")
-def events():
-    def gen():
+async def events(request: Request):
+    async def gen():
         EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         EVENT_LOG_PATH.touch(exist_ok=True)
 
-        with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
-            f.seek(0, 2)  # tail from end
-            while True:
-                line = f.readline()
-                if not line:
-                    time.sleep(0.25)
-                    continue
-                line = line.strip()
-                if not line:
-                    continue
-                yield f"data: {line}\n\n"
+        try:
+            with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
+                f.seek(0, 2)  # tail from end
+                while not _shutdown_event.is_set():
+                    # Check if client disconnected
+                    if await request.is_disconnected():
+                        break
+                        
+                    line = f.readline()
+                    if not line:
+                        await asyncio.sleep(0.1)
+                        continue
+                    line = line.strip()
+                    if not line:
+                        continue
+                    yield f"data: {line}\n\n"
+        except asyncio.CancelledError:
+            # Handle cancellation during shutdown
+            pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
-
 
 @app.get("/analytics/summary")
 def analytics_summary(range: str = Query(default="24h")):
@@ -343,7 +465,7 @@ def analytics_summary(range: str = Query(default="24h")):
     
     # Determine time filter
     now = datetime.now(timezone.utc)
-    time_deltas = {
+    time_deltas = { 
         "1h": timedelta(hours=1),
         "6h": timedelta(hours=6),
         "24h": timedelta(hours=24),
@@ -471,7 +593,7 @@ def analytics_summary(range: str = Query(default="24h")):
     total_snapshots = len(snapshots)
     
     # Current occupancy from latest snapshot
-    current_occupancy = {}
+    current_occupancy = {} 
     if snapshots:
         latest = snapshots[-1]
         zone_stats = latest.get("zone_stats", {})
@@ -498,3 +620,102 @@ def analytics_summary(range: str = Query(default="24h")):
     }
 
 
+@app.get("/snapshot")
+def get_snapshot():
+    """
+    Returns the current snapshot data with baseline values and tracking info.
+    """
+    with _snapshot_lock:
+        snapshot_data = load_snapshot_data()
+    return snapshot_data
+
+
+def _fetch_slot_data(headers: dict) -> list:
+    """Fetch slot data from API (blocking call for use in thread pool)."""
+    response = requests.get(API_URL, headers=headers, timeout=5)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+
+@app.post("/calibrate/{slot_id}")
+async def calibrate_single_slot(slot_id: int):
+    """
+    Calibrate a single slot by taking 5 sample readings and averaging them
+    to establish baseline x,y,z values.
+    """
+    samples_needed = 10
+    sample_interval = 5  # seconds between samples
+    
+    samples: List[dict] = []
+    
+    headers = {}
+    if API_TOKEN:
+        headers["Authorization"] = f"Bearer {API_TOKEN}"
+    
+    loop = asyncio.get_event_loop()
+    
+    for sample_num in range(samples_needed):
+        try:
+            # Run blocking request in thread pool to avoid blocking event loop
+            data = await loop.run_in_executor(None, _fetch_slot_data, headers)
+            
+            for item in data:
+                item_id = item.get("id")
+                if item_id is None or int(item_id) != slot_id:
+                    continue
+                
+                status_str = item.get("status")
+                if not status_str:
+                    continue
+                
+                if isinstance(status_str, str):
+                    status = json.loads(status_str)
+                else:
+                    status = status_str
+                
+                r = float(status.get("r", 0))
+                y = float(status.get("y", 0))
+                b = float(status.get("b", 0))
+                
+                samples.append({"x": r, "y": y, "z": b})
+                break
+            
+            # Wait before next sample (except for last iteration)
+            if sample_num < samples_needed - 1:
+                await asyncio.sleep(sample_interval)
+                
+        except Exception as e:
+            print(f"Error during calibration sample {sample_num + 1}: {e}")
+    
+    if len(samples) == 0:
+        return {"success": False, "message": f"Could not collect samples for slot {slot_id}"}
+    
+    # Calculate averages and save to snapshot
+    avg_x = sum(s["x"] for s in samples) / len(samples)
+    avg_y = sum(s["y"] for s in samples) / len(samples)
+    avg_z = sum(s["z"] for s in samples) / len(samples)
+    
+    with _snapshot_lock:
+        snapshot_data = load_snapshot_data()
+        slots_snapshot = snapshot_data.get("slots", {})
+        
+        slot_key = str(slot_id)
+        if slot_key not in slots_snapshot:
+            slots_snapshot[slot_key] = {}
+        
+        slots_snapshot[slot_key]["baseline_x"] = round(avg_x, 2)
+        slots_snapshot[slot_key]["baseline_y"] = round(avg_y, 2)
+        slots_snapshot[slot_key]["baseline_z"] = round(avg_z, 2)
+        slots_snapshot[slot_key]["consecutive_occupied"] = 0
+        slots_snapshot[slot_key]["calibrated_at"] = datetime.now(timezone.utc).isoformat()
+        
+        save_snapshot_data({"slots": slots_snapshot})
+    
+    return {
+        "success": True,
+        "message": f"Calibrated slot {slot_id} with {len(samples)} samples",
+        "baseline_x": round(avg_x, 2),
+        "baseline_y": round(avg_y, 2),
+        "baseline_z": round(avg_z, 2)
+    }

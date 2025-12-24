@@ -1,6 +1,2 @@
-
-[
-    {"id": 4, "unique_id": "slot_1", "status": "{\"r\":1,\"y\":1,\"b\":1}"},
-    {"id": 5, "unique_id": "slot_2", "status": "{\"r\":1,\"y\":1,\"b\":1}"},
-    {"id": 1, "unique_id": "slot_3", "status": "{\"r\":1,\"y\":1,\"b\":1}"}
-]
+[{"id":2,"unique_id":"1","status":"{\"power\":1,\"r\":-38,\"y\":13,\"b\":25,\"relay\":25}","timestamp":1766561203999,"relay_status":3},
+{"id":1,"unique_id":"2","status":"{\"power\":1,\"r\":30,\"y\":20,\"b\":-35,\"relay\":25}","timestamp":1766561203473,"relay_status":3}]

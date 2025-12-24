@@ -58,6 +58,100 @@ html, body {
   z-index: 100;
 }
 
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+/* Slot calibrate button */
+.slot-calibrate-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 16px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(99, 102, 241, 0.2) 100%);
+  color: var(--accent-bright);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15), 
+              inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  position: relative;
+  overflow: hidden;
+}
+
+.slot-calibrate-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  transition: left 0.5s ease;
+}
+
+.slot-calibrate-btn:hover:not(:disabled)::before {
+  left: 100%;
+}
+
+.slot-calibrate-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.25) 0%, rgba(99, 102, 241, 0.35) 100%);
+  border-color: var(--accent-bright);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3), 
+              0 0 20px rgba(99, 102, 241, 0.15),
+              inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.slot-calibrate-btn:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: 0 1px 4px rgba(99, 102, 241, 0.2);
+}
+
+.slot-calibrate-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(30%);
+}
+
+.slot-calibrate-btn.loading {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(99, 102, 241, 0.3) 100%);
+  pointer-events: none;
+}
+
+.slot-calibrate-btn.success {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.15) 0%, rgba(16, 185, 129, 0.25) 100%);
+  border-color: var(--free);
+  color: var(--free);
+  box-shadow: 0 2px 12px rgba(16, 185, 129, 0.25);
+}
+
+.slot-calibrate-btn.error {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.25) 0%, rgba(239, 68, 68, 0.4) 100%);
+  border-color: #ef4444;
+  color: #fff;
+  box-shadow: 0 2px 16px rgba(239, 68, 68, 0.4);
+}
+
+.slot-calibrate-btn svg.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .title {
   font-weight: 700;
   font-size: 20px;
