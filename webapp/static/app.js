@@ -600,7 +600,7 @@ function renderAlerts(alerts) {
   container.style.display = 'grid';
   emptyState.style.display = 'none';
 
-  const html = alerts.map(alert => {
+  const html = alerts.map((alert, index) => {
     const ts = new Date(alert.ts);
     const timeStr = ts.toLocaleString();
     const stateClass = alert.new_state === 'OCCUPIED' ? 'occupied' : 'free';
@@ -629,7 +629,7 @@ function renderAlerts(alerts) {
     }
 
     return `
-      <div class="alert-card ${stateClass}">
+      <div class="alert-card ${stateClass}" style="--index: ${index}">
         ${imageHtml}
         <div class="alert-content">
           <div class="alert-header">
