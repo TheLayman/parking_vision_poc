@@ -34,9 +34,11 @@ function switchTab(tabId) {
     content.classList.toggle('active', content.id === `${tabId}-tab`);
   });
 
-  // Load analytics data when switching to analytics tab
+  // Load data when switching tabs
   if (tabId === 'analytics') {
     loadAnalytics();
+  } else if (tabId === 'alerts') {
+    loadAlerts();
   }
 }
 
@@ -44,6 +46,10 @@ function switchTab(tabId) {
 let occupancyChart = null;
 let dwellChart = null;
 let predictionChart = null;
+
+// Alerts state
+let alertsCache = [];
+let alertsLoadedOnce = false;
 
 // Zone colors for charts
 const zoneColors = {
@@ -564,6 +570,93 @@ function prependLog(obj) {
   list.insertBefore(item, list.firstChild);
 }
 
+// Alerts functions
+async function loadAlerts() {
+  try {
+    const res = await fetch('/alerts?limit=100');
+    const data = await res.json();
+
+    alertsCache = data.alerts || [];
+    alertsLoadedOnce = true;
+
+    renderAlerts(alertsCache);
+  } catch (err) {
+    console.error('Failed to load alerts:', err);
+    document.getElementById('alertsEmpty').style.display = 'flex';
+    document.getElementById('alertsList').style.display = 'none';
+  }
+}
+
+function renderAlerts(alerts) {
+  const container = document.getElementById('alertsList');
+  const emptyState = document.getElementById('alertsEmpty');
+
+  if (alerts.length === 0) {
+    container.style.display = 'none';
+    emptyState.style.display = 'flex';
+    return;
+  }
+
+  container.style.display = 'grid';
+  emptyState.style.display = 'none';
+
+  const html = alerts.map(alert => {
+    const ts = new Date(alert.ts);
+    const timeStr = ts.toLocaleString();
+    const stateClass = alert.new_state === 'OCCUPIED' ? 'occupied' : 'free';
+    const stateIcon = alert.new_state === 'OCCUPIED' ? '🚗' : '✅';
+
+    // Handle image
+    let imageHtml = '';
+    if (alert.image_path) {
+      const filename = alert.image_path.split('/').pop().split('\\').pop();
+      imageHtml = `
+        <div class="alert-image">
+          <img src="/snapshots/${filename}" alt="Slot ${alert.slot_name}" loading="lazy" />
+        </div>
+      `;
+    } else {
+      imageHtml = `
+        <div class="alert-no-image">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <circle cx="8.5" cy="8.5" r="1.5"/>
+            <polyline points="21 15 16 10 5 21"/>
+          </svg>
+          <span>No image</span>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="alert-card ${stateClass}">
+        ${imageHtml}
+        <div class="alert-content">
+          <div class="alert-header">
+            <span class="alert-icon">${stateIcon}</span>
+            <span class="alert-slot">${alert.slot_name}</span>
+            <span class="alert-zone">Zone ${alert.zone}</span>
+            <span class="alert-state-badge ${stateClass}">${alert.new_state}</span>
+          </div>
+          <div class="alert-details">
+            <div class="alert-transition">
+              <span class="prev-state">${alert.prev_state}</span>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="5" y1="12" x2="19" y2="12"/>
+                <polyline points="12 5 19 12 12 19"/>
+              </svg>
+              <span class="new-state">${alert.new_state}</span>
+            </div>
+            <div class="alert-time">${timeStr}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = html;
+}
+
 async function init() {
   const res = await fetch("/state");
   const data = await res.json();
@@ -605,6 +698,18 @@ async function init() {
         }
         refreshLayout();
         prependLog(obj);
+
+        // Update alerts if loaded
+        if (alertsLoadedOnce) {
+          alertsCache.unshift(obj);
+          alertsCache = alertsCache.slice(0, 100); // Keep only 100 most recent
+
+          // Re-render if alerts tab is active
+          const alertsTab = document.getElementById('alerts-tab');
+          if (alertsTab && alertsTab.classList.contains('active')) {
+            renderAlerts(alertsCache);
+          }
+        }
       }
     } catch (e) {
       // ignore parse errors

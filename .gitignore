@@ -1,5 +1,41 @@
+# Model files
 *.pt
+
+# Python
 *.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Config and data
 *.yaml
 *.jsonl
 *.mp4
+
+# Camera snapshots
+data/camera_snapshots/
+*.jpg
+*.jpeg
+*.png
+
+# Environment variables (sensitive)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log

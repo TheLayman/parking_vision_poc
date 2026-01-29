@@ -25,6 +25,7 @@
         <div class="tab-bar">
           <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
           <button class="tab-btn" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
+          <button class="tab-btn" data-tab="alerts" onclick="switchTab('alerts')">Alerts</button>
         </div>
       </div>
       <div class="summary" id="summary"></div>
@@ -145,6 +146,33 @@
         <div class="empty-icon">📊</div>
         <div class="empty-title">No data for selected range</div>
         <div class="empty-hint">Try selecting a wider time range or wait for more occupancy events.</div>
+      </div>
+    </main>
+
+    <!-- Alerts Tab -->
+    <main class="alerts-tab tab-content" id="alerts-tab">
+      <div class="alerts-header">
+        <div class="alerts-header-left">
+          <h2 class="alerts-title">🚨 Parking Alerts</h2>
+          <p class="alerts-subtitle">Real-time state changes with camera snapshots</p>
+        </div>
+        <div class="alerts-controls">
+          <button class="refresh-btn" onclick="loadAlerts()" title="Refresh alerts">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="alerts-list" id="alertsList">
+        <div class="alerts-loading">Loading alerts...</div>
+      </div>
+
+      <div id="alertsEmpty" class="alerts-empty" style="display: none;">
+        <div class="empty-icon">🚨</div>
+        <div class="empty-title">No alerts yet</div>
+        <div class="empty-hint">State changes will appear here with camera snapshots</div>
       </div>
     </main>
 

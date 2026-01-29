@@ -3,37 +3,49 @@
 - id: 1
   name: A01
   zone: A
+  preset: 2
 - id: 2
   name: A02
   zone: A
+  preset: 3
 - id: 3
   name: A03
   zone: A
+  preset: 3
 - id: 4
   name: A04
   zone: A
+  preset: 4
 - id: 5
   name: A05
   zone: A
+  preset: 5
 - id: 6
   name: B06
   zone: B
+  preset: 6
 - id: 7
   name: B07
   zone: B
+  preset: 7
 - id: 8
   name: B08
   zone: B
+  preset: 8
 - id: 9
   name: C09
   zone: C
+  preset: 9
 - id: 10
   name: C10
   zone: C
+  preset: 10
 - id: 11
   name: C11
   zone: C
+  preset: 11
 - id: 12
   name: C12
   zone: C
+  preset: 12
 
