@@ -17,6 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from requests.auth import HTTPDigestAuth
 from urllib.parse import quote
+from dotenv import load_dotenv
+
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
 
 # Configuration from environment variables
 ENABLE_CAMERA_CONTROL = os.getenv("ENABLE_CAMERA_CONTROL", "false").lower() in ("true", "1", "yes")

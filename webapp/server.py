@@ -222,6 +222,24 @@ def _process_slot_item(item: dict, slots_snapshot: dict) -> tuple[int, bool] | t
         print(f"Error parsing item: {e}")
         return None, None
 
+def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
+    """Log camera capture result to event log."""
+    event = {
+        "event": "camera_capture",
+        "ts": timestamp_str,
+        "slot_id": slot_id,
+        "slot_name": slot_name,
+        "zone": zone,
+        "image_path": image_path
+    }
+    try:
+        with _event_log_lock:
+            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event) + "\n")
+                f.flush()
+    except Exception as e:
+        print(f"Error logging camera capture: {e}")
+
 def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_id: dict, timestamp_str: str) -> list:
     """Detect state changes and return change events. Also enqueue camera tasks if enabled."""
     events = []
@@ -245,13 +263,22 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                 if preset:
                     try:
                         timestamp_obj = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+
+                        # Create callback to log image path after capture
+                        def make_callback(slot_id, slot_name, zone, timestamp_str):
+                            def callback(success, image_path, error_msg):
+                                if success and image_path:
+                                    _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str)
+                            return callback
+
                         _camera_queue.add_task({
                             "slot_id": sid,
                             "slot_name": meta.get("name", str(sid)),
                             "zone": meta.get("zone", "A"),
                             "preset": preset,
                             "timestamp": timestamp_obj,
-                            "event_id": f"{sid}_{timestamp_str}"
+                            "event_id": f"{sid}_{timestamp_str}",
+                            "callback": make_callback(sid, meta.get("name", str(sid)), meta.get("zone", "A"), timestamp_str)
                         })
                     except Exception as e:
                         print(f"Error enqueueing camera task for slot {sid}: {e}")
@@ -843,6 +870,7 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
     Sorted by timestamp descending (newest first).
     """
     alerts = []
+    camera_captures = {}
 
     if not EVENT_LOG_PATH.exists():
         return {"alerts": [], "total": 0, "limit": limit, "offset": offset}
@@ -856,10 +884,22 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
                     continue
                 try:
                     obj = json.loads(line)
-                    if obj.get("event") == "slot_state_changed":
+                    event_type = obj.get("event")
+
+                    if event_type == "slot_state_changed":
                         alerts.append(obj)
+                    elif event_type == "camera_capture":
+                        # Store camera captures by slot_id and timestamp for matching
+                        key = (obj.get("slot_id"), obj.get("ts"))
+                        camera_captures[key] = obj.get("image_path")
                 except Exception:
                     continue
+
+    # Merge camera captures with alerts
+    for alert in alerts:
+        key = (alert.get("slot_id"), alert.get("ts"))
+        if key in camera_captures:
+            alert["image_path"] = camera_captures[key]
 
     # Sort newest first
     alerts.sort(key=lambda x: x.get("ts", ""), reverse=True)
