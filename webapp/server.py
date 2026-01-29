@@ -13,6 +13,26 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import math
+import os
+
+# Import camera controller
+try:
+    from webapp.camera_controller import (
+        CameraController,
+        CameraTaskQueue,
+        camera_worker,
+        ENABLE_CAMERA_CONTROL,
+        CAMERA_SNAPSHOTS_DIR,
+        CAMERA_IP,
+        CAMERA_USER,
+        CAMERA_PASS,
+        RTSP_URL
+    )
+    _camera_available = True
+except ImportError as e:
+    print(f"Camera controller not available: {e}")
+    _camera_available = False
+    ENABLE_CAMERA_CONTROL = False
 
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent
@@ -49,6 +69,11 @@ _meta_cache_mtime = None
 _active_streams = 0
 _max_streams = 50
 _streams_lock = threading.Lock()
+
+# Camera control components
+_camera_queue = None
+_camera_controller = None
+_camera_worker_thread = None
 
 def load_snapshot_data() -> dict:
     """Load snapshot data from YAML file."""
@@ -198,7 +223,7 @@ def _process_slot_item(item: dict, slots_snapshot: dict) -> tuple[int, bool] | t
         return None, None
 
 def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_id: dict, timestamp_str: str) -> list:
-    """Detect state changes and return change events."""
+    """Detect state changes and return change events. Also enqueue camera tasks if enabled."""
     events = []
     for sid, state in current_states.items():
         prev_state = previous_states.get(sid)
@@ -213,6 +238,23 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                 "prev_state": prev_state,
                 "new_state": state
             })
+
+            # Enqueue camera task if enabled
+            if ENABLE_CAMERA_CONTROL and _camera_queue is not None:
+                preset = meta.get("preset")
+                if preset:
+                    try:
+                        timestamp_obj = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                        _camera_queue.add_task({
+                            "slot_id": sid,
+                            "slot_name": meta.get("name", str(sid)),
+                            "zone": meta.get("zone", "A"),
+                            "preset": preset,
+                            "timestamp": timestamp_obj,
+                            "event_id": f"{sid}_{timestamp_str}"
+                        })
+                    except Exception as e:
+                        print(f"Error enqueueing camera task for slot {sid}: {e}")
     return events
 
 def poll_external_api():
@@ -294,9 +336,44 @@ def poll_external_api():
 
 @app.on_event("startup")
 def start_polling():
+    global _camera_queue, _camera_controller, _camera_worker_thread
+
     # Clear shutdown event in case it was set from previous run
     _shutdown_event.clear()
-    
+
+    # Initialize camera system if enabled
+    if ENABLE_CAMERA_CONTROL and _camera_available:
+        try:
+            print("Initializing camera control system...")
+            _camera_queue = CameraTaskQueue()
+            _camera_controller = CameraController(
+                ip=CAMERA_IP,
+                user=CAMERA_USER,
+                password=CAMERA_PASS,
+                rtsp_url=RTSP_URL
+            )
+
+            # Ensure snapshot directory exists
+            CAMERA_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Start camera worker thread
+            _camera_worker_thread = threading.Thread(
+                target=camera_worker,
+                args=(_camera_controller, _camera_queue),
+                daemon=True,
+                name="CameraWorker"
+            )
+            _camera_worker_thread.start()
+            print(f"Camera control enabled (IP: {CAMERA_IP})")
+        except Exception as e:
+            print(f"Failed to initialize camera system: {e}")
+            print("Continuing without camera control...")
+    else:
+        if not ENABLE_CAMERA_CONTROL:
+            print("Camera control disabled (ENABLE_CAMERA_CONTROL not set)")
+        else:
+            print("Camera controller module not available")
+
     if ENABLE_POLLING:
         print(f"Polling enabled. Starting background thread...")
         thread = threading.Thread(target=poll_external_api, daemon=True)
@@ -309,6 +386,11 @@ def start_polling():
 def stop_polling():
     print("Shutting down poller...")
     _shutdown_event.set()
+
+    # Shutdown camera worker
+    if _camera_queue is not None:
+        print("Shutting down camera worker...")
+        _camera_queue.shutdown_event.set()
 
 def _load_yaml(path: Path):
     if not path.exists():
@@ -751,4 +833,100 @@ async def calibrate_single_slot(slot_id: int):
         "baseline_x": round(avg_x, 2),
         "baseline_y": round(avg_y, 2),
         "baseline_z": round(avg_z, 2)
+    }
+
+
+@app.get("/alerts")
+def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(default=0)):
+    """
+    Returns recent state change events (alerts) with optional images.
+    Sorted by timestamp descending (newest first).
+    """
+    alerts = []
+
+    if not EVENT_LOG_PATH.exists():
+        return {"alerts": [], "total": 0, "limit": limit, "offset": offset}
+
+    # Read events from log
+    with _event_log_lock:
+        with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("event") == "slot_state_changed":
+                        alerts.append(obj)
+                except Exception:
+                    continue
+
+    # Sort newest first
+    alerts.sort(key=lambda x: x.get("ts", ""), reverse=True)
+
+    total = len(alerts)
+    paginated = alerts[offset:offset+limit]
+
+    return {
+        "alerts": paginated,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.get("/snapshots/{filename}")
+def get_snapshot_image(filename: str):
+    """
+    Serves captured camera snapshot images.
+    Validates filename to prevent directory traversal.
+    """
+    # Validate filename (no path components)
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    if not ENABLE_CAMERA_CONTROL or not _camera_available:
+        raise HTTPException(status_code=503, detail="Camera control not enabled")
+
+    snapshot_path = CAMERA_SNAPSHOTS_DIR / filename
+
+    if not snapshot_path.exists() or not snapshot_path.is_file():
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    return FileResponse(
+        str(snapshot_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000"}  # Cache for 1 year
+    )
+
+
+@app.get("/camera/status")
+def camera_status():
+    """Returns camera system status."""
+    if not ENABLE_CAMERA_CONTROL or not _camera_available:
+        return {
+            "enabled": False,
+            "message": "Camera control disabled"
+        }
+
+    is_available = False
+    queue_size = 0
+    worker_active = False
+
+    try:
+        if _camera_controller:
+            is_available = _camera_controller.is_available()
+        if _camera_queue:
+            queue_size = _camera_queue.queue.qsize()
+        if _camera_worker_thread:
+            worker_active = _camera_worker_thread.is_alive()
+    except Exception as e:
+        print(f"Error checking camera status: {e}")
+
+    return {
+        "enabled": True,
+        "available": is_available,
+        "queue_size": queue_size,
+        "worker_active": worker_active,
+        "camera_ip": CAMERA_IP
     }

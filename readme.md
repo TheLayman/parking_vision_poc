@@ -4,6 +4,14 @@ Real-time dashboard for parking slot occupancy using **3-axis magnetometer detec
 
 ## 📝 Recent Updates
 
+**Camera Control & Alerts System (Jan 2026)**
+- 📸 PTZ camera integration with automatic preset positioning on state changes
+- 🚨 New Alerts dashboard tab with real-time state changes and camera snapshots
+- 🔄 Sequential task queue to prevent concurrent camera commands
+- 🎛️ Environment variable control: `ENABLE_CAMERA_CONTROL` for easy testing without hardware
+- 🖼️ Image capture via RTSP with 8-second camera settle time
+- 🧵 Thread-safe camera worker with graceful error handling
+
 **Code Refactoring (Jan 2026)**
 - Reduced [server.py](webapp/server.py) from 857 → 754 lines (12% reduction)
 - Extracted helper functions: `_process_slot_item()`, `_detect_state_changes()`, `_calculate_zone_stats()`
@@ -15,6 +23,8 @@ Real-time dashboard for parking slot occupancy using **3-axis magnetometer detec
 - **Magnetic Field Detection** — Uses Euclidean distance from baseline (r,y,b values) with 7.5 threshold and hysteresis to prevent false positives
 - **Smart Calibration** — Automatic baseline learning (α=0.01) when slots are free + manual calibration endpoint
 - **Live Dashboard** — Real-time visualization (🔴 Occupied / 🟢 Free) via Server-Sent Events with 50-connection limit
+- **📸 Camera Control** — PTZ camera automatically moves to preset positions and captures images on state changes
+- **🚨 Alerts System** — New dashboard tab showing real-time alerts with captured images and state transition history
 - **Analytics Module** — Occupancy trends, dwell times, peak hours with 30s response caching
 - **Auto Log Rotation** — Events rotate at 50 MB to prevent disk exhaustion
 - **Thread-Safe** — Snapshot and event log locks prevent data corruption
@@ -42,13 +52,16 @@ pip install -r requirements.txt
 ```
 parking_vision_poc/
 ├── config/
-│   └── slot_meta.yaml        # Slot names + zone labels for dashboard
+│   └── slot_meta.yaml        # Slot names, zones, and camera presets
 ├── data/
-│   └── occupancy_events.jsonl # (Generated) History of state changes
+│   ├── occupancy_events.jsonl # (Generated) History of state changes
+│   └── camera_snapshots/     # (Generated) Captured images from camera
 ├── webapp/
-│   ├── server.py             # FastAPI backend (SSE + Analytics)
+│   ├── server.py             # FastAPI backend (SSE + Analytics + Camera API)
+│   ├── camera_controller.py  # Camera control module (PTZ + RTSP)
 │   └── static/               # Frontend (HTML/JS/CSS)
 ├── data.txt                  # Input file for simulating sensor data
+├── .env.example              # Environment configuration template
 └── readme.md
 ```
 
@@ -87,6 +100,118 @@ Server polls external API every 5 seconds with `Authorization: Bearer {token}` h
 ```json
 [{"id": 1, "unique_id": "slot_1", "status": "{\"r\":30,\"y\":20,\"b\":-35}", "timestamp": 1234567890}]
 ```
+
+---
+
+## 📸 Camera Control & Alerts
+
+### Overview
+
+The system supports optional PTZ camera integration that automatically:
+1. **Detects** state changes (FREE ↔ OCCUPIED)
+2. **Moves** camera to preset position (configured in `slot_meta.yaml`)
+3. **Waits** 8 seconds for camera to settle
+4. **Captures** image via RTSP stream
+5. **Displays** alert with image in dashboard
+
+### Setup
+
+**1. Copy environment template:**
+```bash
+cp .env.example .env
+```
+
+**2. Configure camera settings in `.env`:**
+```bash
+# Enable camera control
+ENABLE_CAMERA_CONTROL=true
+
+# Camera connection
+CAMERA_IP=192.168.1.100
+CAMERA_USER=admin
+CAMERA_PASS=your_password
+
+# RTSP stream (optional - auto-generated if not set)
+CAMERA_RTSP_URL=rtsp://admin:your_password@192.168.1.100:554/stream1
+```
+
+**3. Configure camera presets in `config/slot_meta.yaml`:**
+```yaml
+- id: 1
+  name: A01
+  zone: A
+  preset: 1    # Camera preset position (1-256)
+```
+
+**4. Start server:**
+```bash
+# Windows
+set ENABLE_CAMERA_CONTROL=true
+set CAMERA_IP=192.168.1.100
+python -m uvicorn webapp.server:app --reload --port 8080
+
+# Linux/Mac
+export ENABLE_CAMERA_CONTROL=true
+export CAMERA_IP=192.168.1.100
+python -m uvicorn webapp.server:app --reload --port 8080
+```
+
+### Testing Without Camera
+
+Camera control is **disabled by default**, allowing full alerts functionality without hardware:
+
+```bash
+# No environment variables needed
+python -m uvicorn webapp.server:app --reload --port 8080
+```
+
+1. Navigate to **Alerts** tab in dashboard
+2. Trigger state change (magnetic sensor or API)
+3. Alert appears with "No image" placeholder
+4. All metadata displayed: time, slot, zone, state transition
+
+### Camera API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/camera/status` | GET | Camera system status and queue size |
+| `/snapshots/{filename}` | GET | Serve captured images |
+| `/alerts` | GET | Recent alerts with pagination (`?limit=50&offset=0`) |
+
+**Check camera status:**
+```bash
+curl http://127.0.0.1:8080/camera/status
+```
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "available": true,
+  "queue_size": 2,
+  "worker_active": true,
+  "camera_ip": "192.168.1.100"
+}
+```
+
+### How It Works
+
+**Sequential Processing:**
+- Multiple state changes queued automatically
+- Processed one at a time (prevents concurrent camera commands)
+- Queue limit: 50 tasks (drops oldest if full)
+- Processing time: ~12 seconds per slot (2s move + 8s settle + 2s capture)
+
+**Error Handling:**
+- Camera unreachable → Alert created without image
+- RTSP timeout (10s) → Retry once, then skip
+- Queue overflow → Log warning, drop oldest task
+- All errors logged, server continues running
+
+**Production Considerations:**
+- Images stored in `data/camera_snapshots/` (~200KB each)
+- Recommend retention policy (e.g., delete after 30 days)
+- For multiple cameras: extend queue system to support parallel processing
 
 ---
 
@@ -169,16 +294,25 @@ The dashboard includes an analytics view (`/analytics/summary` endpoint) providi
 ## ⚙️ Configuration
 
 **`config/slot_meta.yaml`**
-Map internal IDs to human-readable names and zones:
+Map internal IDs to human-readable names, zones, and camera presets:
 
 ```yaml
-1:
-  name: "A-01"
-  zone: "Zone A"
-4:
-  name: "B-01"
-  zone: "Zone B"
+- id: 1
+  name: "A01"
+  zone: "A"
+  preset: 1    # PTZ camera preset position (1-256)
+- id: 2
+  name: "A02"
+  zone: "A"
+  preset: 2
 ```
+
+**Environment Variables (`.env`)**
+See [`.env.example`](.env.example) for all configuration options:
+- `ENABLE_CAMERA_CONTROL` - Enable/disable camera (default: false)
+- `CAMERA_IP` - Camera IP address
+- `CAMERA_USER` / `CAMERA_PASS` - Authentication credentials
+- `CAMERA_RTSP_URL` - Custom RTSP stream URL (optional)
 
 ---
 
@@ -230,6 +364,9 @@ Map internal IDs to human-readable names and zones:
 | `/events` | GET | SSE stream of real-time events (max 50 connections) |
 | `/analytics/summary` | GET | Occupancy trends (1h/6h/24h) |
 | `/calibrate/{slot_id}` | POST | Calibrate slot baseline |
+| `/alerts` | GET | Recent alerts with pagination (`?limit=50&offset=0`) |
+| `/snapshots/{filename}` | GET | Serve captured camera images |
+| `/camera/status` | GET | Camera system status (enabled, available, queue size) |
 
 ---
 
