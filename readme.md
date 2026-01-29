@@ -105,113 +105,49 @@ Server polls external API every 5 seconds with `Authorization: Bearer {token}` h
 
 ## 📸 Camera Control & Alerts
 
-### Overview
+Optional PTZ camera integration: automatically moves to preset position and captures images when slots change state.
 
-The system supports optional PTZ camera integration that automatically:
-1. **Detects** state changes (FREE ↔ OCCUPIED)
-2. **Moves** camera to preset position (configured in `slot_meta.yaml`)
-3. **Waits** 8 seconds for camera to settle
-4. **Captures** image via RTSP stream
-5. **Displays** alert with image in dashboard
+### Quick Setup
 
-### Setup
-
-**1. Copy environment template:**
+**1. Create `.env` file:**
 ```bash
-cp .env.example .env
-```
-
-**2. Configure camera settings in `.env`:**
-```bash
-# Enable camera control
 ENABLE_CAMERA_CONTROL=true
-
-# Camera connection
 CAMERA_IP=192.168.1.100
 CAMERA_USER=admin
 CAMERA_PASS=your_password
-
-# RTSP stream (optional - auto-generated if not set)
-CAMERA_RTSP_URL=rtsp://admin:your_password@192.168.1.100:554/stream1
 ```
 
-**3. Configure camera presets in `config/slot_meta.yaml`:**
+**2. Configure presets in `config/slot_meta.yaml`:**
 ```yaml
 - id: 1
   name: A01
-  zone: A
-  preset: 1    # Camera preset position (1-256)
+  preset: 1  # PTZ preset (1-256)
 ```
 
-**4. Start server:**
+**3. Start server:**
 ```bash
-# Windows
-set ENABLE_CAMERA_CONTROL=true
-set CAMERA_IP=192.168.1.100
-python -m uvicorn webapp.server:app --reload --port 8080
-
-# Linux/Mac
-export ENABLE_CAMERA_CONTROL=true
-export CAMERA_IP=192.168.1.100
 python -m uvicorn webapp.server:app --reload --port 8080
 ```
 
 ### Testing Without Camera
 
-Camera control is **disabled by default**, allowing full alerts functionality without hardware:
+Camera is **disabled by default**. Alerts work without hardware:
+- Set `ENABLE_CAMERA_CONTROL=false` or omit `.env` entirely
+- Alerts show with "No image" placeholder
+- Perfect for development/testing
 
-```bash
-# No environment variables needed
-python -m uvicorn webapp.server:app --reload --port 8080
-```
+### Key Features
 
-1. Navigate to **Alerts** tab in dashboard
-2. Trigger state change (magnetic sensor or API)
-3. Alert appears with "No image" placeholder
-4. All metadata displayed: time, slot, zone, state transition
+- **Sequential Processing**: Queue prevents concurrent camera commands (max 50 tasks)
+- **Timing**: 2s move + 8s settle + 2s capture = ~12s per alert
+- **Error Handling**: Camera failures don't crash server, alerts created without images
+- **Storage**: Images in `data/camera_snapshots/` (~200KB each)
 
-### Camera API Endpoints
+### API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/camera/status` | GET | Camera system status and queue size |
-| `/snapshots/{filename}` | GET | Serve captured images |
-| `/alerts` | GET | Recent alerts with pagination (`?limit=50&offset=0`) |
-
-**Check camera status:**
-```bash
-curl http://127.0.0.1:8080/camera/status
-```
-
-**Response:**
-```json
-{
-  "enabled": true,
-  "available": true,
-  "queue_size": 2,
-  "worker_active": true,
-  "camera_ip": "192.168.1.100"
-}
-```
-
-### How It Works
-
-**Sequential Processing:**
-- Multiple state changes queued automatically
-- Processed one at a time (prevents concurrent camera commands)
-- Queue limit: 50 tasks (drops oldest if full)
-- Processing time: ~12 seconds per slot (2s move + 8s settle + 2s capture)
-
-**Error Handling:**
-- Camera unreachable → Alert created without image
-- RTSP timeout (10s) → Retry once, then skip
-- Queue overflow → Log warning, drop oldest task
-- All errors logged, server continues running
-
-**Production Considerations:**
-- Images stored in `data/camera_snapshots/` (~200KB each)
-- Recommend retention policy (e.g., delete after 30 days)
-- For multiple cameras: extend queue system to support parallel processing
+- `GET /alerts` - Recent alerts with pagination (`?limit=50&offset=0`)
+- `GET /snapshots/{filename}` - Serve captured images
+- `GET /camera/status` - System status (enabled, queue size, worker active)
 
 ---
 
