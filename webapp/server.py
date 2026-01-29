@@ -56,9 +56,11 @@ API_URL = "http://localhost:8000/slots"
 API_TOKEN = ""
 ENABLE_POLLING = 1
 
-def poll_external_api(): 
+def poll_external_api():
     """Background task to poll external API and log events."""
-    previous_states: Dict[int, str] = {} 
+    previous_states: Dict[int, str] = {}
+    last_snapshot_time = datetime.now(timezone.utc)
+    snapshot_interval = timedelta(minutes=1)  # Log snapshot every 1 minute 
     
     print(f"Starting poller. Target: {API_URL}")
     if not API_TOKEN:
@@ -179,8 +181,10 @@ def poll_external_api():
 
                     # Detect changes
                     events_to_log = []
-                    timestamp = datetime.now(timezone.utc).isoformat()
-                    
+                    timestamp = datetime.now(timezone.utc)
+                    timestamp_str = timestamp.isoformat()
+                    has_state_changes = False
+
                     for sid, state in current_states.items():
                         prev_state = previous_states.get(sid)
                         if prev_state and prev_state != state:
@@ -188,7 +192,7 @@ def poll_external_api():
                             meta = meta_by_id.get(sid, {})
                             change_event = {
                                 "event": "slot_state_changed",
-                                "ts": timestamp,
+                                "ts": timestamp_str,
                                 "slot_id": sid,
                                 "slot_name": meta.get("name", str(sid)),
                                 "zone": meta.get("zone", "A"),
@@ -196,7 +200,8 @@ def poll_external_api():
                                 "new_state": state
                             }
                             events_to_log.append(change_event)
-                    
+                            has_state_changes = True
+
                     # Update previous states
                     previous_states = current_states.copy()
 
@@ -204,16 +209,16 @@ def poll_external_api():
                     zones_stats = {}
                     total_count = len(all_configured_ids)
                     free_count = 0
-                    
+
                     for sid in all_configured_ids:
                         is_occupied = sid in occupied_ids
                         # Get zone
                         meta = meta_by_id.get(sid, {})
                         zone = meta.get("zone", "A")
-                        
+
                         if zone not in zones_stats:
                             zones_stats[zone] = {"total": 0, "free": 0, "occupied": 0}
-                        
+
                         zones_stats[zone]["total"] += 1
                         if is_occupied:
                             zones_stats[zone]["occupied"] += 1
@@ -221,20 +226,27 @@ def poll_external_api():
                             zones_stats[zone]["free"] += 1
                             free_count += 1
 
-                    snapshot_event = { 
-                        "event": "snapshot",
-                        "ts": timestamp,
-                        "occupied_ids": occupied_ids,
-                        "zone_stats": zones_stats,
-                        "total_count": total_count,
-                        "free_count": free_count
-                    }
-                    events_to_log.append(snapshot_event)
+                    # Only log snapshot if state changed OR interval elapsed
+                    time_since_snapshot = timestamp - last_snapshot_time
+                    should_log_snapshot = has_state_changes or time_since_snapshot >= snapshot_interval
+
+                    if should_log_snapshot:
+                        snapshot_event = {
+                            "event": "snapshot",
+                            "ts": timestamp_str,
+                            "occupied_ids": occupied_ids,
+                            "zone_stats": zones_stats,
+                            "total_count": total_count,
+                            "free_count": free_count
+                        }
+                        events_to_log.append(snapshot_event)
+                        last_snapshot_time = timestamp
                     
-                    # Append to log
-                    with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-                        for evt in events_to_log:
-                            f.write(json.dumps(evt) + "\n")
+                    # Append to log (only if there are events)
+                    if events_to_log:
+                        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                            for evt in events_to_log:
+                                f.write(json.dumps(evt) + "\n")
                             
                 except json.JSONDecodeError:
                     print(f"Error decoding JSON response from {API_URL}")
