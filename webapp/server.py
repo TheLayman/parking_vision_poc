@@ -1,13 +1,14 @@
 from __future__ import annotations
 import json
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
 import yaml
 import threading
-import requests
+import paho.mqtt.client as mqtt
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -128,11 +129,6 @@ def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Di
 
     return zones_stats, free_count, total_count
 
-def _parse_status_json(status_str) -> dict:
-    """Parse status field which can be string or dict."""
-    if isinstance(status_str, str):
-        return json.loads(status_str)
-    return status_str if isinstance(status_str, dict) else {}
 
 def _update_slot_baseline(slot_snapshot: dict, r: float, y: float, b: float, alpha: float = 0.01):
     """Update baseline values with exponential moving average."""
@@ -159,68 +155,17 @@ def rotate_log_if_needed(max_size_mb=50):
     except Exception as e:
         print(f"Error rotating event log: {e}")
 
-# ... (API constants)
-API_URL = "http://localhost:8080/slots"
-API_TOKEN = ""
-ENABLE_POLLING = 1
+# MQTT Configuration
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "application/+/device/+/event/up")
+ENABLE_MQTT = int(os.getenv("ENABLE_MQTT", "1"))  # Enable MQTT by default
 
-def _process_slot_item(item: dict, slots_snapshot: dict) -> tuple[int, bool] | tuple[None, None]:
-    """Process a single slot item from API. Returns (slot_id, is_occupied) or (None, None) if error."""
-    try:
-        slot_id = item.get("id")
-        if slot_id is None:
-            return None, None
-        slot_id = int(slot_id)
+# MQTT client reference
+_mqtt_client = None
+_mqtt_previous_states: Dict[int, str] = {}
+_mqtt_last_snapshot_time = None
 
-        status_str = item.get("status")
-        if not status_str:
-            return None, None
-
-        status = _parse_status_json(status_str)
-        r, y, b = float(status.get("r", 0)), float(status.get("y", 0)), float(status.get("b", 0))
-
-        slot_key = str(slot_id)
-        slot_snapshot = slots_snapshot.get(slot_key, {})
-
-        # Check for duplicate data
-        timestamp_ms = item.get("timestamp", 0)
-        if (timestamp_ms == slot_snapshot.get("last_timestamp", 0) and
-            r == slot_snapshot.get("last_x") and y == slot_snapshot.get("last_y") and b == slot_snapshot.get("last_z")):
-            consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
-            return slot_id, consecutive_occupied >= CONSECUTIVE_COUNT_REQUIRED
-
-        # Update last readings
-        slot_snapshot.update({"last_timestamp": timestamp_ms, "last_x": r, "last_y": y, "last_z": b})
-
-        baseline_x = slot_snapshot.get("baseline_x")
-        baseline_y = slot_snapshot.get("baseline_y")
-        baseline_z = slot_snapshot.get("baseline_z")
-        consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
-
-        if baseline_x is not None and baseline_y is not None and baseline_z is not None:
-            distance = calculate_distance(r, y, b, baseline_x, baseline_y, baseline_z)
-
-            if distance > DISTANCE_THRESHOLD:
-                consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
-            elif distance <= DISTANCE_THRESHOLD * 0.9:
-                consecutive_occupied = 0
-
-            slot_snapshot["consecutive_occupied"] = consecutive_occupied
-            slot_snapshot["last_distance"] = round(distance, 2)
-
-            if consecutive_occupied == 0:
-                _update_slot_baseline(slot_snapshot, r, y, b)
-
-            slots_snapshot[slot_key] = slot_snapshot
-            return slot_id, consecutive_occupied >= CONSECUTIVE_COUNT_REQUIRED
-        else:
-            slot_snapshot["consecutive_occupied"] = 0
-            slots_snapshot[slot_key] = slot_snapshot
-            return slot_id, False
-
-    except Exception as e:
-        print(f"Error parsing item: {e}")
-        return None, None
 
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
     """Log camera capture result to event log."""
@@ -284,85 +229,226 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                         print(f"Error enqueueing camera task for slot {sid}: {e}")
     return events
 
-def poll_external_api():
-    """Background task to poll external API and log events."""
-    previous_states: Dict[int, str] = {}
-    last_snapshot_time = datetime.now(timezone.utc)
-    snapshot_interval = timedelta(minutes=1)
 
-    print(f"Starting poller. Target: {API_URL}")
-    if not API_TOKEN:
-        print("WARNING: No PARKING_API_TOKEN set. Requests might fail if auth is required.")
+def decode_uplink(payload_base64: str) -> dict:
+    """
+    Decode the LoRaWAN uplink payload.
+    
+    Payload format (8 bytes):
+        - Bytes 0-1: X accelerometer (signed int16, divide by 100)
+        - Bytes 2-3: Y accelerometer (signed int16, divide by 100)
+        - Bytes 4-5: Z accelerometer (signed int16, divide by 100)
+        - Bytes 6-7: Temperature (signed int16, divide by 100) - ignored
+        
+    Args:
+        payload_base64: Base64 encoded payload string
+        
+    Returns:
+        dict with x, y, z values and timestamp
+    """
+    data = base64.b64decode(payload_base64)
+    
+    def read_int16(index):
+        """Read a signed 16-bit integer from bytes at given index"""
+        val = (data[index] << 8) | data[index + 1]
+        if val & 0x8000:  # Check sign bit
+            val -= 0x10000  # Convert to signed
+        return val
+    
+    # Parse accelerometer values (each is 2 bytes, scaled by 100)
+    x = read_int16(0) / 100
+    y = read_int16(2) / 100
+    z = read_int16(4) / 100
+    
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    return {"x": x, "y": y, "z": z, "timestamp": timestamp}
 
-    while not _shutdown_event.is_set():
-        try:
-            headers = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
-            response = requests.get(API_URL, headers=headers, timeout=5)
 
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    occupied_ids = set()
+def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -> int | None:
+    """
+    Map MQTT device name to slot ID.
+    Looks for a 'device_name' field in slot metadata, or matches by slot name.
+    """
+    for slot_id, meta in meta_by_id.items():
+        # First check for explicit device_name field
+        if meta.get("device_name") == device_name:
+            return slot_id
+        # Fallback: check if name matches device name (case-insensitive)
+        if meta.get("name", "").upper() == device_name.upper():
+            return slot_id
+    return None
 
-                    with _snapshot_lock:
-                        snapshot_data = load_snapshot_data()
-                        slots_snapshot = snapshot_data.get("slots", {})
 
-                        for item in data:
-                            slot_id, is_occupied = _process_slot_item(item, slots_snapshot)
-                            if slot_id is not None and is_occupied:
-                                occupied_ids.add(slot_id)
+def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timestamp_str: str):
+    """Process sensor data from MQTT and update occupancy state."""
+    global _mqtt_previous_states, _mqtt_last_snapshot_time
+    
+    meta_by_id = load_slot_meta_by_id()
+    all_configured_ids = load_slot_ids()
+    
+    with _snapshot_lock:
+        snapshot_data = load_snapshot_data()
+        slots_snapshot = snapshot_data.get("slots", {})
+        slot_key = str(slot_id)
+        slot_snapshot = slots_snapshot.get(slot_key, {})
+        
+        # Check for duplicate data
+        if (x == slot_snapshot.get("last_x") and 
+            y == slot_snapshot.get("last_y") and 
+            z == slot_snapshot.get("last_z")):
+            return
+        
+        # Update last readings
+        slot_snapshot.update({"last_x": x, "last_y": y, "last_z": z})
+        
+        baseline_x = slot_snapshot.get("baseline_x")
+        baseline_y = slot_snapshot.get("baseline_y")
+        baseline_z = slot_snapshot.get("baseline_z")
+        consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
+        
+        if baseline_x is not None and baseline_y is not None and baseline_z is not None:
+            distance = calculate_distance(x, y, z, baseline_x, baseline_y, baseline_z)
+            
+            if distance > DISTANCE_THRESHOLD:
+                consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
+            elif distance <= DISTANCE_THRESHOLD * 0.9:
+                consecutive_occupied = 0
+            
+            slot_snapshot["consecutive_occupied"] = consecutive_occupied
+            slot_snapshot["last_distance"] = round(distance, 2)
+            
+            if consecutive_occupied == 0:
+                _update_slot_baseline(slot_snapshot, x, y, z)
+        else:
+            slot_snapshot["consecutive_occupied"] = 0
+        
+        slots_snapshot[slot_key] = slot_snapshot
+        
+        # Build occupied_ids from current snapshot (avoid reloading)
+        occupied_ids = {
+            sid for sid in all_configured_ids
+            if slots_snapshot.get(str(sid), {}).get("consecutive_occupied", 0) >= CONSECUTIVE_COUNT_REQUIRED
+        }
+        
+        save_snapshot_data({"slots": slots_snapshot})
+    
+    # State change detection and logging
+    current_states = {sid: "OCCUPIED" if sid in occupied_ids else "FREE" for sid in all_configured_ids}
+    timestamp = datetime.now(timezone.utc)
+    
+    events_to_log = _detect_state_changes(current_states, _mqtt_previous_states, meta_by_id, timestamp_str)
+    has_state_changes = bool(events_to_log)
+    _mqtt_previous_states = current_states.copy()
+    
+    zones_stats, free_count, total_count = _calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
+    
+    # Log snapshot periodically or on state changes
+    if _mqtt_last_snapshot_time is None:
+        _mqtt_last_snapshot_time = timestamp
+    
+    if has_state_changes or (timestamp - _mqtt_last_snapshot_time) >= timedelta(minutes=1):
+        events_to_log.append({
+            "event": "snapshot",
+            "ts": timestamp_str,
+            "occupied_ids": list(occupied_ids),
+            "zone_stats": zones_stats,
+            "total_count": total_count,
+            "free_count": free_count
+        })
+        _mqtt_last_snapshot_time = timestamp
+    
+    if events_to_log:
+        rotate_log_if_needed(max_size_mb=50)
+        with _event_log_lock:
+            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                for evt in events_to_log:
+                    f.write(json.dumps(evt) + "\n")
+                f.flush()
 
-                        save_snapshot_data({"slots": slots_snapshot})
 
-                    meta_by_id = load_slot_meta_by_id()
-                    all_configured_ids = load_slot_ids()
+def on_mqtt_message(client, userdata, msg):
+    """
+    Handle incoming MQTT messages from ChirpStack/LoRaWAN.
+    Decodes the payload and processes sensor data for occupancy detection.
+    """
+    global _mqtt_last_snapshot_time
+    
+    try:
+        payload = json.loads(msg.payload)
+        device_name = payload.get('deviceInfo', {}).get('deviceName', 'Unknown')
+        
+        # Get the raw payload (base64 encoded)
+        raw_data = payload.get('data')
+        
+        if not raw_data:
+            print(f"Device {device_name}: No data in payload")
+            return
+        
+        # Decode the LoRaWAN payload
+        decoded = decode_uplink(raw_data)
+        x, y, z = decoded['x'], decoded['y'], decoded['z']
+        timestamp_str = decoded['timestamp']
+        
+        print(f"MQTT Device: {device_name} | x: {x}, y: {y}, z: {z} | ts: {timestamp_str}")
+        
+        # Map device name to slot ID
+        meta_by_id = load_slot_meta_by_id()
+        slot_id = _get_slot_id_by_device_name(device_name, meta_by_id)
+        
+        if slot_id is None:
+            print(f"Warning: Device '{device_name}' not mapped to any slot")
+            return
+        
+        # Process the sensor data
+        _process_mqtt_sensor_data(slot_id, x, y, z, timestamp_str)
+        
+        # Add sample for calibration if active
+        add_calibration_sample(slot_id, x, y, z)
+        
+    except Exception as e:
+        print(f"Error processing MQTT message: {e}")
 
-                    current_states = {sid: "OCCUPIED" if sid in occupied_ids else "FREE" for sid in all_configured_ids}
-                    timestamp = datetime.now(timezone.utc)
-                    timestamp_str = timestamp.isoformat()
 
-                    events_to_log = _detect_state_changes(current_states, previous_states, meta_by_id, timestamp_str)
-                    has_state_changes = bool(events_to_log)
-                    previous_states = current_states.copy()
+def on_mqtt_connect(client, userdata, flags, rc):
+    """Handle MQTT connection and subscribe to topic."""
+    if rc == 0:
+        print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+        client.subscribe(MQTT_TOPIC)
+        print(f"Subscribed to topic: {MQTT_TOPIC}")
+    else:
+        print(f"Failed to connect to MQTT broker, return code: {rc}")
 
-                    zones_stats, free_count, total_count = _calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
 
-                    if has_state_changes or (timestamp - last_snapshot_time) >= snapshot_interval:
-                        events_to_log.append({
-                            "event": "snapshot",
-                            "ts": timestamp_str,
-                            "occupied_ids": list(occupied_ids),
-                            "zone_stats": zones_stats,
-                            "total_count": total_count,
-                            "free_count": free_count
-                        })
-                        last_snapshot_time = timestamp
+def start_mqtt_listener():
+    """Start the MQTT client in a background thread."""
+    global _mqtt_client
+    
+    _mqtt_client = mqtt.Client()
+    _mqtt_client.on_connect = on_mqtt_connect
+    _mqtt_client.on_message = on_mqtt_message
+    
+    try:
+        _mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
+        print(f"Starting MQTT listener for LoRaWAN uplink messages...")
+        _mqtt_client.loop_start()  # Start background thread for MQTT
+    except Exception as e:
+        print(f"Error starting MQTT client: {e}")
 
-                    if events_to_log:
-                        rotate_log_if_needed(max_size_mb=50)
-                        with _event_log_lock:
-                            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-                                for evt in events_to_log:
-                                    f.write(json.dumps(evt) + "\n")
-                                f.flush()
 
-                except json.JSONDecodeError:
-                    print(f"Error decoding JSON response from {API_URL}")
-            else:
-                print(f"External API returned status {response.status_code}")
+def stop_mqtt_listener():
+    """Stop the MQTT client."""
+    global _mqtt_client
+    if _mqtt_client is not None:
+        print("Stopping MQTT listener...")
+        _mqtt_client.loop_stop()
+        _mqtt_client.disconnect()
+        _mqtt_client = None
 
-        except requests.exceptions.RequestException as e:
-            print(f"Error connecting to external API: {e}")
-        except Exception as e:
-            print(f"Error in polling loop: {e}")
 
-        _shutdown_event.wait(timeout=5)
-
-    print("Poller thread shutting down gracefully")
 
 @app.on_event("startup")
-def start_polling():
+def start_app():
     global _camera_queue, _camera_controller, _camera_worker_thread
 
     # Clear shutdown event in case it was set from previous run
@@ -401,18 +487,22 @@ def start_polling():
         else:
             print("Camera controller module not available")
 
-    if ENABLE_POLLING:
-        print(f"Polling enabled. Starting background thread...")
-        thread = threading.Thread(target=poll_external_api, daemon=True)
-        thread.start()
+    # Start MQTT listener if enabled
+    if ENABLE_MQTT:
+        print(f"MQTT enabled. Starting listener for {MQTT_BROKER}:{MQTT_PORT}...")
+        start_mqtt_listener()
     else:
-        print("Polling disabled. Set ENABLE_POLLING=true to enable.")
+        print("MQTT disabled. Set ENABLE_MQTT=1 to enable.")
 
 
 @app.on_event("shutdown")
-def stop_polling():
-    print("Shutting down poller...")
+def stop_app():
+    print("Shutting down...")
     _shutdown_event.set()
+    
+    # Shutdown MQTT listener
+    if ENABLE_MQTT:
+        stop_mqtt_listener()
 
     # Shutdown camera worker
     if _camera_queue is not None:
@@ -778,47 +868,47 @@ def get_snapshot():
     return snapshot_data
 
 
-def _fetch_slot_data(headers: dict) -> list:
-    """Fetch slot data from API (blocking call for use in thread pool)."""
-    response = requests.get(API_URL, headers=headers, timeout=5)
-    if response.status_code == 200:
-        return response.json()
-    return []
+# Storage for calibration samples (slot_id -> list of {x, y, z} samples)
+_calibration_samples: Dict[int, list] = {}
+_calibration_active: Dict[int, bool] = {}
 
 
-async def _collect_calibration_samples(slot_id: int, headers: dict, samples_needed: int = 10, interval: int = 5) -> list:
-    """Collect calibration samples for a slot."""
-    samples = []
-    loop = asyncio.get_event_loop()
-
-    for sample_num in range(samples_needed):
-        try:
-            data = await loop.run_in_executor(None, _fetch_slot_data, headers)
-
-            for item in data:
-                if item.get("id") is None or int(item.get("id")) != slot_id:
-                    continue
-
-                status = _parse_status_json(item.get("status"))
-                if status:
-                    samples.append({
-                        "x": float(status.get("r", 0)),
-                        "y": float(status.get("y", 0)),
-                        "z": float(status.get("b", 0))
-                    })
-                    break
-
-            if sample_num < samples_needed - 1:
-                await asyncio.sleep(interval)
-
-        except Exception as e:
-            print(f"Error during calibration sample {sample_num + 1}: {e}")
-
+async def _collect_mqtt_calibration_samples(slot_id: int, samples_needed: int = 10, timeout: int = 60) -> list:
+    """
+    Collect calibration samples from MQTT data.
+    Waits for new MQTT readings to come in and collects them.
+    """
+    _calibration_samples[slot_id] = []
+    _calibration_active[slot_id] = True
+    
+    start_time = datetime.now(timezone.utc)
+    max_wait = timedelta(seconds=timeout)
+    
+    while len(_calibration_samples.get(slot_id, [])) < samples_needed:
+        if datetime.now(timezone.utc) - start_time > max_wait:
+            break
+        await asyncio.sleep(1)
+    
+    _calibration_active[slot_id] = False
+    samples = _calibration_samples.get(slot_id, [])
+    _calibration_samples.pop(slot_id, None)
     return samples
+
+
+def add_calibration_sample(slot_id: int, x: float, y: float, z: float):
+    """Called from MQTT handler to add calibration samples when calibration is active."""
+    if _calibration_active.get(slot_id, False):
+        if slot_id not in _calibration_samples:
+            _calibration_samples[slot_id] = []
+        _calibration_samples[slot_id].append({"x": x, "y": y, "z": z})
+
 
 @app.post("/calibrate/{slot_id}")
 async def calibrate_single_slot(slot_id: int):
-    """Calibrate a slot by taking 10 sample readings and averaging them."""
+    """
+    Calibrate a slot by collecting 5 sample readings from MQTT and averaging them.
+    Waits up to 120 seconds for samples to arrive.
+    """
     if slot_id < 1:
         return {"success": False, "message": "Invalid slot_id: must be positive integer"}
 
@@ -826,23 +916,27 @@ async def calibrate_single_slot(slot_id: int):
     if slot_id not in meta_by_id:
         return {"success": False, "message": f"Slot {slot_id} not configured in slot_meta.yaml"}
 
-    headers = {"Authorization": f"Bearer {API_TOKEN}"} if API_TOKEN else {}
-    samples = await _collect_calibration_samples(slot_id, headers)
-
+    # Collect 5 samples from MQTT
+    print(f"Starting calibration for slot {slot_id}, waiting for 5 samples...")
+    samples = await _collect_mqtt_calibration_samples(slot_id, samples_needed=5, timeout=120)
+    
     if len(samples) < 5:
-        return {"success": False, "message": f"Insufficient samples: {len(samples)}/10. Need at least 5 for reliable calibration."}
-
+        return {
+            "success": False, 
+            "message": f"Insufficient samples: {len(samples)}/5. Timeout waiting for MQTT data. Check if sensor is transmitting."
+        }
+    
+    # Calculate averages
     avg_x = sum(s["x"] for s in samples) / len(samples)
     avg_y = sum(s["y"] for s in samples) / len(samples)
     avg_z = sum(s["z"] for s in samples) / len(samples)
-
+    
     if abs(avg_x) < 0.1 and abs(avg_y) < 0.1 and abs(avg_z) < 0.1:
         return {"success": False, "message": "Invalid baseline: all values near zero. Check sensor connection."}
 
     with _snapshot_lock:
         snapshot_data = load_snapshot_data()
         slots_snapshot = snapshot_data.get("slots", {})
-
         slot_key = str(slot_id)
         slots_snapshot.setdefault(slot_key, {}).update({
             "baseline_x": round(avg_x, 2),
@@ -851,8 +945,9 @@ async def calibrate_single_slot(slot_id: int):
             "consecutive_occupied": 0,
             "calibrated_at": datetime.now(timezone.utc).isoformat()
         })
-
         save_snapshot_data({"slots": slots_snapshot})
+    
+    print(f"Calibration complete for slot {slot_id}: x={round(avg_x, 2)}, y={round(avg_y, 2)}, z={round(avg_z, 2)}")
 
     return {
         "success": True,
