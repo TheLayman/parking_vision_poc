@@ -649,31 +649,6 @@ def state():
     return result
 
 
-@app.get("/slots")
-def slots():
-    """
-    Returns slot data from data.txt file.
-    Format matches the external API response.
-    """
-    data_txt_path = REPO_ROOT / "data.txt"
-
-    if not data_txt_path.exists():
-        raise HTTPException(status_code=404, detail="data.txt not found")
-
-    try:
-        with open(data_txt_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return []
-            data = json.loads(content)
-            return data if isinstance(data, list) else []
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON in data.txt: {str(e)}")
-    except Exception as e:
-        print(f"Error reading data.txt: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
 @app.get("/events")
 async def events(request: Request):
     global _active_streams
