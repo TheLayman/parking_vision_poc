@@ -10,6 +10,7 @@ Real-time parking slot occupancy monitoring using **LoRaWAN magnetometer sensors
 - **Magnetic Field Detection** — Euclidean distance-based occupancy detection with hysteresis
 - **Smart Calibration** — MQTT-based calibration with automatic baseline learning
 - **PTZ Camera Control** — Automatic camera positioning and image capture on state changes
+- **License Plate Recognition** — EasyOCR-based extraction with Indian plate pattern matching
 - **Live Dashboard** — Real-time visualization with Server-Sent Events
 - **Analytics** — Occupancy trends, dwell time analysis, and predictions
 - **Thread-Safe** — Concurrent MQTT message handling with proper locking
@@ -203,12 +204,26 @@ CAMERA_PASS=your_password
 2. Camera moves to preset position (HTTP command)
 3. Wait 8 seconds for camera to settle
 4. Capture frame via RTSP stream
-5. Save image to `data/camera_snapshots/slot_<id>_<timestamp>.jpg`
-6. Log capture event to `data/occupancy_events.jsonl`
+5. Extract license plate using EasyOCR (returns "UNKNOWN" if not detected)
+6. Save image to `data/camera_snapshots/slot_<id>_<timestamp>.jpg`
+7. Log capture event with license plate to `data/occupancy_events.jsonl`
 
-**Processing time:** ~12 seconds per event (2s move + 8s settle + 2s capture)
+**Processing time:** ~15 seconds per event (2s move + 8s settle + 2s capture + 3s OCR)
 
 **Testing without hardware:** Set `ENABLE_CAMERA_CONTROL=false` — alerts will show without images.
+
+### License Plate Recognition
+
+Automatically extracts license plates from captured images:
+
+- **OCR Engine:** EasyOCR with smart error correction (O→0, I→1, S→5, Z→2)
+- **Pattern Matching:** Indian plate formats (e.g., TS07ES2598, KA01A1234)
+- **Fallback:** Returns "UNKNOWN" if detection fails or plate not visible
+- **Formats Supported:**
+  - Standard: `LL DD LL DDDD` (TS07ES2598)
+  - Variant: `LL DD L DDDD` (KA01A1234)
+
+License plates are stored in event log and displayed in dashboard alerts.
 
 ---
 
@@ -255,7 +270,8 @@ CAMERA_PASS=your_password
   "slot_id": 1,
   "slot_name": "A01",
   "zone": "A",
-  "image_path": "data/camera_snapshots/slot_1_20260130_100005.jpg"
+  "image_path": "data/camera_snapshots/slot_1_20260130_100005.jpg",
+  "license_plate": "TS07ES2598"
 }
 ```
 
@@ -280,19 +296,20 @@ CAMERA_PASS=your_password
 ```
 parking_vision_poc/
 ├── config/
-│   └── slot_meta.yaml           # Slot configuration and device mapping
+│   └── slot_meta.yaml              # Slot configuration and device mapping
 ├── data/
-│   ├── occupancy_events.jsonl   # Event log (auto-generated)
-│   ├── snapshot.yaml             # Current state with baselines (auto-generated)
-│   └── camera_snapshots/         # Captured images (auto-generated)
+│   ├── occupancy_events.jsonl      # Event log with license plates (auto-generated)
+│   ├── snapshot.yaml               # Current state with baselines (auto-generated)
+│   └── camera_snapshots/           # Captured images (auto-generated)
 ├── webapp/
-│   ├── server.py                 # FastAPI server with MQTT client
-│   ├── camera_controller.py      # PTZ camera control module
-│   └── static/                   # Dashboard frontend (HTML/JS/CSS)
-├── .env                          # Environment configuration
-├── .env.example                  # Configuration template
-├── requirements.txt              # Python dependencies
-└── readme.md                     # This file
+│   ├── server.py                   # FastAPI server with MQTT client
+│   ├── camera_controller.py        # PTZ camera control module
+│   ├── license_plate_extractor.py  # OCR and pattern matching
+│   └── static/                     # Dashboard frontend (HTML/JS/CSS)
+├── .env                            # Environment configuration
+├── .env.example                    # Configuration template
+├── requirements.txt                # Python dependencies (includes easyocr)
+└── readme.md                       # This file
 ```
 
 ---

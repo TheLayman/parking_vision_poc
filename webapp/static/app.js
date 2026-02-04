@@ -628,6 +628,11 @@ function renderAlerts(alerts) {
       `;
     }
 
+    // Handle license plate
+    const licensePlate = alert.license_plate || 'UNKNOWN';
+    const hasPlate = licensePlate !== 'UNKNOWN';
+    const plateClass = hasPlate ? 'has-plate' : 'no-plate';
+
     return `
       <div class="alert-card ${stateClass}" style="--index: ${index}">
         ${imageHtml}
@@ -646,6 +651,14 @@ function renderAlerts(alerts) {
                 <polyline points="12 5 19 12 12 19"/>
               </svg>
               <span class="new-state">${alert.new_state}</span>
+            </div>
+            <div class="alert-license-plate ${plateClass}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="7" width="20" height="10" rx="2" ry="2"/>
+                <line x1="6" y1="11" x2="6" y2="13"/>
+                <line x1="18" y1="11" x2="18" y2="13"/>
+              </svg>
+              <span class="plate-text">${licensePlate}</span>
             </div>
             <div class="alert-time">${timeStr}</div>
           </div>

@@ -35,6 +35,14 @@ except ImportError as e:
     _camera_available = False
     ENABLE_CAMERA_CONTROL = False
 
+# Import license plate extractor
+try:
+    from webapp.license_plate_extractor import extract_license_plate
+    _license_plate_available = True
+except ImportError as e:
+    print(f"License plate extractor not available: {e}")
+    _license_plate_available = False
+
 APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent
 
@@ -168,14 +176,27 @@ _mqtt_last_snapshot_time = None
 
 
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
-    """Log camera capture result to event log."""
+    """Log camera capture result to event log with license plate extraction."""
+    # Extract license plate from the captured image
+    license_plate = "UNKNOWN"
+    if _license_plate_available:
+        try:
+            print(f"Extracting license plate from {image_path}...")
+            license_plate = extract_license_plate(image_path)
+        except Exception as e:
+            print(f"Error extracting license plate: {e}")
+            license_plate = "UNKNOWN"
+    else:
+        print("License plate extraction not available")
+
     event = {
         "event": "camera_capture",
         "ts": timestamp_str,
         "slot_id": slot_id,
         "slot_name": slot_name,
         "zone": zone,
-        "image_path": image_path
+        "image_path": image_path,
+        "license_plate": license_plate
     }
     try:
         with _event_log_lock:
@@ -629,6 +650,13 @@ def index():
     return FileResponse(str(APP_ROOT / "static" / "index.html"))
 
 
+@app.get("/favicon.ico")
+def favicon():
+    """Return 204 No Content for favicon to avoid 404 errors."""
+    from fastapi import Response
+    return Response(status_code=204)
+
+
 @app.get("/state")
 def state():
     global _state_cache, _state_cache_time
@@ -936,7 +964,7 @@ async def calibrate_single_slot(slot_id: int):
 @app.get("/alerts")
 def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(default=0)):
     """
-    Returns recent state change events (alerts) with optional images.
+    Returns recent state change events (alerts) with optional images and license plates.
     Sorted by timestamp descending (newest first).
     """
     alerts = []
@@ -961,7 +989,10 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
                     elif event_type == "camera_capture":
                         # Store camera captures by slot_id and timestamp for matching
                         key = (obj.get("slot_id"), obj.get("ts"))
-                        camera_captures[key] = obj.get("image_path")
+                        camera_captures[key] = {
+                            "image_path": obj.get("image_path"),
+                            "license_plate": obj.get("license_plate", "UNKNOWN")
+                        }
                 except Exception:
                     continue
 
@@ -969,7 +1000,11 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
     for alert in alerts:
         key = (alert.get("slot_id"), alert.get("ts"))
         if key in camera_captures:
-            alert["image_path"] = camera_captures[key]
+            alert["image_path"] = camera_captures[key]["image_path"]
+            alert["license_plate"] = camera_captures[key]["license_plate"]
+        else:
+            # Default license plate to UNKNOWN if no camera capture
+            alert["license_plate"] = "UNKNOWN"
 
     # Sort newest first
     alerts.sort(key=lambda x: x.get("ts", ""), reverse=True)
