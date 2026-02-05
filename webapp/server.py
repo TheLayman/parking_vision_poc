@@ -177,7 +177,6 @@ _mqtt_last_snapshot_time = None
 
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
     """Log camera capture result to event log with license plate extraction."""
-    # Extract license plate from the captured image
     license_plate = "UNKNOWN"
     if _license_plate_available:
         try:
@@ -185,7 +184,6 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
             license_plate = extract_license_plate(image_path)
         except Exception as e:
             print(f"Error extracting license plate: {e}")
-            license_plate = "UNKNOWN"
     else:
         print("License plate extraction not available")
 
@@ -205,6 +203,14 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
                 f.flush()
     except Exception as e:
         print(f"Error logging camera capture: {e}")
+
+
+def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str, timestamp_str: str):
+    """Create callback for camera capture completion."""
+    def callback(success, image_path, error_msg):
+        if success and image_path:
+            _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str)
+    return callback
 
 def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_id: dict, timestamp_str: str) -> list:
     """Detect state changes and return change events. Also enqueue camera tasks if enabled."""
@@ -229,22 +235,17 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                 if preset:
                     try:
                         timestamp_obj = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-
-                        # Create callback to log image path after capture
-                        def make_callback(slot_id, slot_name, zone, timestamp_str):
-                            def callback(success, image_path, error_msg):
-                                if success and image_path:
-                                    _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str)
-                            return callback
+                        slot_name = meta.get("name", str(sid))
+                        zone = meta.get("zone", "A")
 
                         _camera_queue.add_task({
                             "slot_id": sid,
-                            "slot_name": meta.get("name", str(sid)),
-                            "zone": meta.get("zone", "A"),
+                            "slot_name": slot_name,
+                            "zone": zone,
                             "preset": preset,
                             "timestamp": timestamp_obj,
                             "event_id": f"{sid}_{timestamp_str}",
-                            "callback": make_callback(sid, meta.get("name", str(sid)), meta.get("zone", "A"), timestamp_str)
+                            "callback": _make_camera_capture_callback(sid, slot_name, zone, timestamp_str)
                         })
                     except Exception as e:
                         print(f"Error enqueueing camera task for slot {sid}: {e}")
@@ -301,73 +302,96 @@ def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -
     return None
 
 
+def _is_duplicate_reading(slot_snapshot: dict, x: float, y: float, z: float) -> bool:
+    """Check if sensor reading is duplicate of last reading."""
+    return (x == slot_snapshot.get("last_x") and
+            y == slot_snapshot.get("last_y") and
+            z == slot_snapshot.get("last_z"))
+
+
+def _update_slot_occupancy_state(slot_snapshot: dict, x: float, y: float, z: float):
+    """Update slot occupancy state based on magnetic field distance from baseline."""
+    slot_snapshot.update({"last_x": x, "last_y": y, "last_z": z})
+
+    baseline_x = slot_snapshot.get("baseline_x")
+    baseline_y = slot_snapshot.get("baseline_y")
+    baseline_z = slot_snapshot.get("baseline_z")
+    consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
+
+    if baseline_x is not None and baseline_y is not None and baseline_z is not None:
+        distance = calculate_distance(x, y, z, baseline_x, baseline_y, baseline_z)
+
+        if distance > DISTANCE_THRESHOLD:
+            consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
+        elif distance <= DISTANCE_THRESHOLD * 0.9:
+            consecutive_occupied = 0
+
+        slot_snapshot["consecutive_occupied"] = consecutive_occupied
+        slot_snapshot["last_distance"] = round(distance, 2)
+
+        if consecutive_occupied == 0:
+            _update_slot_baseline(slot_snapshot, x, y, z)
+    else:
+        slot_snapshot["consecutive_occupied"] = 0
+
+
+def _compute_occupied_slots(slots_snapshot: dict, all_slot_ids: list) -> set:
+    """Compute set of occupied slot IDs from snapshot data."""
+    return {
+        sid for sid in all_slot_ids
+        if slots_snapshot.get(str(sid), {}).get("consecutive_occupied", 0) >= CONSECUTIVE_COUNT_REQUIRED
+    }
+
+
+def _log_events_to_file(events: list):
+    """Write events to event log file."""
+    if not events:
+        return
+
+    rotate_log_if_needed(max_size_mb=50)
+    with _event_log_lock:
+        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+            for evt in events:
+                f.write(json.dumps(evt) + "\n")
+            f.flush()
+
+
 def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timestamp_str: str):
     """Process sensor data from MQTT and update occupancy state."""
     global _mqtt_previous_states, _mqtt_last_snapshot_time
-    
+
     meta_by_id = load_slot_meta_by_id()
     all_configured_ids = load_slot_ids()
-    
+
     with _snapshot_lock:
         snapshot_data = load_snapshot_data()
         slots_snapshot = snapshot_data.get("slots", {})
         slot_key = str(slot_id)
         slot_snapshot = slots_snapshot.get(slot_key, {})
-        
-        # Check for duplicate data
-        if (x == slot_snapshot.get("last_x") and 
-            y == slot_snapshot.get("last_y") and 
-            z == slot_snapshot.get("last_z")):
+
+        if _is_duplicate_reading(slot_snapshot, x, y, z):
             return
-        
-        # Update last readings
-        slot_snapshot.update({"last_x": x, "last_y": y, "last_z": z})
-        
-        baseline_x = slot_snapshot.get("baseline_x")
-        baseline_y = slot_snapshot.get("baseline_y")
-        baseline_z = slot_snapshot.get("baseline_z")
-        consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
-        
-        if baseline_x is not None and baseline_y is not None and baseline_z is not None:
-            distance = calculate_distance(x, y, z, baseline_x, baseline_y, baseline_z)
-            
-            if distance > DISTANCE_THRESHOLD:
-                consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
-            elif distance <= DISTANCE_THRESHOLD * 0.9:
-                consecutive_occupied = 0
-            
-            slot_snapshot["consecutive_occupied"] = consecutive_occupied
-            slot_snapshot["last_distance"] = round(distance, 2)
-            
-            if consecutive_occupied == 0:
-                _update_slot_baseline(slot_snapshot, x, y, z)
-        else:
-            slot_snapshot["consecutive_occupied"] = 0
-        
+
+        _update_slot_occupancy_state(slot_snapshot, x, y, z)
         slots_snapshot[slot_key] = slot_snapshot
-        
-        # Build occupied_ids from current snapshot (avoid reloading)
-        occupied_ids = {
-            sid for sid in all_configured_ids
-            if slots_snapshot.get(str(sid), {}).get("consecutive_occupied", 0) >= CONSECUTIVE_COUNT_REQUIRED
-        }
-        
+
+        occupied_ids = _compute_occupied_slots(slots_snapshot, all_configured_ids)
         save_snapshot_data({"slots": slots_snapshot})
-    
+
     # State change detection and logging
     current_states = {sid: "OCCUPIED" if sid in occupied_ids else "FREE" for sid in all_configured_ids}
     timestamp = datetime.now(timezone.utc)
-    
+
     events_to_log = _detect_state_changes(current_states, _mqtt_previous_states, meta_by_id, timestamp_str)
     has_state_changes = bool(events_to_log)
     _mqtt_previous_states = current_states.copy()
-    
+
     zones_stats, free_count, total_count = _calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
-    
+
     # Log snapshot periodically or on state changes
     if _mqtt_last_snapshot_time is None:
         _mqtt_last_snapshot_time = timestamp
-    
+
     if has_state_changes or (timestamp - _mqtt_last_snapshot_time) >= timedelta(minutes=1):
         events_to_log.append({
             "event": "snapshot",
@@ -378,14 +402,8 @@ def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timest
             "free_count": free_count
         })
         _mqtt_last_snapshot_time = timestamp
-    
-    if events_to_log:
-        rotate_log_if_needed(max_size_mb=50)
-        with _event_log_lock:
-            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-                for evt in events_to_log:
-                    f.write(json.dumps(evt) + "\n")
-                f.flush()
+
+    _log_events_to_file(events_to_log)
 
 
 def on_mqtt_message(client, userdata, msg):
