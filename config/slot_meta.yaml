@@ -4,12 +4,12 @@
 - id: 1
   name: A01
   zone: A
-  preset: 2
+  preset: 1
   device_name: A1  # ChirpStack device name
 - id: 2
   name: A02
   zone: A
-  preset: 3
+  preset: 2
   device_name: A2
 - id: 3
   name: A03
@@ -27,10 +27,10 @@
   preset: 5
   device_name: A5
 - id: 6
-  name: B04
+  name: B12
   zone: B
   preset: 6
-  device_name: B4
+  device_name: B12
 - id: 7
   name: B07
   zone: B

@@ -257,7 +257,8 @@ def decode_uplink(payload_base64: str) -> dict:
     """
     try:
         data_bytes = base64.b64decode(payload_base64)
-        status = data_bytes.decode('utf-8').strip()
+        # Convert raw bytes to hex string (e.g. b'\x00' -> "00", b'\xcd' -> "cd")
+        status = data_bytes.hex().lower()
     except Exception as e:
         print(f"Error decoding payload: {e}")
         status = "unknown"
@@ -284,20 +285,13 @@ def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -
 def _update_slot_occupancy_state(slot_snapshot: dict, status: str):
     """Update slot occupancy state based on device status."""
     prev_status = slot_snapshot.get("last_status")
-    slot_snapshot["last_status"] = status
 
-    # Map status to consecutive_occupied count for compatibility
-    if status == "01":
-        slot_snapshot["consecutive_occupied"] = CONSECUTIVE_COUNT_REQUIRED
-    elif status == "00":
-        slot_snapshot["consecutive_occupied"] = 0
+    # Update state directly from status (00=Free, 01=Occupied)
+    if status in ("00", "01"):
+        slot_snapshot["last_status"] = status
     elif status == "cd":
         # Log calibration done event separately or just note it
         print(f"Device reported Calibration Done (cd)")
-        # Calibration doesn't change occupancy state directly, maybe reset?
-        # For now, let's treat it as no-change or maybe force reset?
-        # "cd" means it just finished calibrating, likely empty?
-        # Let's assume it doesn't change occupancy unless followed by 00/01
         pass
 
 
@@ -305,7 +299,7 @@ def _compute_occupied_slots(slots_snapshot: dict, all_slot_ids: list) -> set:
     """Compute set of occupied slot IDs from snapshot data."""
     return {
         sid for sid in all_slot_ids
-        if slots_snapshot.get(str(sid), {}).get("consecutive_occupied", 0) >= CONSECUTIVE_COUNT_REQUIRED
+        if slots_snapshot.get(str(sid), {}).get("last_status") == "01"
     }
 
 
@@ -324,7 +318,7 @@ def _log_events_to_file(events: list):
 
 def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str):
     """Process sensor data from MQTT and update occupancy state."""
-    global _mqtt_previous_states, _mqtt_last_snapshot_time
+    global _mqtt_previous_states, _mqtt_last_snapshot_time, _state_cache
 
     meta_by_id = load_slot_meta_by_id()
     all_configured_ids = load_slot_ids()
@@ -341,6 +335,9 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str):
 
         occupied_ids = _compute_occupied_slots(slots_snapshot, all_configured_ids)
         save_snapshot_data({"slots": slots_snapshot})
+
+    # Invalidate cache so next /state request gets fresh data
+    _state_cache = None
 
     # State change detection and logging
     current_states = {sid: "OCCUPIED" if sid in occupied_ids else "FREE" for sid in all_configured_ids}
