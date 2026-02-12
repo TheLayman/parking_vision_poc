@@ -110,9 +110,9 @@ def save_snapshot_data(data: dict):
     except yaml.YAMLError as e:
         print(f"YAML serialization error: {e}")
 
-def calculate_distance(x, y, z, bx, by, bz) -> float:
-    """Calculate Euclidean distance between current and baseline magnetic field vectors."""
-    return math.sqrt((x - bx) ** 2 + (y - by) ** 2 + (z - bz) ** 2)
+
+
+# calculate_distance and _update_slot_baseline removed
 
 def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Dict[int, dict]) -> tuple:
     """Calculate zone statistics and counts. Returns (zones_stats, free_count, total_count)."""
@@ -138,16 +138,6 @@ def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Di
     return zones_stats, free_count, total_count
 
 
-def _update_slot_baseline(slot_snapshot: dict, r: float, y: float, b: float, alpha: float = 0.01):
-    """Update baseline values with exponential moving average."""
-    baseline_x = slot_snapshot.get("baseline_x")
-    baseline_y = slot_snapshot.get("baseline_y")
-    baseline_z = slot_snapshot.get("baseline_z")
-
-    if baseline_x is not None and baseline_y is not None and baseline_z is not None:
-        slot_snapshot["baseline_x"] = round(baseline_x * (1 - alpha) + r * alpha, 2)
-        slot_snapshot["baseline_y"] = round(baseline_y * (1 - alpha) + y * alpha, 2)
-        slot_snapshot["baseline_z"] = round(baseline_z * (1 - alpha) + b * alpha, 2)
 
 def rotate_log_if_needed(max_size_mb=50):
     """Rotate event log if it exceeds max size to prevent disk exhaustion."""
@@ -256,35 +246,24 @@ def decode_uplink(payload_base64: str) -> dict:
     """
     Decode the LoRaWAN uplink payload.
     
-    Payload format (8 bytes):
-        - Bytes 0-1: X accelerometer (signed int16, divide by 100)
-        - Bytes 2-3: Y accelerometer (signed int16, divide by 100)
-        - Bytes 4-5: Z accelerometer (signed int16, divide by 100)
-        - Bytes 6-7: Temperature (signed int16, divide by 100) - ignored
+    New Payload format:
+        - String: "cd" (Calibration Done), "00" (Empty), "01" (Occupied)
         
     Args:
         payload_base64: Base64 encoded payload string
         
     Returns:
-        dict with x, y, z values and timestamp
+        dict with status and timestamp
     """
-    data = base64.b64decode(payload_base64)
-    
-    def read_int16(index):
-        """Read a signed 16-bit integer from bytes at given index"""
-        val = (data[index] << 8) | data[index + 1]
-        if val & 0x8000:  # Check sign bit
-            val -= 0x10000  # Convert to signed
-        return val
-    
-    # Parse accelerometer values (each is 2 bytes, scaled by 100)
-    x = read_int16(0) / 100
-    y = read_int16(2) / 100
-    z = read_int16(4) / 100
+    try:
+        data_bytes = base64.b64decode(payload_base64)
+        status = data_bytes.decode('utf-8').strip()
+    except Exception as e:
+        print(f"Error decoding payload: {e}")
+        status = "unknown"
     
     timestamp = datetime.now(timezone.utc).isoformat()
-    
-    return {"x": x, "y": y, "z": z, "timestamp": timestamp}
+    return {"status": status, "timestamp": timestamp}
 
 
 def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -> int | None:
@@ -302,37 +281,24 @@ def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -
     return None
 
 
-def _is_duplicate_reading(slot_snapshot: dict, x: float, y: float, z: float) -> bool:
-    """Check if sensor reading is duplicate of last reading."""
-    return (x == slot_snapshot.get("last_x") and
-            y == slot_snapshot.get("last_y") and
-            z == slot_snapshot.get("last_z"))
+def _update_slot_occupancy_state(slot_snapshot: dict, status: str):
+    """Update slot occupancy state based on device status."""
+    prev_status = slot_snapshot.get("last_status")
+    slot_snapshot["last_status"] = status
 
-
-def _update_slot_occupancy_state(slot_snapshot: dict, x: float, y: float, z: float):
-    """Update slot occupancy state based on magnetic field distance from baseline."""
-    slot_snapshot.update({"last_x": x, "last_y": y, "last_z": z})
-
-    baseline_x = slot_snapshot.get("baseline_x")
-    baseline_y = slot_snapshot.get("baseline_y")
-    baseline_z = slot_snapshot.get("baseline_z")
-    consecutive_occupied = slot_snapshot.get("consecutive_occupied", 0)
-
-    if baseline_x is not None and baseline_y is not None and baseline_z is not None:
-        distance = calculate_distance(x, y, z, baseline_x, baseline_y, baseline_z)
-
-        if distance > DISTANCE_THRESHOLD:
-            consecutive_occupied = min(consecutive_occupied + 1, CONSECUTIVE_COUNT_REQUIRED)
-        elif distance <= DISTANCE_THRESHOLD * 0.9:
-            consecutive_occupied = 0
-
-        slot_snapshot["consecutive_occupied"] = consecutive_occupied
-        slot_snapshot["last_distance"] = round(distance, 2)
-
-        if consecutive_occupied == 0:
-            _update_slot_baseline(slot_snapshot, x, y, z)
-    else:
+    # Map status to consecutive_occupied count for compatibility
+    if status == "01":
+        slot_snapshot["consecutive_occupied"] = CONSECUTIVE_COUNT_REQUIRED
+    elif status == "00":
         slot_snapshot["consecutive_occupied"] = 0
+    elif status == "cd":
+        # Log calibration done event separately or just note it
+        print(f"Device reported Calibration Done (cd)")
+        # Calibration doesn't change occupancy state directly, maybe reset?
+        # For now, let's treat it as no-change or maybe force reset?
+        # "cd" means it just finished calibrating, likely empty?
+        # Let's assume it doesn't change occupancy unless followed by 00/01
+        pass
 
 
 def _compute_occupied_slots(slots_snapshot: dict, all_slot_ids: list) -> set:
@@ -356,7 +322,7 @@ def _log_events_to_file(events: list):
             f.flush()
 
 
-def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timestamp_str: str):
+def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str):
     """Process sensor data from MQTT and update occupancy state."""
     global _mqtt_previous_states, _mqtt_last_snapshot_time
 
@@ -369,10 +335,8 @@ def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timest
         slot_key = str(slot_id)
         slot_snapshot = slots_snapshot.get(slot_key, {})
 
-        if _is_duplicate_reading(slot_snapshot, x, y, z):
-            return
-
-        _update_slot_occupancy_state(slot_snapshot, x, y, z)
+        # Update state directly from status
+        _update_slot_occupancy_state(slot_snapshot, status)
         slots_snapshot[slot_key] = slot_snapshot
 
         occupied_ids = _compute_occupied_slots(slots_snapshot, all_configured_ids)
@@ -383,6 +347,17 @@ def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timest
     timestamp = datetime.now(timezone.utc)
 
     events_to_log = _detect_state_changes(current_states, _mqtt_previous_states, meta_by_id, timestamp_str)
+    
+    # If "cd" (Calibration Done) was received, log a specific event
+    if status == "cd":
+        events_to_log.append({
+            "event": "device_calibration",
+            "ts": timestamp_str,
+            "slot_id": slot_id,
+            "slot_name": meta_by_id.get(slot_id, {}).get("name", str(slot_id)),
+            "message": "Device completed calibration"
+        })
+
     has_state_changes = bool(events_to_log)
     _mqtt_previous_states = current_states.copy()
 
@@ -409,7 +384,7 @@ def _process_mqtt_sensor_data(slot_id: int, x: float, y: float, z: float, timest
 def on_mqtt_message(client, userdata, msg):
     """
     Handle incoming MQTT messages from ChirpStack/LoRaWAN.
-    Decodes the payload and processes sensor data for occupancy detection.
+    Decodes the payload and processes sensor status.
     """
     global _mqtt_last_snapshot_time
     
@@ -426,10 +401,10 @@ def on_mqtt_message(client, userdata, msg):
         
         # Decode the LoRaWAN payload
         decoded = decode_uplink(raw_data)
-        x, y, z = decoded['x'], decoded['y'], decoded['z']
+        status = decoded['status']
         timestamp_str = decoded['timestamp']
         
-        print(f"MQTT Device: {device_name} | x: {x}, y: {y}, z: {z} | ts: {timestamp_str}")
+        print(f"MQTT Device: {device_name} | status: {status} | ts: {timestamp_str}")
         
         # Map device name to slot ID
         meta_by_id = load_slot_meta_by_id()
@@ -440,10 +415,7 @@ def on_mqtt_message(client, userdata, msg):
             return
         
         # Process the sensor data
-        _process_mqtt_sensor_data(slot_id, x, y, z, timestamp_str)
-        
-        # Add sample for calibration if active
-        add_calibration_sample(slot_id, x, y, z)
+        _process_mqtt_sensor_data(slot_id, status, timestamp_str)
         
     except Exception as e:
         print(f"Error processing MQTT message: {e}")
@@ -889,94 +861,10 @@ def get_snapshot():
     return snapshot_data
 
 
-# Storage for calibration samples (slot_id -> list of {x, y, z} samples)
-_calibration_samples: Dict[int, list] = {}
-_calibration_active: Dict[int, bool] = {}
 
+# Legacy calibration functions removed
+# Use "cd" payload status from device if calibration is needed
 
-async def _collect_mqtt_calibration_samples(slot_id: int, samples_needed: int = 10, timeout: int = 60) -> list:
-    """
-    Collect calibration samples from MQTT data.
-    Waits for new MQTT readings to come in and collects them.
-    """
-    _calibration_samples[slot_id] = []
-    _calibration_active[slot_id] = True
-    
-    start_time = datetime.now(timezone.utc)
-    max_wait = timedelta(seconds=timeout)
-    
-    while len(_calibration_samples.get(slot_id, [])) < samples_needed:
-        if datetime.now(timezone.utc) - start_time > max_wait:
-            break
-        await asyncio.sleep(1)
-    
-    _calibration_active[slot_id] = False
-    samples = _calibration_samples.get(slot_id, [])
-    _calibration_samples.pop(slot_id, None)
-    return samples
-
-
-def add_calibration_sample(slot_id: int, x: float, y: float, z: float):
-    """Called from MQTT handler to add calibration samples when calibration is active."""
-    if _calibration_active.get(slot_id, False):
-        if slot_id not in _calibration_samples:
-            _calibration_samples[slot_id] = []
-        _calibration_samples[slot_id].append({"x": x, "y": y, "z": z})
-
-
-@app.post("/calibrate/{slot_id}")
-async def calibrate_single_slot(slot_id: int):
-    """
-    Calibrate a slot by collecting 5 sample readings from MQTT and averaging them.
-    Waits up to 120 seconds for samples to arrive.
-    """
-    if slot_id < 1:
-        return {"success": False, "message": "Invalid slot_id: must be positive integer"}
-
-    meta_by_id = load_slot_meta_by_id()
-    if slot_id not in meta_by_id:
-        return {"success": False, "message": f"Slot {slot_id} not configured in slot_meta.yaml"}
-
-    # Collect 5 samples from MQTT
-    print(f"Starting calibration for slot {slot_id}, waiting for 5 samples...")
-    samples = await _collect_mqtt_calibration_samples(slot_id, samples_needed=5, timeout=120)
-    
-    if len(samples) < 5:
-        return {
-            "success": False, 
-            "message": f"Insufficient samples: {len(samples)}/5. Timeout waiting for MQTT data. Check if sensor is transmitting."
-        }
-    
-    # Calculate averages
-    avg_x = sum(s["x"] for s in samples) / len(samples)
-    avg_y = sum(s["y"] for s in samples) / len(samples)
-    avg_z = sum(s["z"] for s in samples) / len(samples)
-    
-    if abs(avg_x) < 0.1 and abs(avg_y) < 0.1 and abs(avg_z) < 0.1:
-        return {"success": False, "message": "Invalid baseline: all values near zero. Check sensor connection."}
-
-    with _snapshot_lock:
-        snapshot_data = load_snapshot_data()
-        slots_snapshot = snapshot_data.get("slots", {})
-        slot_key = str(slot_id)
-        slots_snapshot.setdefault(slot_key, {}).update({
-            "baseline_x": round(avg_x, 2),
-            "baseline_y": round(avg_y, 2),
-            "baseline_z": round(avg_z, 2),
-            "consecutive_occupied": 0,
-            "calibrated_at": datetime.now(timezone.utc).isoformat()
-        })
-        save_snapshot_data({"slots": slots_snapshot})
-    
-    print(f"Calibration complete for slot {slot_id}: x={round(avg_x, 2)}, y={round(avg_y, 2)}, z={round(avg_z, 2)}")
-
-    return {
-        "success": True,
-        "message": f"Calibrated slot {slot_id} with {len(samples)} samples",
-        "baseline_x": round(avg_x, 2),
-        "baseline_y": round(avg_y, 2),
-        "baseline_z": round(avg_z, 2)
-    }
 
 
 @app.get("/alerts")
