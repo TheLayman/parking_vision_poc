@@ -27,33 +27,33 @@
   preset: 5
   device_name: A5
 - id: 6
-  name: B12
+  name: B1
   zone: B
   preset: 6
   device_name: B12
 - id: 7
-  name: B07
+  name: B2
   zone: B
   preset: 7
   device_name: B7
 - id: 8
-  name: B08
+  name: B3
   zone: B
   preset: 8
   device_name: B8
 - id: 9
-  name: C09
-  zone: C
+  name: B4
+  zone: B
   preset: 9
   device_name: C9
 - id: 10
-  name: C10
-  zone: C
+  name: B5
+  zone: B
   preset: 10
   device_name: C10
 - id: 11
-  name: C11
-  zone: C
+  name: B6
+  zone: B
   preset: 11
   device_name: C11
 - id: 12

@@ -50,10 +50,6 @@ SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
 EVENT_LOG_PATH = REPO_ROOT / "data" / "occupancy_events.jsonl"
 SNAPSHOT_PATH = REPO_ROOT / "data" / "snapshot.yaml"
 
-# Occupancy detection settings
-DISTANCE_THRESHOLD = 7.5  # Magnetic field distance threshold
-CONSECUTIVE_COUNT_REQUIRED = 3  # Number of consecutive readings to confirm state
-
 app = FastAPI(title="Parking Vision Dashboard")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
@@ -112,7 +108,7 @@ def save_snapshot_data(data: dict):
 
 
 
-# calculate_distance and _update_slot_baseline removed
+# _update_slot_baseline removed
 
 def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Dict[int, dict]) -> tuple:
     """Calculate zone statistics and counts. Returns (zones_stats, free_count, total_count)."""
@@ -163,6 +159,9 @@ ENABLE_MQTT = int(os.getenv("ENABLE_MQTT", "1"))  # Enable MQTT by default
 _mqtt_client = None
 _mqtt_previous_states: Dict[int, str] = {}
 _mqtt_last_snapshot_time = None
+
+# Device mapping for command queuing: slot_id -> {"applicationId": str, "devEui": str}
+_device_map: Dict[int, dict] = {}
 
 
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
@@ -316,6 +315,48 @@ def _log_events_to_file(events: list):
             f.flush()
 
 
+def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
+    """
+    Queue a downlink command for a device via ChirpStack MQTT.
+    For Class A devices, this will be sent after the next uplink.
+    """
+    if _mqtt_client is None:
+        print("Error: MQTT client not initialized")
+        return False
+
+    device_info = _device_map.get(slot_id)
+    if not device_info:
+        print(f"Error: No device mapping found for slot {slot_id}")
+        return False
+
+    app_id = device_info.get("applicationId")
+    dev_eui = device_info.get("devEui")
+
+    if not (app_id and dev_eui):
+        print(f"Error: Incomplete device info for slot {slot_id}")
+        return False
+
+    topic = f"application/{app_id}/device/{dev_eui}/command/down"
+    
+    try:
+        # Convert hex string to base64
+        data_bytes = bytes.fromhex(data_hex)
+        data_b64 = base64.b64encode(data_bytes).decode("ascii")
+        
+        payload = {
+            "confirmed": False,
+            "fPort": fport,
+            "data": data_b64
+        }
+        
+        _mqtt_client.publish(topic, json.dumps(payload))
+        print(f"Queued command for slot {slot_id} (topic: {topic})")
+        return True
+    except Exception as e:
+        print(f"Error queuing command: {e}")
+        return False
+
+
 def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str):
     """Process sensor data from MQTT and update occupancy state."""
     global _mqtt_previous_states, _mqtt_last_snapshot_time, _state_cache
@@ -411,6 +452,16 @@ def on_mqtt_message(client, userdata, msg):
             print(f"Warning: Device '{device_name}' not mapped to any slot")
             return
         
+        # Update device map with info needed for downlink
+        app_id = payload.get('deviceInfo', {}).get('applicationId')
+        dev_eui = payload.get('deviceInfo', {}).get('devEui')
+        
+        if app_id and dev_eui:
+            _device_map[slot_id] = {
+                "applicationId": app_id,
+                "devEui": dev_eui
+            }
+
         # Process the sensor data
         _process_mqtt_sensor_data(slot_id, status, timestamp_str)
         
@@ -662,6 +713,53 @@ def state():
     _state_cache = result
     _state_cache_time = now
     return result
+
+
+from pydantic import BaseModel
+
+class CommandRequestModel(BaseModel):
+    command: str
+
+
+@app.post("/calibrate/{slot_id}")
+def calibrate_slot(slot_id: int):
+    """
+    Trigger calibration for a specific slot.
+    Sends command 'CC' (hex) to the device.
+    """
+    # Hex code for calibration command
+    # Adjust this value if your device expects a different command
+    CALIBRATION_COMMAND = "CC"
+    
+    success = queue_command(slot_id, CALIBRATION_COMMAND)
+    
+    if not success:
+        if slot_id not in _device_map:
+            raise HTTPException(status_code=404, detail="Device not connected or mapped yet. Wait for an uplink.")
+        raise HTTPException(status_code=500, detail="Failed to queue calibration command")
+        
+    return {"success": True, "message": f"Calibration command queued for slot {slot_id}"}
+
+@app.post("/setThreshold/{slot_id}/{threshold}")
+def setThreshold_slot(slot_id: int, threshold: float):
+    """
+    Set threshold for a specific slot.
+    Sends threshold in hex to the device.
+    """
+    # Hex code for calibration command
+    # Adjust this value if your device expects a different command
+
+    threshold = threshold*2
+    THRESHOLD_COMMAND = "DD"+threshold.hex()
+    
+    success = queue_command(slot_id, THRESHOLD_COMMAND)
+    
+    if not success:
+        if slot_id not in _device_map:
+            raise HTTPException(status_code=404, detail="Device not connected or mapped yet. Wait for an uplink.")
+        raise HTTPException(status_code=500, detail="Failed to queue threshold command")
+        
+    return {"success": True, "message": f"Threshold command queued for slot {slot_id}"}
 
 
 @app.get("/events")

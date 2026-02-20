@@ -1,0 +1,51 @@
+/Users/anusha/Workspace/parking_vision_poc/webapp/server.py:513: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+/opt/homebrew/lib/python3.14/site-packages/fastapi/applications.py:4580: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  return self.router.on_event(event_type)
+/Users/anusha/Workspace/parking_vision_poc/webapp/server.py:561: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+FF
+======================================================================
+FAIL: test_api_endpoint (__main__.TestChirpStackCommand.test_api_endpoint)
+Test the API endpoint triggers the command queue.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/anusha/Workspace/parking_vision_poc/tests/test_chirpstack_command.py", line 112, in test_api_endpoint
+    self.assertEqual(response.status_code, 200)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 500 != 200
+
+======================================================================
+FAIL: test_queue_command_flow (__main__.TestChirpStackCommand.test_queue_command_flow)
+Test the full flow:
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/anusha/Workspace/parking_vision_poc/tests/test_chirpstack_command.py", line 76, in test_queue_command_flow
+    self.assertTrue(success)
+    ~~~~~~~~~~~~~~~^^^^^^^^^
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.101s
+
+FAILED (failures=2)
+License plate extractor not available: No module named 'easyocr'
+Error: MQTT client not initialized
+MQTT Device: A1 | status: 00 | ts: 2026-02-12T11:57:09.987414+00:00
+Error: MQTT client not initialized
+DEBUG: queue_command failed. _mqtt_client: <MagicMock id='4628547968'>, _device_map: {1: {'applicationId': '123', 'devEui': 'aabbccddeeff0011'}}
