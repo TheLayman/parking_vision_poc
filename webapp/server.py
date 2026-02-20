@@ -342,14 +342,21 @@ def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
         # Convert hex string to base64
         data_bytes = bytes.fromhex(data_hex)
         data_b64 = base64.b64encode(data_bytes).decode("ascii")
-        
+
+        # ChirpStack v4 MQTT downlink format requires the payload wrapped
+        # inside "deviceQueueItem"; a bare object is silently ignored.
         payload = {
-            "confirmed": False,
-            "fPort": fport,
-            "data": data_b64
+            "deviceQueueItem": {
+                "confirmed": False,
+                "fPort": fport,
+                "data": data_b64
+            }
         }
-        
-        _mqtt_client.publish(topic, json.dumps(payload))
+
+        result = _mqtt_client.publish(topic, json.dumps(payload), qos=1)
+        if result.rc != 0:
+            print(f"Warning: publish returned rc={result.rc} for slot {slot_id}")
+            return False
         print(f"Queued command for slot {slot_id} (topic: {topic})")
         return True
     except Exception as e:
@@ -746,11 +753,14 @@ def setThreshold_slot(slot_id: int, threshold: float):
     Set threshold for a specific slot.
     Sends threshold in hex to the device.
     """
-    # Hex code for calibration command
+    # Hex code for calibration commandf
     # Adjust this value if your device expects a different command
 
-    threshold = threshold*2
-    THRESHOLD_COMMAND = "DD"+threshold.hex()
+    import struct
+    # Scale to integer (multiply by 2 as before) and pack as big-endian uint16
+    threshold_int = int(threshold * 2)
+    threshold_hex = struct.pack(">H", threshold_int).hex()
+    THRESHOLD_COMMAND = "DD" + threshold_hex
     
     success = queue_command(slot_id, THRESHOLD_COMMAND)
     
