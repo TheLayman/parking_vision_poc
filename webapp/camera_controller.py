@@ -64,7 +64,7 @@ class CameraController:
 
     def move_to_preset(self, preset_number: int) -> bool:
         """
-        Move camera to preset position (1-256).
+        Move camera to preset position (Tyco Illustra API).
 
         Args:
             preset_number: Preset position number (1-256)
@@ -77,31 +77,23 @@ class CameraController:
             return False
 
         try:
-            # Camera API command format
-            payload = f"0x8000062{preset_number-1:02X}081"
-            params = {
-                'command': '0x09A5',
-                'type': 'P_OCTET',
-                'direction': 'WRITE',
-                'num': '1',
-                'payload': payload
-            }
+            # Tyco Illustra ISAPI format
+            url = f"http://{self.ip}/ISAPI/PTZCtrl/channels/1/presets/{preset_number}/goto"
 
             print(f"Moving camera to preset {preset_number}...")
-            response = requests.get(
-                f"http://{self.ip}/rcp.xml",
-                params=params,
+            response = requests.put(
+                url,
                 auth=self.auth,
                 timeout=5
             )
 
-            # Check if command was accepted
-            success = "<str>" in response.text and "<err>" not in response.text
+            # Check if command was accepted (200-299 range)
+            success = 200 <= response.status_code < 300
 
             if success:
                 print(f"Camera movement command accepted (preset {preset_number})")
             else:
-                print(f"Camera movement command failed (preset {preset_number})")
+                print(f"Camera movement command failed (preset {preset_number}): Status {response.status_code}")
 
             return success
 

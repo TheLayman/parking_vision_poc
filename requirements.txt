@@ -7,3 +7,5 @@ fastapi
 uvicorn
 requests
 python-dotenv
+paho-mqtt
+easyocr

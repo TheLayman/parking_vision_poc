@@ -1301,8 +1301,8 @@ html, body {
 
 .alert-details {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
   padding-top: 14px;
   margin-top: 4px;
   border-top: 1px solid rgba(99, 102, 241, 0.1);
@@ -1330,11 +1330,48 @@ html, body {
   opacity: 0.6;
 }
 
+.alert-license-plate {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+  letter-spacing: 1px;
+  transition: all 0.3s ease;
+}
+
+.alert-license-plate.has-plate {
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.2) 0%, rgba(37, 99, 235, 0.3) 100%);
+  color: #93c5fd;
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.1);
+}
+
+.alert-license-plate.no-plate {
+  background: rgba(99, 102, 241, 0.1);
+  color: var(--muted);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  opacity: 0.7;
+}
+
+.alert-license-plate svg {
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
+.alert-license-plate .plate-text {
+  font-size: 14px;
+}
+
 .alert-time {
   font-size: 12px;
   color: var(--muted);
   font-weight: 500;
   opacity: 0.8;
+  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 6px;

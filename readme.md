@@ -1,43 +1,28 @@
-# 🅿️ Parking Occupancy Dashboard POC
+# 🅿️ Parking Occupancy Detection System
 
-Real-time dashboard for parking slot occupancy using **3-axis magnetometer detection**. Detects vehicle presence by measuring magnetic field distortions and provides live monitoring with analytics.
-
-## 📝 Recent Updates
-
-**Camera Control & Alerts System (Jan 2026)**
-- 📸 PTZ camera integration with automatic preset positioning on state changes
-- 🚨 New Alerts dashboard tab with real-time state changes and camera snapshots
-- 🔄 Sequential task queue to prevent concurrent camera commands
-- 🎛️ Environment variable control: `ENABLE_CAMERA_CONTROL` for easy testing without hardware
-- 🖼️ Image capture via RTSP with 8-second camera settle time
-- 🧵 Thread-safe camera worker with graceful error handling
-
-**Code Refactoring (Jan 2026)**
-- Reduced [server.py](webapp/server.py) from 857 → 754 lines (12% reduction)
-- Extracted helper functions: `_process_slot_item()`, `_detect_state_changes()`, `_calculate_zone_stats()`
-- Refactored analytics pipeline into modular functions for better maintainability
-- All functionality tested: calibration ✓, state transitions ✓, real-time updates ✓
-
-## ✨ Features
-
-- **Magnetic Field Detection** — Uses Euclidean distance from baseline (r,y,b values) with 7.5 threshold and hysteresis to prevent false positives
-- **Smart Calibration** — Automatic baseline learning (α=0.01) when slots are free + manual calibration endpoint
-- **Live Dashboard** — Real-time visualization (🔴 Occupied / 🟢 Free) via Server-Sent Events with 50-connection limit
-- **📸 Camera Control** — PTZ camera automatically moves to preset positions and captures images on state changes
-- **🚨 Alerts System** — New dashboard tab showing real-time alerts with captured images and state transition history
-- **Analytics Module** — Occupancy trends, dwell times, peak hours with 30s response caching
-- **Auto Log Rotation** — Events rotate at 50 MB to prevent disk exhaustion
-- **Thread-Safe** — Snapshot and event log locks prevent data corruption
-- **Production Ready** — Configurable API polling with Bearer token auth
+Real-time parking slot occupancy monitoring using **LoRaWAN magnetometer sensors** with PTZ camera integration for visual verification.
 
 ---
 
-## 📋 Requirements
+## Features
 
-| Component | Requirement |
-|-----------|-------------|
-| **Python** | 3.9+ |
-| **OS** | Windows, Linux, or macOS |
+- **LoRaWAN Sensor Integration** — Receives magnetic field data via MQTT from ChirpStack
+- **Magnetic Field Detection** — Euclidean distance-based occupancy detection with hysteresis
+- **Smart Calibration** — MQTT-based calibration with automatic baseline learning
+- **PTZ Camera Control** — Automatic camera positioning and image capture on state changes
+- **License Plate Recognition** — EasyOCR-based extraction with Indian plate pattern matching
+- **Live Dashboard** — Real-time visualization with Server-Sent Events
+- **Analytics** — Occupancy trends, dwell time analysis, and predictions
+- **Thread-Safe** — Concurrent MQTT message handling with proper locking
+
+---
+
+## Requirements
+
+- Python 3.9+
+- MQTT Broker (Mosquitto, ChirpStack, etc.)
+- LoRaWAN sensors with 3-axis magnetometer (sending via ChirpStack)
+- PTZ Camera with preset support (optional)
 
 ### Installation
 
@@ -47,69 +32,157 @@ pip install -r requirements.txt
 
 ---
 
-## 📁 Project Structure
+## Configuration
 
+### 1. Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# MQTT Configuration
+MQTT_BROKER=localhost
+MQTT_PORT=1883
+MQTT_TOPIC=application/+/device/+/event/up
+ENABLE_MQTT=1
+
+# Camera Configuration (optional)
+ENABLE_CAMERA_CONTROL=false
+CAMERA_IP=192.168.1.100
+CAMERA_USER=admin
+CAMERA_PASS=your_password
+CAMERA_RTSP_URL=rtsp://admin:password@192.168.1.100/stream1
 ```
-parking_vision_poc/
-├── config/
-│   └── slot_meta.yaml        # Slot names, zones, and camera presets
-├── data/
-│   ├── occupancy_events.jsonl # (Generated) History of state changes
-│   └── camera_snapshots/     # (Generated) Captured images from camera
-├── webapp/
-│   ├── server.py             # FastAPI backend (SSE + Analytics + Camera API)
-│   ├── camera_controller.py  # Camera control module (PTZ + RTSP)
-│   └── static/               # Frontend (HTML/JS/CSS)
-├── data.txt                  # Input file for simulating sensor data
-├── .env.example              # Environment configuration template
-└── readme.md
+
+### 2. Slot Metadata
+
+Edit `config/slot_meta.yaml` to map device names to parking slots:
+
+```yaml
+- id: 1
+  name: "A01"
+  zone: "A"
+  device_name: "sensor-001"  # Must match ChirpStack device name
+  preset: 1                   # PTZ camera preset (1-256) - optional
+
+- id: 2
+  name: "A02"
+  zone: "A"
+  device_name: "sensor-002"
+  preset: 2
 ```
+
+**Key fields:**
+- `id` — Unique slot identifier (integer)
+- `name` — Human-readable slot name
+- `zone` — Zone grouping (e.g., "A", "B", "VIP")
+- `device_name` — LoRaWAN device name from ChirpStack (used for MQTT mapping)
+- `preset` — Camera preset position (optional, requires camera enabled)
 
 ---
 
-## 🚀 Quick Start
+## How It Works
 
-### Option 1: Test Mode (Local File Simulation)
+### Sensor Data Flow
 
-**Start Server:**
+1. **LoRaWAN Sensor** transmits 3-axis magnetometer data (X, Y, Z)
+2. **ChirpStack** forwards data to MQTT broker on topic `application/+/device/+/event/up`
+3. **Server** subscribes to MQTT, decodes base64 payload, maps device to slot ID
+4. **Detection Algorithm** calculates distance from baseline and determines occupancy
+5. **State Changes** trigger event logging and optional camera capture
+6. **Dashboard** receives real-time updates via Server-Sent Events
+
+### Payload Format
+
+LoRaWAN uplink payload (8 bytes, base64 encoded):
+```
+Bytes 0-1: X magnetometer (signed int16, divide by 100)
+Bytes 2-3: Y magnetometer (signed int16, divide by 100)
+Bytes 4-5: Z magnetometer (signed int16, divide by 100)
+Bytes 6-7: Temperature (signed int16) - unused
+```
+
+Example MQTT message from ChirpStack:
+```json
+{
+  "deviceInfo": {
+    "deviceName": "sensor-001"
+  },
+  "data": "AH4BCgDy/+w="  // base64 encoded sensor data
+}
+```
+
+### Detection Logic
+
+**Distance Calculation:**
+```
+distance = sqrt((X - baseline_x)² + (Y - baseline_y)² + (Z - baseline_z)²)
+```
+
+**State Determination:**
+- **distance > 7.5**: Increment consecutive occupancy counter (max 3)
+- **distance ≤ 6.75** (90% of threshold): Reset counter to 0
+- **Consecutive counter ≥ 3**: Slot marked **OCCUPIED**
+- **Consecutive counter = 0**: Slot marked **FREE**
+
+**Hysteresis Zone (6.75 to 7.5):** Counter unchanged to prevent oscillation from nearby vehicles.
+
+**Baseline Learning:**
+- Baseline auto-updates when slot is FREE using exponential moving average (α=0.01)
+- Adapts to environmental magnetic field drift over time
+
+---
+
+## Running the System
+
+### 1. Start MQTT Broker (if not already running)
+
+```bash
+# Using Mosquitto
+mosquitto -c /path/to/mosquitto.conf
+
+# Or use existing ChirpStack MQTT broker
+```
+
+### 2. Start Web Server
+
 ```bash
 python -m uvicorn webapp.server:app --reload --port 8080
 ```
 
-**Edit `data.txt` with test values:**
-```json
-[
-  {"id":1,"unique_id":"2","status":"{\"r\":45,\"y\":30,\"b\":-20}","timestamp":1766561204011},
-  {"id":2,"unique_id":"1","status":"{\"r\":-50,\"y\":25,\"b\":40}","timestamp":1766561205011}
-]
-```
+**Server will:**
+- Connect to MQTT broker and subscribe to sensor data
+- Initialize camera controller (if enabled)
+- Start background camera worker thread
+- Serve dashboard at [http://127.0.0.1:8080](http://127.0.0.1:8080)
 
-Server polls `/slots` endpoint (returns `data.txt` contents) every 5 seconds. Dashboard updates live at [http://127.0.0.1:8080](http://127.0.0.1:8080).
+### 3. Calibrate Slots
 
-### Option 2: Production Mode (External API)
+**Ensure slot is EMPTY** before calibrating:
 
-**Configure Environment:**
 ```bash
-# In webapp/server.py, set:
-API_URL = "https://your-api.com/parking/sensors"
-API_TOKEN = "your_bearer_token_here"  # Optional
-ENABLE_POLLING = 1
+curl -X POST http://127.0.0.1:8080/calibrate/1
 ```
 
-Server polls external API every 5 seconds with `Authorization: Bearer {token}` header. Expects JSON array:
-```json
-[{"id": 1, "unique_id": "slot_1", "status": "{\"r\":30,\"y\":20,\"b\":-35}", "timestamp": 1234567890}]
-```
+**Calibration process:**
+1. Waits for 5 MQTT sensor readings (timeout: 120 seconds)
+2. Calculates average baseline (X, Y, Z)
+3. Validates readings (rejects near-zero values)
+4. Saves baseline to `data/snapshot.yaml`
+
+Repeat for each slot before deployment.
 
 ---
 
-## 📸 Camera Control & Alerts
+## Camera Integration
 
-Optional PTZ camera integration: automatically moves to preset position and captures images when slots change state.
+### Setup
 
-### Quick Setup
+**Requirements:**
+- PTZ camera with HTTP API support
+- RTSP stream access
+- Camera presets configured (1-256)
 
-**1. Create `.env` file:**
+**Enable in `.env`:**
 ```bash
 ENABLE_CAMERA_CONTROL=true
 CAMERA_IP=192.168.1.100
@@ -117,200 +190,172 @@ CAMERA_USER=admin
 CAMERA_PASS=your_password
 ```
 
-**2. Configure presets in `config/slot_meta.yaml`:**
-```yaml
-- id: 1
-  name: A01
-  preset: 1  # PTZ preset (1-256)
-```
-
-**3. Start server:**
-```bash
-python -m uvicorn webapp.server:app --reload --port 8080
-```
-
-### Testing Without Camera
-
-Camera is **disabled by default**. Alerts work without hardware:
-- Set `ENABLE_CAMERA_CONTROL=false` or omit `.env` entirely
-- Alerts show with "No image" placeholder
-- Perfect for development/testing
-
-### Key Features
-
-- **Sequential Processing**: Queue prevents concurrent camera commands (max 50 tasks)
-- **Timing**: 2s move + 8s settle + 2s capture = ~12s per alert
-- **Error Handling**: Camera failures don't crash server, alerts created without images
-- **Storage**: Images in `data/camera_snapshots/` (~200KB each)
-
-### API Endpoints
-
-- `GET /alerts` - Recent alerts with pagination (`?limit=50&offset=0`)
-- `GET /snapshots/{filename}` - Serve captured images
-- `GET /camera/status` - System status (enabled, queue size, worker active)
-
----
-
-## 🧲 How Detection Works
-
-**Magnetic Field Baseline:**
-- Each slot stores calibrated baseline (r, y, b) values representing empty state
-- Distance calculated: `sqrt((r-baseline_r)² + (y-baseline_y)² + (z-baseline_z)²)`
-
-**Occupancy Logic:**
-- **Distance > 7.5**: Increment consecutive count (max 3)
-- **Distance ≤ 6.75** (0.9 × threshold): Reset consecutive count to 0
-- **Consecutive ≥ 3**: Slot marked OCCUPIED (hysteresis prevents false positives from nearby cars)
-- **Free Slots**: Baseline auto-updates with α=0.01 learning rate
-
-**State Transitions:**
-- Logged only when state changes (FREE ↔ OCCUPIED)
-- Snapshots logged on change OR every 1 minute
-
----
-
-## 🎯 Calibration & Testing
-
-### Manual Calibration
-
-**Calibrate slot baseline (must be empty):**
-```bash
-curl -X POST http://127.0.0.1:8080/calibrate/1
-```
-
-Takes 10 samples over 50 seconds, validates:
-- Minimum 5 samples required
-- Rejects near-zero values (sensor error)
-- Rejects unconfigured slot IDs
-
-Baseline saved to `data/snapshot.yaml`:
-```yaml
-slots:
-  '1':
-    baseline_x: 30.0
-    baseline_y: 20.0
-    baseline_z: -35.0
-    calibrated_at: '2025-12-24T10:33:33+00:00'
-```
-
-### Testing Occupancy Detection
-
-**Test 1: Empty Slot (Distance < 7.5)**
-```json
-{"id":1,"unique_id":"1","status":"{\"r\":32,\"y\":21,\"b\":-34}","timestamp":1234567891}
-```
-Distance ≈ 2.45 → FREE
-
-**Test 2: Occupied Slot (Distance > 7.5)**
-```json
-{"id":1,"unique_id":"1","status":"{\"r\":50,\"y\":40,\"b\":-10}","timestamp":1234567892}
-```
-Distance ≈ 31.62 → After 3 consecutive reads → OCCUPIED
-
-**Test 3: Mixed States**
-```json
-[
-  {"id":1,"unique_id":"1","status":"{\"r\":32,\"y\":21,\"b\":-34}","timestamp":1234567893},
-  {"id":2,"unique_id":"2","status":"{\"r\":60,\"y\":50,\"b\":20}","timestamp":1234567894}
-]
-```
-Slot 1: FREE, Slot 2: OCCUPIED
-
----
-
-## 📊 Analytics
-
-The dashboard includes an analytics view (`/analytics/summary` endpoint) providing:
-- **Occupancy Trends**: Occupancy % over time (1h, 6h, 24h).
-- **Dwell Time**: Average time vehicles spend in slots per zone.
-- **Zone Stats**: Current usage per zone (e.g., Zone A, Zone B).
-
----
-
-## ⚙️ Configuration
-
-**`config/slot_meta.yaml`**
-Map internal IDs to human-readable names, zones, and camera presets:
-
+**Configure presets in `config/slot_meta.yaml`:**
 ```yaml
 - id: 1
   name: "A01"
-  zone: "A"
-  preset: 1    # PTZ camera preset position (1-256)
-- id: 2
-  name: "A02"
-  zone: "A"
-  preset: 2
+  preset: 5  # Camera moves to preset 5 when slot 1 changes state
 ```
 
-**Environment Variables (`.env`)**
-See [`.env.example`](.env.example) for all configuration options:
-- `ENABLE_CAMERA_CONTROL` - Enable/disable camera (default: false)
-- `CAMERA_IP` - Camera IP address
-- `CAMERA_USER` / `CAMERA_PASS` - Authentication credentials
-- `CAMERA_RTSP_URL` - Custom RTSP stream URL (optional)
+### Operation
+
+**On State Change (FREE ↔ OCCUPIED):**
+1. Task added to camera queue (max 50 tasks)
+2. Camera moves to preset position (HTTP command)
+3. Wait 8 seconds for camera to settle
+4. Capture frame via RTSP stream
+5. Extract license plate using EasyOCR (returns "UNKNOWN" if not detected)
+6. Save image to `data/camera_snapshots/slot_<id>_<timestamp>.jpg`
+7. Log capture event with license plate to `data/occupancy_events.jsonl`
+
+**Processing time:** ~15 seconds per event (2s move + 8s settle + 2s capture + 3s OCR)
+
+**Testing without hardware:** Set `ENABLE_CAMERA_CONTROL=false` — alerts will show without images.
+
+### License Plate Recognition
+
+Automatically extracts license plates from captured images:
+
+- **OCR Engine:** EasyOCR with smart error correction (O→0, I→1, S→5, Z→2)
+- **Pattern Matching:** Indian plate formats (e.g., TS07ES2598, KA01A1234)
+- **Fallback:** Returns "UNKNOWN" if detection fails or plate not visible
+- **Formats Supported:**
+  - Standard: `LL DD LL DDDD` (TS07ES2598)
+  - Variant: `LL DD L DDDD` (KA01A1234)
+
+License plates are stored in event log and displayed in dashboard alerts.
 
 ---
 
-## 🧾 Event Logging System
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Dashboard UI |
+| `/state` | GET | Current slot states (30s cache) |
+| `/snapshot` | GET | Current snapshot with baseline values |
+| `/events` | GET | SSE stream for real-time updates |
+| `/analytics/summary` | GET | Occupancy trends (`?range=1h/6h/24h/7d/all`) |
+| `/calibrate/{slot_id}` | POST | Calibrate slot baseline (MQTT-based) |
+| `/alerts` | GET | Recent state changes with images (`?limit=50&offset=0`) |
+| `/snapshots/{filename}` | GET | Serve captured camera images |
+| `/camera/status` | GET | Camera system status |
+
+---
+
+## Event Logging
 
 **File:** `data/occupancy_events.jsonl` (auto-rotates at 50 MB)
 
 **Event Types:**
 
-**State Change:**
+### State Change
 ```json
 {
   "event": "slot_state_changed",
-  "ts": "2025-12-24T10:00:00+00:00",
+  "ts": "2026-01-30T10:00:00+00:00",
   "slot_id": 1,
-  "slot_name": "A-01",
-  "zone": "Zone A",
+  "slot_name": "A01",
+  "zone": "A",
   "prev_state": "FREE",
   "new_state": "OCCUPIED"
 }
 ```
 
-**Snapshot (every state change OR 1 min):**
+### Camera Capture
 ```json
 {
-  "event": "snapshot",
-  "ts": "2025-12-24T10:00:00+00:00",
-  "occupied_ids": [1, 4],
-  "zone_stats": {"Zone A": {"total": 2, "free": 0, "occupied": 2}},
-  "total_count": 10,
-  "free_count": 8
+  "event": "camera_capture",
+  "ts": "2026-01-30T10:00:05+00:00",
+  "slot_id": 1,
+  "slot_name": "A01",
+  "zone": "A",
+  "image_path": "data/camera_snapshots/slot_1_20260130_100005.jpg",
+  "license_plate": "TS07ES2598"
 }
 ```
 
-**Log Rotation:**
-- Rotates when file exceeds 50 MB
-- Backup named: `occupancy_events_YYYYMMDD_HHMMSS.jsonl`
-- Prevents disk exhaustion in long-running deployments
+### Snapshot (every state change OR 1 minute)
+```json
+{
+  "event": "snapshot",
+  "ts": "2026-01-30T10:00:00+00:00",
+  "occupied_ids": [1, 4, 7],
+  "zone_stats": {
+    "A": {"total": 10, "free": 7, "occupied": 3}
+  },
+  "total_count": 10,
+  "free_count": 7
+}
+```
 
 ---
 
-## 🔌 API Endpoints
+## Project Structure
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Dashboard UI |
-| `/state` | GET | Current slot states (cached 30s) |
-| `/slots` | GET | Raw sensor data (from data.txt or API) |
-| `/events` | GET | SSE stream of real-time events (max 50 connections) |
-| `/analytics/summary` | GET | Occupancy trends (1h/6h/24h) |
-| `/calibrate/{slot_id}` | POST | Calibrate slot baseline |
-| `/alerts` | GET | Recent alerts with pagination (`?limit=50&offset=0`) |
-| `/snapshots/{filename}` | GET | Serve captured camera images |
-| `/camera/status` | GET | Camera system status (enabled, available, queue size) |
+```
+parking_vision_poc/
+├── config/
+│   └── slot_meta.yaml              # Slot configuration and device mapping
+├── data/
+│   ├── occupancy_events.jsonl      # Event log with license plates (auto-generated)
+│   ├── snapshot.yaml               # Current state with baselines (auto-generated)
+│   └── camera_snapshots/           # Captured images (auto-generated)
+├── webapp/
+│   ├── server.py                   # FastAPI server with MQTT client
+│   ├── camera_controller.py        # PTZ camera control module
+│   ├── license_plate_extractor.py  # OCR and pattern matching
+│   └── static/                     # Dashboard frontend (HTML/JS/CSS)
+├── .env                            # Environment configuration
+├── .env.example                    # Configuration template
+├── requirements.txt                # Python dependencies (includes easyocr)
+└── readme.md                       # This file
+```
 
 ---
 
-## ⚡ Performance Features
+## Analytics
 
-- **Response Caching**: `/state` cached for 30s (reduces log reads by 90%)
-- **Metadata Caching**: Config file parsed only on modification
-- **Set-Based Lookups**: O(1) occupancy checks (was O(n))
-- **Thread-Safe**: Snapshot and event log locks prevent corruption
-- **Connection Limits**: Max 50 SSE streams to prevent FD exhaustion
-- **Exponential Backoff**: SSE clients back off 0.1s → 1.0s when idle
+The `/analytics/summary` endpoint provides:
+
+- **Occupancy Series** — Zone occupancy % over time
+- **Dwell Time** — Average parking duration per zone
+- **Predictions** — Moving average forecast of next occupancy %
+- **Current Occupancy** — Real-time zone statistics
+
+Query parameters: `?range=1h|6h|24h|7d|all` (default: 24h)
+
+---
+
+## Performance
+
+- **Response Caching** — `/state` cached for 30 seconds
+- **Metadata Caching** — Config file cached with modification time tracking
+- **Thread-Safe Operations** — Locks for snapshot, event log, and calibration data
+- **Connection Limits** — Max 50 concurrent SSE streams
+- **Log Rotation** — Event log auto-rotates at 50 MB
+
+---
+
+## Troubleshooting
+
+### No MQTT messages received
+- Check MQTT broker is running: `mosquitto_sub -h localhost -t '#' -v`
+- Verify `MQTT_TOPIC` matches ChirpStack configuration
+- Ensure sensors are transmitting and joined to LoRaWAN network
+
+### Calibration timeout
+- Check device name in `slot_meta.yaml` matches ChirpStack device name exactly
+- Verify sensor is transmitting (check ChirpStack dashboard)
+- Increase timeout in calibration endpoint if needed
+
+### Camera not capturing
+- Verify `ENABLE_CAMERA_CONTROL=true` in `.env`
+- Check camera IP/credentials are correct
+- Test RTSP URL: `ffplay rtsp://admin:password@192.168.1.100/stream1`
+- Check camera presets are configured correctly (test manually via camera UI)
+
+### False positives/negatives
+- Re-calibrate slots when parking lot is empty
+- Adjust `DISTANCE_THRESHOLD` (default: 7.5) in `server.py` if needed
+- Check for nearby metal objects affecting baseline readings
