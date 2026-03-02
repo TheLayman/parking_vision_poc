@@ -8554,3 +8554,16 @@
 {"event": "snapshot", "ts": "2026-03-02T10:22:17.827806+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16, 19], "zone_stats": {"B": {"total": 48, "free": 41, "occupied": 7}}, "total_count": 48, "free_count": 41}
 {"event": "slot_state_changed", "ts": "2026-03-02T10:24:07.360535+00:00", "slot_id": 19, "slot_name": "B40", "zone": "B", "prev_state": "OCCUPIED", "new_state": "FREE"}
 {"event": "snapshot", "ts": "2026-03-02T10:24:07.360535+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 42, "occupied": 6}}, "total_count": 48, "free_count": 42}
+{"event": "snapshot", "ts": "2026-03-02T10:29:47.680017+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 42, "occupied": 6}}, "total_count": 48, "free_count": 42}
+{"event": "snapshot", "ts": "2026-03-02T10:30:51.407654+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 42, "occupied": 6}}, "total_count": 48, "free_count": 42}
+{"event": "snapshot", "ts": "2026-03-02T10:32:13.834742+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 42, "occupied": 6}}, "total_count": 48, "free_count": 42}
+{"event": "snapshot", "ts": "2026-03-02T10:33:21.391985+00:00", "occupied_ids": [2, 38, 12, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 42, "occupied": 6}}, "total_count": 48, "free_count": 42}
+{"event": "slot_state_changed", "ts": "2026-03-02T10:34:01.530829+00:00", "slot_id": 12, "slot_name": "B16", "zone": "B", "prev_state": "OCCUPIED", "new_state": "FREE"}
+{"event": "snapshot", "ts": "2026-03-02T10:34:01.530829+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:36:31.324298+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:41:50.141733+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:43:37.434146+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:45:51.320018+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:47:27.556128+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:49:17.588281+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}
+{"event": "snapshot", "ts": "2026-03-02T10:52:08.061557+00:00", "occupied_ids": [2, 38, 46, 47, 16], "zone_stats": {"B": {"total": 48, "free": 43, "occupied": 5}}, "total_count": 48, "free_count": 43}

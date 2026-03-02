@@ -6,9 +6,9 @@ Real-time parking slot occupancy monitoring using **LoRaWAN magnetometer sensors
 
 ## Features
 
-- **LoRaWAN Sensor Integration** — Receives magnetic field data via MQTT from ChirpStack
-- **Magnetic Field Detection** — Euclidean distance-based occupancy detection with hysteresis
-- **Smart Calibration** — MQTT-based calibration with automatic baseline learning
+- **LoRaWAN Sensor Integration** — Receives occupancy status via MQTT from ChirpStack
+- **Simple Status Decoding** — Payload-based occupancy: `00` (Free), `01` (Occupied), `cd` (Calibration Done)
+- **Device Calibration** — Send calibration commands to sensors via ChirpStack gRPC or MQTT downlink
 - **PTZ Camera Control** — Automatic camera positioning and image capture on state changes
 - **License Plate Recognition** — EasyOCR-based extraction with Indian plate pattern matching
 - **Live Dashboard** — Real-time visualization with Server-Sent Events
@@ -84,51 +84,32 @@ Edit `config/slot_meta.yaml` to map device names to parking slots:
 
 ### Sensor Data Flow
 
-1. **LoRaWAN Sensor** transmits 3-axis magnetometer data (X, Y, Z)
+1. **LoRaWAN Sensor** transmits occupancy status (`00` = Free, `01` = Occupied, `cd` = Calibration Done)
 2. **ChirpStack** forwards data to MQTT broker on topic `application/+/device/+/event/up`
-3. **Server** subscribes to MQTT, decodes base64 payload, maps device to slot ID
-4. **Detection Algorithm** calculates distance from baseline and determines occupancy
-5. **State Changes** trigger event logging and optional camera capture
-6. **Dashboard** receives real-time updates via Server-Sent Events
+3. **Server** subscribes to MQTT, decodes base64 payload hex, maps device name to slot ID
+4. **State Changes** trigger event logging and optional camera capture
+5. **Dashboard** receives real-time updates via Server-Sent Events
 
 ### Payload Format
 
-LoRaWAN uplink payload (8 bytes, base64 encoded):
-```
-Bytes 0-1: X magnetometer (signed int16, divide by 100)
-Bytes 2-3: Y magnetometer (signed int16, divide by 100)
-Bytes 4-5: Z magnetometer (signed int16, divide by 100)
-Bytes 6-7: Temperature (signed int16) - unused
-```
+LoRaWAN uplink payload (base64-encoded hex string):
+- `00` — Slot is **Free**
+- `01` — Slot is **Occupied**
+- `cd` — Device completed **Calibration**
 
 Example MQTT message from ChirpStack:
 ```json
 {
   "deviceInfo": {
-    "deviceName": "sensor-001"
+    "deviceName": "B7",
+    "applicationId": "...",
+    "devEui": "..."
   },
-  "data": "AH4BCgDy/+w="  // base64 encoded sensor data
+  "data": "AA=="
 }
 ```
 
-### Detection Logic
-
-**Distance Calculation:**
-```
-distance = sqrt((X - baseline_x)² + (Y - baseline_y)² + (Z - baseline_z)²)
-```
-
-**State Determination:**
-- **distance > 7.5**: Increment consecutive occupancy counter (max 3)
-- **distance ≤ 6.75** (90% of threshold): Reset counter to 0
-- **Consecutive counter ≥ 3**: Slot marked **OCCUPIED**
-- **Consecutive counter = 0**: Slot marked **FREE**
-
-**Hysteresis Zone (6.75 to 7.5):** Counter unchanged to prevent oscillation from nearby vehicles.
-
-**Baseline Learning:**
-- Baseline auto-updates when slot is FREE using exponential moving average (α=0.01)
-- Adapts to environmental magnetic field drift over time
+The `data` field is base64-decoded to its hex representation (e.g. `AA==` → `00` → Free).
 
 ---
 
@@ -164,12 +145,9 @@ curl -X POST http://127.0.0.1:8080/calibrate/1
 ```
 
 **Calibration process:**
-1. Waits for 5 MQTT sensor readings (timeout: 120 seconds)
-2. Calculates average baseline (X, Y, Z)
-3. Validates readings (rejects near-zero values)
-4. Saves baseline to `data/snapshot.yaml`
-
-Repeat for each slot before deployment.
+1. Sends a `CC` hex command to the device via ChirpStack gRPC (or MQTT fallback)
+2. Device performs on-board calibration
+3. Device responds with `cd` payload confirming calibration is complete
 
 ---
 
@@ -344,10 +322,10 @@ Query parameters: `?range=1h|6h|24h|7d|all` (default: 24h)
 - Verify `MQTT_TOPIC` matches ChirpStack configuration
 - Ensure sensors are transmitting and joined to LoRaWAN network
 
-### Calibration timeout
+### Calibration issues
 - Check device name in `slot_meta.yaml` matches ChirpStack device name exactly
 - Verify sensor is transmitting (check ChirpStack dashboard)
-- Increase timeout in calibration endpoint if needed
+- Ensure device map is populated (device must have sent at least one uplink)
 
 ### Camera not capturing
 - Verify `ENABLE_CAMERA_CONTROL=true` in `.env`
@@ -357,5 +335,4 @@ Query parameters: `?range=1h|6h|24h|7d|all` (default: 24h)
 
 ### False positives/negatives
 - Re-calibrate slots when parking lot is empty
-- Adjust `DISTANCE_THRESHOLD` (default: 7.5) in `server.py` if needed
-- Check for nearby metal objects affecting baseline readings
+- Check for nearby metal objects affecting sensor readings

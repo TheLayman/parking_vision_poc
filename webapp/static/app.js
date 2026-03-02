@@ -342,6 +342,7 @@ function renderPredictionsGrid(predictions, currentOccupancy) {
 let slots = [];
 let stateById = {};
 let sinceById = {};
+let serverZoneStats = null; // use server-provided zone stats when available
 let collapsedZones = new Set();
 let calibratingSlots = new Set(); // Track slots currently being calibrated
 let failedSlots = new Map(); // Track slots that failed calibration with error message
@@ -352,19 +353,17 @@ function getSlotStatus(slotId) {
 }
 
 function computeZoneStats() {
-  /** @type {Record<string, { total: number, occupied: number, free: number }>} */
-  const zones = {};
+  // Prefer server-provided zone stats to avoid duplicate computation
+  if (serverZoneStats) return serverZoneStats;
 
+  const zones = {};
   for (const s of slots) {
     const zoneKey = s.zone || "A";
     if (!zones[zoneKey]) zones[zoneKey] = { total: 0, occupied: 0, free: 0 };
-
     zones[zoneKey].total += 1;
-    const status = getSlotStatus(s.id);
-    if (status === "OCCUPIED") zones[zoneKey].occupied += 1;
+    if (getSlotStatus(s.id) === "OCCUPIED") zones[zoneKey].occupied += 1;
     else zones[zoneKey].free += 1;
   }
-
   return zones;
 }
 
@@ -398,148 +397,206 @@ function renderZones(zones) {
 
 function renderZoneSections(zones) {
   const container = document.getElementById("zoneSections");
-  container.innerHTML = "";
-
   const zoneKeys = Object.keys(zones || {}).sort();
+
+  // Build a set of expected section IDs for cleanup
+  const expectedIds = new Set(zoneKeys.map(k => `zone-section-${k}`));
+
+  // Remove sections that no longer exist
+  for (const child of Array.from(container.children)) {
+    if (!expectedIds.has(child.id)) child.remove();
+  }
+
   for (const zoneKey of zoneKeys) {
     const z = zones[zoneKey];
     const isCollapsed = collapsedZones.has(zoneKey);
+    const sectionId = `zone-section-${zoneKey}`;
+    let section = document.getElementById(sectionId);
 
-    const section = document.createElement("section");
-    section.className = "zoneSection";
+    // Create section skeleton if it doesn't exist yet
+    if (!section) {
+      section = document.createElement("section");
+      section.id = sectionId;
+      section.className = "zoneSection";
+
+      const header = document.createElement("div");
+      header.className = "zoneHeader";
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "zoneTitleRow";
+
+      const toggle = document.createElement("button");
+      toggle.className = "zoneToggle";
+      toggle.type = "button";
+      toggle.addEventListener("click", () => {
+        if (collapsedZones.has(zoneKey)) collapsedZones.delete(zoneKey);
+        else collapsedZones.add(zoneKey);
+        refreshLayout();
+      });
+
+      const title = document.createElement("div");
+      title.className = "zoneTitle";
+
+      titleRow.appendChild(toggle);
+      titleRow.appendChild(title);
+
+      const subtitle = document.createElement("div");
+      subtitle.className = "zoneSubtitle";
+
+      header.appendChild(titleRow);
+      header.appendChild(subtitle);
+      section.appendChild(header);
+
+      const grid = document.createElement("div");
+      grid.className = "zoneSlotGrid";
+      section.appendChild(grid);
+
+      container.appendChild(section);
+    }
+
+    // Update header text
     if (isCollapsed) section.classList.add("collapsed");
+    else section.classList.remove("collapsed");
 
-    const header = document.createElement("div");
-    header.className = "zoneHeader";
-
-    const titleRow = document.createElement("div");
-    titleRow.className = "zoneTitleRow";
-
-    const toggle = document.createElement("button");
-    toggle.className = "zoneToggle";
-    toggle.type = "button";
+    const toggle = section.querySelector(".zoneToggle");
+    toggle.textContent = isCollapsed ? "▸" : "▾";
     toggle.setAttribute("aria-label", isCollapsed ? `Expand Zone ${zoneKey}` : `Collapse Zone ${zoneKey}`);
     toggle.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
-    toggle.textContent = isCollapsed ? "▸" : "▾";
-    toggle.addEventListener("click", () => {
-      if (collapsedZones.has(zoneKey)) collapsedZones.delete(zoneKey);
-      else collapsedZones.add(zoneKey);
-      refreshLayout();
-    });
 
-    const title = document.createElement("div");
-    title.className = "zoneTitle";
-    title.textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
-
-    titleRow.appendChild(toggle);
-    titleRow.appendChild(title);
-
-    const subtitle = document.createElement("div");
-    subtitle.className = "zoneSubtitle";
-    subtitle.textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
-
-    header.appendChild(titleRow);
-    header.appendChild(subtitle);
-    section.appendChild(header);
+    section.querySelector(".zoneTitle").textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
+    section.querySelector(".zoneSubtitle").textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
 
     if (isCollapsed) {
-      container.appendChild(section);
+      // Clear grid when collapsed
+      const grid = section.querySelector(".zoneSlotGrid");
+      if (grid) grid.innerHTML = "";
       continue;
     }
 
-    const grid = document.createElement("div");
-    grid.className = "zoneSlotGrid";
-
+    // Diff-update slot tiles
+    const grid = section.querySelector(".zoneSlotGrid");
     const zoneSlots = slots
-      .filter((s) => (s.zone || "A") === zoneKey)
+      .filter(s => (s.zone || "A") === zoneKey)
       .slice()
       .sort((a, b) => a.id - b.id);
 
     grid.style.setProperty("--cols", String(computeCols(zoneSlots.length)));
 
+    // Build a map of existing tiles by slot id
+    const existingTiles = {};
+    for (const tile of Array.from(grid.children)) {
+      const sid = tile.dataset.slotId;
+      if (sid) existingTiles[sid] = tile;
+    }
+
+    const expectedSlotIds = new Set(zoneSlots.map(s => String(s.id)));
+
+    // Remove tiles for slots no longer in this zone
+    for (const [sid, tile] of Object.entries(existingTiles)) {
+      if (!expectedSlotIds.has(sid)) tile.remove();
+    }
+
     for (const s of zoneSlots) {
       const status = getSlotStatus(s.id);
-      const tile = document.createElement("div");
+      const tileId = String(s.id);
+      let tile = existingTiles[tileId];
+
+      if (!tile) {
+        // Create new tile
+        tile = _createSlotTile(s);
+        grid.appendChild(tile);
+      }
+
+      // Update tile state
       tile.className = `slot ${status === "OCCUPIED" ? "occupied" : "free"}`;
-
-      const top = document.createElement("div");
-      top.className = "slotTop";
-
-      const name = document.createElement("div");
-      name.className = "slotName";
-      name.textContent = s.name || `Slot ${s.id}`;
-
-      const badge = document.createElement("div");
-      badge.className = "slotState";
-      badge.textContent = status;
-
-      top.appendChild(name);
-      top.appendChild(badge);
-
-      const meta = document.createElement("div");
-      meta.className = "slotMeta";
+      tile.querySelector(".slotState").textContent = status;
 
       const sinceTs = sinceById[s.id];
       let sinceText = "";
       if (sinceTs) {
         try {
           const d = new Date(sinceTs);
-          if (!isNaN(d.getTime())) {
-            sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          }
+          if (!isNaN(d.getTime())) sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         } catch { }
       }
+      tile.querySelector(".slotMeta").innerHTML = sinceText;
 
-      meta.innerHTML = sinceText;
-
-      // Calibrate button for this slot
-      const calibrateBtn = document.createElement("button");
-      calibrateBtn.className = "slot-calibrate-btn";
-      calibrateBtn.setAttribute("data-slot-id", s.id);
-      
-      // Preserve loading state if calibration is in progress
-      if (calibratingSlots.has(s.id)) {
-        calibrateBtn.disabled = true;
-        calibrateBtn.classList.add("loading");
-        calibrateBtn.innerHTML = `
-          <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-          </svg>
-          ...
-        `;
-      } else if (failedSlots.has(s.id)) {
-        calibrateBtn.classList.add("error");
-        calibrateBtn.title = failedSlots.get(s.id) || "Calibration failed";
-        calibrateBtn.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-          Failed
-        `;
-      } else {
-        calibrateBtn.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-          </svg>
-          Calibrate
-        `;
-      }
-      calibrateBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        handleSlotCalibrate(s.id, calibrateBtn);
-      });
-
-      tile.appendChild(top);
-      tile.appendChild(meta);
-      tile.appendChild(calibrateBtn);
-
-      grid.appendChild(tile);
+      // Update calibrate button state
+      _updateCalibrateBtnState(tile.querySelector(".slot-calibrate-btn"), s.id);
     }
+  }
+}
 
-    section.appendChild(grid);
-    container.appendChild(section);
+/** Create a fresh slot tile DOM element. */
+function _createSlotTile(s) {
+  const tile = document.createElement("div");
+  tile.dataset.slotId = String(s.id);
+
+  const top = document.createElement("div");
+  top.className = "slotTop";
+
+  const name = document.createElement("div");
+  name.className = "slotName";
+  name.textContent = s.name || `Slot ${s.id}`;
+
+  const badge = document.createElement("div");
+  badge.className = "slotState";
+  top.appendChild(name);
+  top.appendChild(badge);
+
+  const meta = document.createElement("div");
+  meta.className = "slotMeta";
+
+  const calibrateBtn = document.createElement("button");
+  calibrateBtn.className = "slot-calibrate-btn";
+  calibrateBtn.setAttribute("data-slot-id", s.id);
+  calibrateBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    handleSlotCalibrate(s.id, calibrateBtn);
+  });
+
+  tile.appendChild(top);
+  tile.appendChild(meta);
+  tile.appendChild(calibrateBtn);
+  return tile;
+}
+
+/** Update calibrate button visual state without recreating it. */
+function _updateCalibrateBtnState(btn, slotId) {
+  if (!btn) return;
+  if (calibratingSlots.has(slotId)) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+    btn.classList.remove("error");
+    btn.innerHTML = `
+      <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+      </svg>
+      ...
+    `;
+  } else if (failedSlots.has(slotId)) {
+    btn.classList.add("error");
+    btn.classList.remove("loading");
+    btn.title = failedSlots.get(slotId) || "Calibration failed";
+    btn.disabled = false;
+    btn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+      Failed
+    `;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove("loading", "error");
+    btn.title = "";
+    btn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+      </svg>
+      Calibrate
+    `;
   }
 }
 
@@ -677,6 +734,7 @@ async function init() {
   slots = (data.slots || []).slice().sort((a, b) => a.id - b.id);
   stateById = data.state_by_id || {};
   sinceById = data.since_by_id || {};
+  serverZoneStats = data.zones || null;
 
   refreshLayout();
 
@@ -694,11 +752,13 @@ async function init() {
         for (const s of slots) {
           stateById[s.id] = occupied.has(s.id) ? "OCCUPIED" : "FREE";
         }
+        serverZoneStats = obj.zone_stats || null;
         refreshLayout();
         return;
       }
 
       if (obj.event === "slot_state_changed") {
+        serverZoneStats = null; // invalidate server stats on individual change
         if (typeof obj.slot_id === "number") {
           stateById[obj.slot_id] = obj.new_state;
           sinceById[obj.slot_id] = obj.ts;

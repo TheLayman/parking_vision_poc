@@ -12,11 +12,14 @@ Pipeline (adapted from NumberPlateDetection project):
 import cv2
 import easyocr
 import itertools
+import logging
 import numpy as np
 import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 # ── Configuration (override via environment variables) ────────────────────────
 APP_ROOT = Path(__file__).resolve().parent
@@ -26,10 +29,10 @@ REPO_ROOT = APP_ROOT.parent
 # the NumberPlateDetection project weights, then to yolov8n.pt (auto-download).
 _default_model = "yolov8n.pt"
 _repo_weights = REPO_ROOT / "weights" / "license_plate_detector.pt"
-_sibling_weights = Path(r"C:\WorkSpace\NumberPlateDetection\weights\license_plate_detector.pt")
+_sibling_weights = Path(os.getenv("SIBLING_WEIGHTS_PATH", ""))
 if _repo_weights.exists():
     _default_model = str(_repo_weights)
-elif _sibling_weights.exists():
+elif _sibling_weights.name and _sibling_weights.exists():
     _default_model = str(_sibling_weights)
 
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", _default_model)
@@ -53,6 +56,8 @@ _PLATE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 # ── Singletons ────────────────────────────────────────────────────────────────
 _reader_instance: Optional[easyocr.Reader] = None
 _detector_instance = None  # ultralytics.YOLO
+_target_class_ids_cache: Optional[tuple] = None  # (class_ids, is_vehicle_fallback)
+_clahe_instance = None  # cv2.CLAHE singleton
 
 # ── OCR character confusion maps ──────────────────────────────────────────────
 _LETTER_TO_DIGIT = {"O": "0", "I": "1", "S": "5", "B": "8", "G": "6", "Z": "2"}
@@ -63,10 +68,17 @@ _DIGIT_TO_LETTER = {v: k for k, v in _LETTER_TO_DIGIT.items()}
 # 1. Preprocessing
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _get_clahe():
+    """Get or create the CLAHE singleton."""
+    global _clahe_instance
+    if _clahe_instance is None:
+        _clahe_instance = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
+    return _clahe_instance
+
+
 def _apply_clahe(gray: np.ndarray) -> np.ndarray:
     """CLAHE contrast enhancement for dark / low-light images."""
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
-    return clahe.apply(gray)
+    return _get_clahe().apply(gray)
 
 
 def _denoise(gray: np.ndarray) -> np.ndarray:
@@ -187,14 +199,16 @@ def _find_plate_in_crop(
 
 
 def _get_detector():
-    """Get or create the YOLO detector singleton."""
-    global _detector_instance
+    """Get or create the YOLO detector singleton and cache class IDs."""
+    global _detector_instance, _target_class_ids_cache
     if _detector_instance is None:
         from ultralytics import YOLO
 
-        print(f"Loading YOLO model from: {YOLO_MODEL_PATH}")
+        log.info("Loading YOLO model from: %s", YOLO_MODEL_PATH)
         _detector_instance = YOLO(YOLO_MODEL_PATH)
-        print(f"YOLO model loaded. Classes: {list(_detector_instance.names.values())}")
+        log.info("YOLO model loaded. Classes: %s", list(_detector_instance.names.values()))
+        # Cache class IDs once at model load time
+        _target_class_ids_cache = _resolve_target_class_ids(_detector_instance)
     return _detector_instance
 
 
@@ -214,10 +228,10 @@ def _resolve_target_class_ids(model) -> Tuple[Optional[set], bool]:
         model_names_lower[n] for n in _VEHICLE_FALLBACK_CLASSES if n in model_names_lower
     }
     if vehicle_ids:
-        print("No dedicated plate class in model. Using vehicle classes + OpenCV plate localisation.")
+        log.info("No dedicated plate class in model. Using vehicle classes + OpenCV plate localisation.")
         return vehicle_ids, True
 
-    print("No matching classes found. Returning all detections.")
+    log.warning("No matching classes found. Returning all detections.")
     return None, False
 
 
@@ -229,7 +243,7 @@ def _detect_plates(colour_bgr: np.ndarray) -> list:
     Returns empty list if nothing detected — this signals "no vehicle found".
     """
     model = _get_detector()
-    plate_class_ids, is_vehicle_fallback = _resolve_target_class_ids(model)
+    plate_class_ids, is_vehicle_fallback = _target_class_ids_cache
 
     results = model(colour_bgr, conf=YOLO_CONF_THRESHOLD, verbose=False)
     boxes = []
@@ -247,12 +261,7 @@ def _detect_plates(colour_bgr: np.ndarray) -> list:
 
             if is_vehicle_fallback:
                 plate_coords = _find_plate_in_crop(colour_bgr, x1, y1, x2, y2)
-                if plate_coords is not None:
-                    px1, py1, px2, py2 = plate_coords
-                    if (px2 - px1) < 30 or (py2 - py1) < 25:
-                        plate_coords = None
-
-                if plate_coords is not None:
+                if plate_coords and (plate_coords[2] - plate_coords[0]) >= 30 and (plate_coords[3] - plate_coords[1]) >= 25:
                     px1, py1, px2, py2 = plate_coords
                     boxes.append({
                         "x1": px1, "y1": py1, "x2": px2, "y2": py2,
@@ -277,18 +286,12 @@ def _detect_plates(colour_bgr: np.ndarray) -> list:
         ih, iw = colour_bgr.shape[:2]
         total_area = ih * iw
         plate_coords = _find_plate_in_crop(colour_bgr, 0, 0, iw, ih, lenient=True)
-        if plate_coords is not None:
-            px1, py1, px2, py2 = plate_coords
-            if (px2 - px1) * (py2 - py1) < total_area * 0.05:
-                plate_coords = None
-
-        if plate_coords is not None:
+        if plate_coords and (plate_coords[2] - plate_coords[0]) * (plate_coords[3] - plate_coords[1]) >= total_area * 0.05:
             px1, py1, px2, py2 = plate_coords
             boxes.append({
                 "x1": px1, "y1": py1, "x2": px2, "y2": py2,
                 "confidence": 0.5, "class_name": "license_plate(cv_full)",
             })
-        # If still nothing, return empty — means no vehicle detected at all
 
     boxes.sort(key=lambda b: b["confidence"], reverse=True)
     return boxes
@@ -379,9 +382,9 @@ def _get_ocr_reader() -> easyocr.Reader:
     """Get or create the EasyOCR reader singleton."""
     global _reader_instance
     if _reader_instance is None:
-        print(f"Initializing EasyOCR reader (languages: {OCR_LANGUAGES}, GPU: {OCR_USE_GPU})")
+        log.info("Initializing EasyOCR reader (languages: %s, GPU: %s)", OCR_LANGUAGES, OCR_USE_GPU)
         _reader_instance = easyocr.Reader(lang_list=OCR_LANGUAGES, gpu=OCR_USE_GPU)
-        print("EasyOCR reader initialized")
+        log.info("EasyOCR reader initialized")
     return _reader_instance
 
 
@@ -523,13 +526,13 @@ def extract_license_plate(image_path) -> dict:
     try:
         image = cv2.imread(str(image_path))
         if image is None:
-            print(f"Failed to load image: {image_path}")
+            log.warning("Failed to load image: %s", image_path)
             return _empty_result()
 
         return _run_pipeline(image)
 
     except Exception as e:
-        print(f"Error extracting license plate from {image_path}: {e}")
+        log.error("Error extracting license plate from %s: %s", image_path, e)
         return _empty_result()
 
 
@@ -544,7 +547,7 @@ def extract_license_plate_from_cv2_image(image) -> dict:
     try:
         return _run_pipeline(image)
     except Exception as e:
-        print(f"Error in license plate extraction pipeline: {e}")
+        log.error("Error in license plate extraction pipeline: %s", e)
         return _empty_result()
 
 
@@ -567,7 +570,7 @@ def _run_pipeline(image: np.ndarray) -> dict:
     # 2. YOLO Detection
     detections = _detect_plates(enhanced_colour)
     if not detections:
-        print("No vehicle or licence plate detected in image")
+        log.debug("No vehicle or licence plate detected in image")
         return result
 
     result["vehicle_detected"] = True
@@ -597,8 +600,8 @@ def _run_pipeline(image: np.ndarray) -> dict:
     result["plate_text"] = plate_text if plate_text else "UNKNOWN"
     result["confidence"] = ocr_confidence
 
-    print(
-        f"License plate detected: {result['plate_text']} "
-        f"(OCR conf: {ocr_confidence:.2f}, det conf: {best['confidence']:.2f})"
+    log.info(
+        "License plate detected: %s (OCR conf: %.2f, det conf: %.2f)",
+        result['plate_text'], ocr_confidence, best['confidence']
     )
     return result
