@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import struct
+import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
+import atexit
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -31,7 +33,8 @@ try:
         CAMERA_IP,
         CAMERA_USER,
         CAMERA_PASS,
-        RTSP_URL
+        RTSP_URL,
+        QUEUE_LOG_PATH
     )
     _camera_available = True
 except ImportError as e:
@@ -41,7 +44,7 @@ except ImportError as e:
 
 # Import license plate extractor
 try:
-    from webapp.license_plate_extractor import extract_license_plate
+    from webapp.license_plate_extractor import extract_all_license_plates
     _license_plate_available = True
 except ImportError as e:
     log.warning("License plate extractor not available: %s", e)
@@ -88,6 +91,15 @@ _slots_snapshot_dirty = False
 _alerts_buffer: List[dict] = []  # state-change alerts
 _camera_captures: Dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
 _ALERTS_MAX = 500
+
+# ── Challan (parking violation) tracking ──────────────────────────────────────
+# Challan re-check interval in seconds (70s × 2 checks ≈ detect >2 min stays)
+CHALLAN_RECHECK_INTERVAL = int(os.getenv("CHALLAN_RECHECK_INTERVAL", "70"))
+CHALLAN_LOG_PATH = REPO_ROOT / "data" / "challan_events.jsonl"
+_challan_records: List[dict] = []  # in-memory challan buffer
+_challan_lock = threading.Lock()
+_challan_pending: Dict[str, dict] = {}  # plate_text -> pending recheck info
+_CHALLAN_MAX = 1000
 
 # Reverse device-name lookup: device_name(upper) -> slot_id
 _device_name_to_slot: Dict[str, int] = {}
@@ -308,20 +320,27 @@ def _enqueue_via_chirpstack_grpc(dev_eui: str, data_hex: str, fport: int = 2) ->
 
 
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
-    """Log camera capture result to event log with license plate extraction."""
-    license_plate = "UNKNOWN"
+    """Log camera capture result to event log with license plate extraction and challan tracking."""
+    license_plates = []
     vehicle_detected = True  # default True when extractor is unavailable
 
     if _license_plate_available:
         try:
-            log.info("Extracting license plate from %s...", image_path)
-            extraction_result = extract_license_plate(image_path)
-            license_plate = extraction_result.get("plate_text", "UNKNOWN")
+            log.info("Extracting license plates from %s...", image_path)
+            extraction_result = extract_all_license_plates(image_path)
             vehicle_detected = extraction_result.get("vehicle_detected", True)
+            plates_list = extraction_result.get("plates", [])
+            for p in plates_list:
+                pt = p.get("plate_text", "UNKNOWN")
+                if pt and pt != "UNKNOWN":
+                    license_plates.append(pt)
         except Exception as e:
-            log.error("Error extracting license plate: %s", e)
+            log.error("Error extracting license plates: %s", e)
     else:
         log.debug("License plate extraction not available")
+
+    # Use best plate for backward-compatible single-plate field
+    license_plate = license_plates[0] if license_plates else "UNKNOWN"
 
     event = {
         "event": "camera_capture",
@@ -331,6 +350,7 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         "zone": zone,
         "image_path": image_path,
         "license_plate": license_plate,
+        "license_plates": license_plates,
         "vehicle_detected": vehicle_detected
     }
     try:
@@ -342,10 +362,204 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         _camera_captures[(slot_id, timestamp_str)] = {
             "image_path": image_path,
             "license_plate": license_plate,
+            "license_plates": license_plates,
             "vehicle_detected": vehicle_detected,
         }
     except Exception as e:
         log.error("Error logging camera capture: %s", e)
+
+    # ── Challan tracking: schedule re-check for each detected plate ──────
+    if license_plates and ENABLE_CAMERA_CONTROL and _camera_queue is not None:
+        meta_by_id = load_slot_meta_by_id()
+        meta = meta_by_id.get(slot_id, {})
+        preset = meta.get("preset")
+        if preset:
+            for plate in license_plates:
+                _schedule_challan_recheck(
+                    plate_text=plate,
+                    slot_id=slot_id,
+                    slot_name=slot_name,
+                    zone=zone,
+                    preset=preset,
+                    first_image=image_path,
+                    first_time=timestamp_str,
+                )
+
+
+def _make_challan_recheck_callback(pending_key: str):
+    """Create callback for challan recheck capture completion.
+
+    The camera worker handles the move/settle/capture cycle.  This callback
+    performs the plate comparison and challan recording after the image has
+    been captured successfully.
+    """
+    def callback(success, image_path, error_msg):
+        with _challan_lock:
+            pending = _challan_pending.pop(pending_key, None)
+        if pending is None:
+            log.warning("Challan recheck callback: no pending entry for key %s", pending_key)
+            return
+
+        if not success or not image_path:
+            log.error("Challan recheck capture failed for %s: %s", pending_key, error_msg)
+            return
+
+        plate_text = pending["plate_text"]
+        slot_id = pending["slot_id"]
+        slot_name = pending["slot_name"]
+        zone = pending["zone"]
+        preset = pending["preset"]
+        first_image = pending["first_image"]
+        first_time = pending["first_time"]
+        recheck_count = pending.get("recheck_count", 0)
+
+        log.info("Challan recheck #%d complete for plate %s at slot %s",
+                 recheck_count + 1, plate_text, slot_name)
+
+        ts_str = datetime.now(timezone.utc).isoformat()
+        second_image = image_path
+
+        # Extract plates from new capture
+        new_plates = []
+        if _license_plate_available:
+            try:
+                result = extract_all_license_plates(second_image)
+                for p in result.get("plates", []):
+                    pt = p.get("plate_text", "UNKNOWN")
+                    if pt and pt != "UNKNOWN":
+                        new_plates.append(pt)
+            except Exception as e:
+                log.error("Error extracting plates in challan recheck: %s", e)
+
+        if plate_text in new_plates:
+            # Same plate still present → CHALLAN
+            _record_challan(
+                plate_text=plate_text,
+                slot_id=slot_id,
+                slot_name=slot_name,
+                zone=zone,
+                first_image=first_image,
+                first_time=first_time,
+                second_image=second_image,
+                second_time=ts_str,
+                challan=True,
+            )
+        else:
+            # Different plates or plates not found
+            if new_plates and recheck_count < 1:
+                for np_text in new_plates:
+                    _schedule_challan_recheck(
+                        plate_text=np_text,
+                        slot_id=slot_id,
+                        slot_name=slot_name,
+                        zone=zone,
+                        preset=preset,
+                        first_image=second_image,
+                        first_time=ts_str,
+                    )
+                    new_key = f"{np_text}_{slot_id}"
+                    with _challan_lock:
+                        if new_key in _challan_pending:
+                            _challan_pending[new_key]["recheck_count"] = recheck_count + 1
+
+            # Record the check (no challan)
+            _record_challan(
+                plate_text=plate_text,
+                slot_id=slot_id,
+                slot_name=slot_name,
+                zone=zone,
+                first_image=first_image,
+                first_time=first_time,
+                second_image=second_image,
+                second_time=ts_str,
+                challan=False,
+                second_plates=new_plates,
+            )
+
+    return callback
+
+
+def _schedule_challan_recheck(plate_text: str, slot_id: int, slot_name: str,
+                               zone: str, preset: int, first_image: str,
+                               first_time: str):
+    """Schedule a re-check by pushing a delayed task onto the camera queue.
+
+    Instead of using a threading.Timer (which bypasses the camera queue and
+    causes race conditions), this enqueues a ``challan_recheck`` task with a
+    ``scheduled_at`` field set to *now + CHALLAN_RECHECK_INTERVAL*.  The camera
+    worker will hold the task until it's due, then move/capture through the
+    single-threaded worker — eliminating concurrent camera access.
+    """
+    key = f"{plate_text}_{slot_id}"
+    with _challan_lock:
+        _challan_pending[key] = {
+            "plate_text": plate_text,
+            "slot_id": slot_id,
+            "slot_name": slot_name,
+            "zone": zone,
+            "preset": preset,
+            "first_image": first_image,
+            "first_time": first_time,
+            "recheck_count": 0,
+        }
+
+    if _camera_queue is None:
+        log.warning("Camera queue not available for challan recheck scheduling")
+        return
+
+    scheduled_at = (datetime.now(timezone.utc) + timedelta(seconds=CHALLAN_RECHECK_INTERVAL)).isoformat()
+    _camera_queue.add_task({
+        "task_type": "challan_recheck",
+        "slot_id": slot_id,
+        "slot_name": slot_name,
+        "zone": zone,
+        "preset": preset,
+        "scheduled_at": scheduled_at,
+        "pending_key": key,
+        "plate_text": plate_text,
+        "first_image": first_image,
+        "first_time": first_time,
+        "recheck_count": 0,
+        "callback": _make_challan_recheck_callback(key),
+    })
+    log.info("Challan recheck scheduled for plate %s at slot %s in %ds (via camera queue)",
+             plate_text, slot_name, CHALLAN_RECHECK_INTERVAL)
+
+
+def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
+                     first_image: str, first_time: str,
+                     second_image: str, second_time: str,
+                     challan: bool, second_plates: list = None):
+    """Write a challan record to disk and keep in memory."""
+    record = {
+        "plate_text": plate_text,
+        "slot_id": slot_id,
+        "slot_name": slot_name,
+        "zone": zone,
+        "first_image": first_image,
+        "first_time": first_time,
+        "second_image": second_image,
+        "second_time": second_time,
+        "challan": challan,
+    }
+    if second_plates is not None:
+        record["second_plates"] = second_plates
+
+    with _challan_lock:
+        _challan_records.append(record)
+        if len(_challan_records) > _CHALLAN_MAX:
+            _challan_records.pop(0)
+
+    # Persist to file
+    try:
+        CHALLAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CHALLAN_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+        status = "CHALLAN" if challan else "cleared"
+        log.info("Challan record: plate=%s slot=%s %s", plate_text, slot_name, status)
+    except Exception as e:
+        log.error("Error writing challan record: %s", e)
 
 
 def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str, timestamp_str: str):
@@ -698,6 +912,10 @@ def _startup():
                 rtsp_url=RTSP_URL
             )
             CAMERA_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Recover pending tasks from previous run
+            _recover_pending_tasks()
+
             _camera_worker_thread = threading.Thread(
                 target=camera_worker,
                 args=(_camera_controller, _camera_queue),
@@ -733,6 +951,72 @@ def _shutdown():
     if _camera_queue is not None:
         log.info("Shutting down camera worker...")
         _camera_queue.shutdown_event.set()
+        if _camera_worker_thread is not None and _camera_worker_thread.is_alive():
+            _camera_worker_thread.join(timeout=15)
+            if _camera_worker_thread.is_alive():
+                log.warning("Camera worker did not terminate within 15s")
+            else:
+                log.info("Camera worker stopped gracefully")
+
+
+def _atexit_handler():
+    """Safety net for unclean exits (Ctrl+C, kill) that bypass the FastAPI lifespan."""
+    _shutdown_event.set()
+    if _camera_queue is not None:
+        _camera_queue.shutdown_event.set()
+    _flush_snapshot_to_disk()
+
+atexit.register(_atexit_handler)
+
+
+def _recover_pending_tasks():
+    """Recover pending tasks from data/camera_queue.jsonl after a crash/restart."""
+    if _camera_queue is None:
+        return
+
+    pending = _camera_queue.recover_tasks(max_age_seconds=300)
+    if not pending:
+        log.info("No pending tasks to recover from queue log")
+        _camera_queue.compact_log()
+        return
+
+    camera_count = 0
+    challan_count = 0
+
+    for task in pending:
+        task_type = task.get("task_type", "camera_capture")
+
+        if task_type == "challan_recheck":
+            pending_key = task.get("pending_key")
+            if pending_key:
+                with _challan_lock:
+                    _challan_pending[pending_key] = {
+                        "plate_text": task.get("plate_text", ""),
+                        "slot_id": task.get("slot_id"),
+                        "slot_name": task.get("slot_name", ""),
+                        "zone": task.get("zone", ""),
+                        "preset": task.get("preset"),
+                        "first_image": task.get("first_image", ""),
+                        "first_time": task.get("first_time", ""),
+                        "recheck_count": task.get("recheck_count", 0),
+                    }
+                task["callback"] = _make_challan_recheck_callback(pending_key)
+            challan_count += 1
+        elif task_type == "camera_capture":
+            slot_id = task.get("slot_id")
+            slot_name = task.get("slot_name", str(slot_id))
+            zone = task.get("zone", "")
+            ts_str = task.get("queued_at", datetime.now(timezone.utc).isoformat())
+            task["callback"] = _make_camera_capture_callback(slot_id, slot_name, zone, ts_str)
+            camera_count += 1
+        else:
+            continue
+
+        _camera_queue.add_task(task, skip_log=True)
+
+    log.info("Recovered %d camera tasks, %d challan rechecks from queue log",
+             camera_count, challan_count)
+    _camera_queue.compact_log()
 
 
 def _init_alerts_from_log():
@@ -755,6 +1039,7 @@ def _init_alerts_from_log():
                         _camera_captures[key] = {
                             "image_path": obj.get("image_path"),
                             "license_plate": obj.get("license_plate", "UNKNOWN"),
+                            "license_plates": obj.get("license_plates", []),
                             "vehicle_detected": obj.get("vehicle_detected", True),
                         }
                 except Exception:
@@ -765,6 +1050,31 @@ def _init_alerts_from_log():
         log.info("Loaded %d alerts and %d camera captures from log", len(_alerts_buffer), len(_camera_captures))
     except Exception as e:
         log.error("Error loading alerts from log: %s", e)
+
+    # Load challan records
+    _init_challan_from_log()
+
+
+def _init_challan_from_log():
+    """Populate in-memory challan records from log file on startup."""
+    if not CHALLAN_LOG_PATH.exists():
+        return
+    try:
+        with open(CHALLAN_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    _challan_records.append(record)
+                except Exception:
+                    continue
+        while len(_challan_records) > _CHALLAN_MAX:
+            _challan_records.pop(0)
+        log.info("Loaded %d challan records from log", len(_challan_records))
+    except Exception as e:
+        log.error("Error loading challan records: %s", e)
 
 def _load_yaml(path: Path):
     if not path.exists():
@@ -1161,6 +1471,33 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
     paginated = merged[offset:offset + limit]
 
     return {"alerts": paginated, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/challans")
+def get_challans(limit: int = Query(default=100, le=500), offset: int = Query(default=0),
+                 challan_only: bool = Query(default=False)):
+    """
+    Returns challan (violation) records.
+    Each record has: plate_text, first_image, first_time, second_image, second_time, challan.
+    Use challan_only=true to filter for confirmed violations only.
+    """
+    with _challan_lock:
+        records = list(_challan_records)
+
+    if challan_only:
+        records = [r for r in records if r.get("challan")]
+
+    records.sort(key=lambda r: r.get("first_time", ""), reverse=True)
+    total = len(records)
+    paginated = records[offset:offset + limit]
+
+    return {"challans": paginated, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/challan-dashboard", response_class=HTMLResponse)
+def challan_dashboard():
+    """Serves the challan dashboard page."""
+    return FileResponse(str(APP_ROOT / "static" / "challan.html"))
 
 
 @app.get("/snapshots/{filename}")

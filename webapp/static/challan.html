@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Challan Dashboard — Parking Vision</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      /* ── Challan-specific styles ─────────────────────────────────── */
+      .challan-page { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+      .challan-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 24px; flex-wrap: wrap; gap: 16px;
+      }
+      .challan-header-left { display: flex; flex-direction: column; gap: 4px; }
+      .challan-title { font-size: 1.5rem; font-weight: 700; color: var(--text); }
+      .challan-subtitle { font-size: 0.875rem; color: var(--muted); }
+
+      .challan-controls { display: flex; gap: 12px; align-items: center; }
+      .challan-filter {
+        padding: 8px 14px; border-radius: 8px;
+        background: var(--panel); border: 1px solid var(--border);
+        color: var(--text); font-family: inherit; font-size: 0.8125rem; cursor: pointer;
+      }
+      .challan-filter:hover { border-color: var(--accent); }
+      .refresh-btn {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 14px; border-radius: 8px;
+        background: var(--panel); border: 1px solid var(--border);
+        color: var(--text-secondary); font-size: 0.8125rem;
+        cursor: pointer; transition: all 0.2s;
+      }
+      .refresh-btn:hover { border-color: var(--accent); color: var(--text); }
+
+      .back-link {
+        display: inline-flex; align-items: center; gap: 6px;
+        color: var(--accent-bright); text-decoration: none; font-size: 0.875rem;
+        margin-bottom: 16px; transition: color 0.2s;
+      }
+      .back-link:hover { color: var(--text); }
+
+      /* Stats row */
+      .challan-stats {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 16px; margin-bottom: 24px;
+      }
+      .challan-stat {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        padding: 16px 20px; display: flex; align-items: center; gap: 14px;
+      }
+      .challan-stat-icon { font-size: 1.5rem; }
+      .challan-stat-value { font-size: 1.25rem; font-weight: 700; color: var(--text); }
+      .challan-stat-label { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+
+      /* Table */
+      .challan-table-wrap {
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 12px; overflow: hidden;
+      }
+      .challan-table {
+        width: 100%; border-collapse: collapse; font-size: 0.8125rem;
+      }
+      .challan-table th {
+        text-align: left; padding: 14px 16px; font-weight: 600; font-size: 0.75rem;
+        color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
+        border-bottom: 1px solid var(--border); background: rgba(26, 31, 53, 0.6);
+        position: sticky; top: 0;
+      }
+      .challan-table td {
+        padding: 12px 16px; border-bottom: 1px solid var(--border);
+        color: var(--text-secondary); vertical-align: middle;
+      }
+      .challan-table tr:last-child td { border-bottom: none; }
+      .challan-table tr:hover td { background: var(--panel-hover); }
+
+      .plate-badge {
+        display: inline-block; padding: 4px 10px; border-radius: 6px;
+        font-weight: 600; font-family: 'Courier New', monospace; font-size: 0.875rem;
+        letter-spacing: 0.08em;
+        background: rgba(99, 102, 241, 0.15); color: var(--accent-bright);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+      }
+
+      .challan-badge {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.75rem;
+      }
+      .challan-badge.yes {
+        background: rgba(239, 68, 68, 0.15); color: #f87171;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+      }
+      .challan-badge.no {
+        background: rgba(16, 185, 129, 0.15); color: #34d399;
+        border: 1px solid rgba(16, 185, 129, 0.3);
+      }
+
+      .thumb {
+        width: 80px; height: 56px; object-fit: cover; border-radius: 6px;
+        border: 1px solid var(--border); cursor: pointer;
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .thumb:hover { transform: scale(1.08); box-shadow: var(--shadow-md); }
+
+      .no-thumb {
+        width: 80px; height: 56px; border-radius: 6px;
+        background: rgba(42, 51, 80, 0.6); border: 1px solid var(--border);
+        display: flex; align-items: center; justify-content: center;
+        color: var(--muted); font-size: 0.65rem;
+      }
+
+      .challan-empty {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 80px 20px; color: var(--muted); text-align: center;
+      }
+      .challan-empty .empty-icon { font-size: 3rem; margin-bottom: 16px; opacity: 0.5; }
+      .challan-empty .empty-title { font-size: 1.125rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }
+      .challan-empty .empty-hint { font-size: 0.875rem; }
+
+      /* Lightbox */
+      .lightbox {
+        display: none; position: fixed; inset: 0; z-index: 1000;
+        background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(8px);
+        align-items: center; justify-content: center; cursor: pointer;
+      }
+      .lightbox.active { display: flex; }
+      .lightbox img {
+        max-width: 90vw; max-height: 85vh; border-radius: 12px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+      }
+      .lightbox-close {
+        position: absolute; top: 20px; right: 24px;
+        background: none; border: none; color: #fff; font-size: 2rem;
+        cursor: pointer; opacity: 0.7; transition: opacity 0.2s;
+      }
+      .lightbox-close:hover { opacity: 1; }
+
+      @media (max-width: 768px) {
+        .challan-table { font-size: 0.75rem; }
+        .challan-table th, .challan-table td { padding: 10px 10px; }
+        .thumb { width: 60px; height: 42px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="title">
+          <svg class="logo-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+            <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+            <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+            <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+          </svg>
+          Challan Dashboard
+        </div>
+      </div>
+    </header>
+
+    <main class="challan-page">
+      <a href="/" class="back-link">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+        </svg>
+        Back to Dashboard
+      </a>
+
+      <!-- Stats -->
+      <div class="challan-stats" id="challanStats">
+        <div class="challan-stat">
+          <div class="challan-stat-icon">📋</div>
+          <div>
+            <div class="challan-stat-value" id="statTotal">--</div>
+            <div class="challan-stat-label">Total Checks</div>
+          </div>
+        </div>
+        <div class="challan-stat">
+          <div class="challan-stat-icon">🚨</div>
+          <div>
+            <div class="challan-stat-value" id="statChallans">--</div>
+            <div class="challan-stat-label">Challans Issued</div>
+          </div>
+        </div>
+        <div class="challan-stat">
+          <div class="challan-stat-icon">✅</div>
+          <div>
+            <div class="challan-stat-value" id="statCleared">--</div>
+            <div class="challan-stat-label">Cleared</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="challan-header">
+        <div class="challan-header-left">
+          <h2 class="challan-title">🚗 Parking Violation Records</h2>
+          <p class="challan-subtitle">Vehicles detected staying more than 2 minutes</p>
+        </div>
+        <div class="challan-controls">
+          <select class="challan-filter" id="filterSelect" onchange="loadChallans()">
+            <option value="all">All Records</option>
+            <option value="challan">Challans Only</option>
+            <option value="cleared">Cleared Only</option>
+          </select>
+          <button class="refresh-btn" onclick="loadChallans()" title="Refresh">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+            </svg>
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div class="challan-table-wrap" id="challanTableWrap">
+        <table class="challan-table">
+          <thead>
+            <tr>
+              <th>Vehicle Number</th>
+              <th>Slot</th>
+              <th>1st Capture</th>
+              <th>1st Photo</th>
+              <th>2nd Capture</th>
+              <th>2nd Photo</th>
+              <th>Challan</th>
+            </tr>
+          </thead>
+          <tbody id="challanBody">
+            <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Empty state -->
+      <div id="challanEmpty" class="challan-empty" style="display: none;">
+        <div class="empty-icon">📋</div>
+        <div class="empty-title">No challan records yet</div>
+        <div class="empty-hint">Records will appear here when vehicles are detected staying too long.</div>
+      </div>
+    </main>
+
+    <!-- Lightbox overlay -->
+    <div class="lightbox" id="lightbox" onclick="closeLightbox()">
+      <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+      <img id="lightboxImg" src="" alt="Full size" />
+    </div>
+
+    <script>
+      function fmtTime(ts) {
+        try {
+          const d = new Date(ts);
+          if (!isNaN(d.getTime())) return d.toLocaleString();
+        } catch {}
+        return String(ts || "—");
+      }
+
+      function filenameFromPath(path) {
+        if (!path) return null;
+        return path.split('/').pop().split('\\').pop();
+      }
+
+      function openLightbox(src) {
+        const lb = document.getElementById('lightbox');
+        document.getElementById('lightboxImg').src = src;
+        lb.classList.add('active');
+      }
+
+      function closeLightbox() {
+        document.getElementById('lightbox').classList.remove('active');
+      }
+
+      document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+      async function loadChallans() {
+        const filter = document.getElementById('filterSelect').value;
+        const challanOnly = filter === 'challan' ? 'true' : 'false';
+
+        try {
+          const res = await fetch(`/challans?limit=200&challan_only=${challanOnly}`);
+          const data = await res.json();
+
+          let records = data.challans || [];
+
+          // Client-side filter for "cleared" option
+          if (filter === 'cleared') {
+            records = records.filter(r => !r.challan);
+          }
+
+          // Stats
+          const allRes = await fetch('/challans?limit=500');
+          const allData = await allRes.json();
+          const all = allData.challans || [];
+          const totalCount = all.length;
+          const challanCount = all.filter(r => r.challan).length;
+          const clearedCount = totalCount - challanCount;
+
+          document.getElementById('statTotal').textContent = totalCount;
+          document.getElementById('statChallans').textContent = challanCount;
+          document.getElementById('statCleared').textContent = clearedCount;
+
+          renderTable(records);
+        } catch (err) {
+          console.error('Failed to load challans:', err);
+        }
+      }
+
+      function renderTable(records) {
+        const tbody = document.getElementById('challanBody');
+        const emptyEl = document.getElementById('challanEmpty');
+        const tableWrap = document.getElementById('challanTableWrap');
+
+        if (records.length === 0) {
+          tableWrap.style.display = 'none';
+          emptyEl.style.display = 'flex';
+          return;
+        }
+
+        tableWrap.style.display = 'block';
+        emptyEl.style.display = 'none';
+
+        tbody.innerHTML = records.map(r => {
+          const f1 = filenameFromPath(r.first_image);
+          const f2 = filenameFromPath(r.second_image);
+
+          const img1 = f1
+            ? `<img class="thumb" src="/snapshots/${f1}" alt="1st" onclick="event.stopPropagation();openLightbox('/snapshots/${f1}')" />`
+            : `<div class="no-thumb">No image</div>`;
+
+          const img2 = f2
+            ? `<img class="thumb" src="/snapshots/${f2}" alt="2nd" onclick="event.stopPropagation();openLightbox('/snapshots/${f2}')" />`
+            : `<div class="no-thumb">No image</div>`;
+
+          const challanBadge = r.challan
+            ? `<span class="challan-badge yes">🚨 YES</span>`
+            : `<span class="challan-badge no">✅ NO</span>`;
+
+          return `
+            <tr>
+              <td><span class="plate-badge">${r.plate_text || 'UNKNOWN'}</span></td>
+              <td>${r.slot_name || '—'} <span style="color:var(--muted);font-size:0.7rem;">(Zone ${r.zone || '?'})</span></td>
+              <td>${fmtTime(r.first_time)}</td>
+              <td>${img1}</td>
+              <td>${fmtTime(r.second_time)}</td>
+              <td>${img2}</td>
+              <td>${challanBadge}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // Initial load
+      loadChallans();
+
+      // Auto refresh every 30 seconds
+      setInterval(loadChallans, 30000);
+    </script>
+  </body>
+</html>
