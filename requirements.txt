@@ -8,4 +8,6 @@ uvicorn
 requests
 python-dotenv
 paho-mqtt
+chirpstack-api
+grpcio
 easyocr

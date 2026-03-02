@@ -155,6 +155,12 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "application/+/device/+/event/up")
 ENABLE_MQTT = int(os.getenv("ENABLE_MQTT", "1"))  # Enable MQTT by default
 
+# ChirpStack gRPC API Configuration
+CHIRPSTACK_HOST = os.getenv("CHIRPSTACK_HOST", "localhost")
+CHIRPSTACK_GRPC_PORT = os.getenv("CHIRPSTACK_GRPC_PORT", "8080")
+CHIRPSTACK_API_TOKEN = os.getenv("CHIRPSTACK_API_TOKEN", "")
+CHIRPSTACK_APP_ID = os.getenv("CHIRPSTACK_APP_ID", "")  # Application UUID to fetch devices from
+
 # MQTT client reference
 _mqtt_client = None
 _mqtt_previous_states: Dict[int, str] = {}
@@ -164,13 +170,136 @@ _mqtt_last_snapshot_time = None
 _device_map: Dict[int, dict] = {}
 
 
+def _save_device_map():
+    """Persist device map into snapshot.yaml so it survives server restarts."""
+    try:
+        with _snapshot_lock:
+            data = load_snapshot_data()
+            data["device_map"] = {str(k): v for k, v in _device_map.items()}
+            save_snapshot_data(data)
+    except Exception as e:
+        print(f"Error persisting device map: {e}")
+
+
+def _load_device_map():
+    """Restore device map from snapshot.yaml on startup."""
+    global _device_map
+    try:
+        data = load_snapshot_data()
+        saved = data.get("device_map", {})
+        for k, v in saved.items():
+            _device_map[int(k)] = v
+        if _device_map:
+            print(f"Restored device map for {len(_device_map)} slot(s)")
+    except Exception as e:
+        print(f"Error loading device map: {e}")
+
+
+def _fetch_devices_from_chirpstack():
+    """Fetch all devices from ChirpStack gRPC API and populate _device_map."""
+    if not CHIRPSTACK_API_TOKEN or not CHIRPSTACK_APP_ID:
+        print("ChirpStack API not configured (missing CHIRPSTACK_API_TOKEN or CHIRPSTACK_APP_ID)")
+        return
+
+    try:
+        import grpc
+        from chirpstack_api import api as cs_api
+
+        target = f"{CHIRPSTACK_HOST}:{CHIRPSTACK_GRPC_PORT}"
+        channel = grpc.insecure_channel(target)
+        client = cs_api.DeviceServiceStub(channel)
+        auth_token = [("authorization", f"Bearer {CHIRPSTACK_API_TOKEN}")]
+
+        meta_by_id = load_slot_meta_by_id()
+        matched = 0
+        offset = 0
+        limit = 100
+
+        while True:
+            resp = client.List(
+                cs_api.ListDevicesRequest(
+                    application_id=CHIRPSTACK_APP_ID,
+                    limit=limit,
+                    offset=offset,
+                ),
+                metadata=auth_token,
+            )
+
+            for device in resp.result:
+                dev_name = device.name
+                dev_eui = device.dev_eui
+
+                # Match ChirpStack device name to a slot
+                slot_id = _get_slot_id_by_device_name(dev_name, meta_by_id)
+                if slot_id is not None:
+                    _device_map[slot_id] = {
+                        "applicationId": CHIRPSTACK_APP_ID,
+                        "devEui": dev_eui,
+                    }
+                    matched += 1
+
+            offset += limit
+            if offset >= resp.total_count:
+                break
+
+        channel.close()
+
+        if matched:
+            print(f"ChirpStack API: mapped {matched} device(s) to slots")
+            _save_device_map()
+        else:
+            print("ChirpStack API: no devices matched any slot names")
+
+    except Exception as e:
+        print(f"Error fetching devices from ChirpStack: {e}")
+
+
+def _enqueue_via_chirpstack_grpc(dev_eui: str, data_hex: str, fport: int = 2) -> bool:
+    """Enqueue a downlink via ChirpStack gRPC API (creates a real queue item)."""
+    if not CHIRPSTACK_API_TOKEN:
+        return False
+
+    try:
+        import grpc
+        from chirpstack_api import api as cs_api
+
+        target = f"{CHIRPSTACK_HOST}:{CHIRPSTACK_GRPC_PORT}"
+        channel = grpc.insecure_channel(target)
+        client = cs_api.DeviceServiceStub(channel)
+        auth_token = [("authorization", f"Bearer {CHIRPSTACK_API_TOKEN}")]
+
+        data_bytes = bytes.fromhex(data_hex)
+
+        resp = client.Enqueue(
+            cs_api.EnqueueDeviceQueueItemRequest(
+                queue_item=cs_api.DeviceQueueItem(
+                    dev_eui=dev_eui,
+                    confirmed=False,
+                    f_port=fport,
+                    data=data_bytes,
+                )
+            ),
+            metadata=auth_token,
+        )
+        channel.close()
+        print(f"ChirpStack gRPC: enqueued downlink for {dev_eui} (id: {resp.id})")
+        return True
+    except Exception as e:
+        print(f"ChirpStack gRPC enqueue error: {e}")
+        return False
+
+
 def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
     """Log camera capture result to event log with license plate extraction."""
     license_plate = "UNKNOWN"
+    vehicle_detected = True  # default True when extractor is unavailable
+
     if _license_plate_available:
         try:
             print(f"Extracting license plate from {image_path}...")
-            license_plate = extract_license_plate(image_path)
+            extraction_result = extract_license_plate(image_path)
+            license_plate = extraction_result.get("plate_text", "UNKNOWN")
+            vehicle_detected = extraction_result.get("vehicle_detected", True)
         except Exception as e:
             print(f"Error extracting license plate: {e}")
     else:
@@ -183,7 +312,8 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         "slot_name": slot_name,
         "zone": zone,
         "image_path": image_path,
-        "license_plate": license_plate
+        "license_plate": license_plate,
+        "vehicle_detected": vehicle_detected
     }
     try:
         with _event_log_lock:
@@ -219,7 +349,7 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
             })
 
             # Enqueue camera task if enabled
-            if ENABLE_CAMERA_CONTROL and _camera_queue is not None:
+            if ENABLE_CAMERA_CONTROL and _camera_queue is not None and prev_state == "FREE" and state == "OCCUPIED":
                 preset = meta.get("preset")
                 if preset:
                     try:
@@ -317,13 +447,10 @@ def _log_events_to_file(events: list):
 
 def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
     """
-    Queue a downlink command for a device via ChirpStack MQTT.
+    Queue a downlink command for a device.
+    Prefers ChirpStack gRPC Enqueue API; falls back to MQTT publish.
     For Class A devices, this will be sent after the next uplink.
     """
-    if _mqtt_client is None:
-        print("Error: MQTT client not initialized")
-        return False
-
     device_info = _device_map.get(slot_id)
     if not device_info:
         print(f"Error: No device mapping found for slot {slot_id}")
@@ -336,28 +463,35 @@ def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
         print(f"Error: Incomplete device info for slot {slot_id}")
         return False
 
+    # --- Prefer gRPC Enqueue (creates a real ChirpStack queue item) ---
+    if CHIRPSTACK_API_TOKEN:
+        if _enqueue_via_chirpstack_grpc(dev_eui, data_hex, fport):
+            return True
+        print(f"gRPC enqueue failed for slot {slot_id}, falling back to MQTT")
+
+    # --- Fallback: MQTT publish ---
+    if _mqtt_client is None:
+        print("Error: MQTT client not initialized and gRPC unavailable")
+        return False
+
     topic = f"application/{app_id}/device/{dev_eui}/command/down"
-    
+
     try:
-        # Convert hex string to base64
         data_bytes = bytes.fromhex(data_hex)
         data_b64 = base64.b64encode(data_bytes).decode("ascii")
 
-        # ChirpStack v4 MQTT downlink format requires the payload wrapped
-        # inside "deviceQueueItem"; a bare object is silently ignored.
         payload = {
-            "deviceQueueItem": {
-                "confirmed": False,
-                "fPort": fport,
-                "data": data_b64
-            }
+            "devEui": dev_eui,
+            "confirmed": False,
+            "fPort": fport,
+            "data": data_b64
         }
 
         result = _mqtt_client.publish(topic, json.dumps(payload), qos=1)
         if result.rc != 0:
             print(f"Warning: publish returned rc={result.rc} for slot {slot_id}")
             return False
-        print(f"Queued command for slot {slot_id} (topic: {topic})")
+        print(f"Queued command for slot {slot_id} via MQTT (topic: {topic})")
         return True
     except Exception as e:
         print(f"Error queuing command: {e}")
@@ -468,6 +602,8 @@ def on_mqtt_message(client, userdata, msg):
                 "applicationId": app_id,
                 "devEui": dev_eui
             }
+            # Persist device map to snapshot so it survives restarts
+            _save_device_map()
 
         # Process the sensor data
         _process_mqtt_sensor_data(slot_id, status, timestamp_str)
@@ -559,6 +695,12 @@ def start_app():
         start_mqtt_listener()
     else:
         print("MQTT disabled. Set ENABLE_MQTT=1 to enable.")
+
+    # Restore device map from disk so calibrate works immediately
+    _load_device_map()
+
+    # Fetch devices from ChirpStack API to fill/refresh device map
+    _fetch_devices_from_chirpstack()
 
 
 @app.on_event("shutdown")
@@ -977,6 +1119,7 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
     """
     Returns recent state change events (alerts) with optional images and license plates.
     Sorted by timestamp descending (newest first).
+    Alerts where a camera snapshot was taken but no vehicle was detected are excluded.
     """
     alerts = []
     camera_captures = {}
@@ -996,32 +1139,42 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
                     event_type = obj.get("event")
 
                     if event_type == "slot_state_changed":
-                        alerts.append(obj)
+                         # Only include FREE -> OCCUPIED transitions
+                        if obj.get("prev_state") == "FREE" and obj.get("new_state") == "OCCUPIED":
+                            alerts.append(obj)
                     elif event_type == "camera_capture":
                         # Store camera captures by slot_id and timestamp for matching
                         key = (obj.get("slot_id"), obj.get("ts"))
                         camera_captures[key] = {
                             "image_path": obj.get("image_path"),
-                            "license_plate": obj.get("license_plate", "UNKNOWN")
+                            "license_plate": obj.get("license_plate", "UNKNOWN"),
+                            "vehicle_detected": obj.get("vehicle_detected", True)
                         }
                 except Exception:
                     continue
 
-    # Merge camera captures with alerts
+    # Merge camera captures with alerts and filter out false positives
+    merged_alerts = []
     for alert in alerts:
         key = (alert.get("slot_id"), alert.get("ts"))
         if key in camera_captures:
-            alert["image_path"] = camera_captures[key]["image_path"]
-            alert["license_plate"] = camera_captures[key]["license_plate"]
+            capture = camera_captures[key]
+            # If camera took a snapshot but no vehicle was detected, skip this alert
+            if not capture.get("vehicle_detected", True):
+                continue
+            alert["image_path"] = capture["image_path"]
+            alert["license_plate"] = capture["license_plate"]
         else:
-            # Default license plate to UNKNOWN if no camera capture
+            # No camera capture for this alert — keep it (sensor-only alert)
             alert["license_plate"] = "UNKNOWN"
 
-    # Sort newest first
-    alerts.sort(key=lambda x: x.get("ts", ""), reverse=True)
+        merged_alerts.append(alert)
 
-    total = len(alerts)
-    paginated = alerts[offset:offset+limit]
+    # Sort newest first
+    merged_alerts.sort(key=lambda x: x.get("ts", ""), reverse=True)
+
+    total = len(merged_alerts)
+    paginated = merged_alerts[offset:offset+limit]
 
     return {
         "alerts": paginated,
