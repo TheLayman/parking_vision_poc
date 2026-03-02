@@ -171,10 +171,17 @@
       <!-- Stats -->
       <div class="challan-stats" id="challanStats">
         <div class="challan-stat">
+          <div class="challan-stat-icon">�</div>
+          <div>
+            <div class="challan-stat-value" id="statIncidents">--</div>
+            <div class="challan-stat-label">Incidents</div>
+          </div>
+        </div>
+        <div class="challan-stat">
           <div class="challan-stat-icon">📋</div>
           <div>
             <div class="challan-stat-value" id="statTotal">--</div>
-            <div class="challan-stat-label">Total Checks</div>
+            <div class="challan-stat-label">Plate Checks</div>
           </div>
         </div>
         <div class="challan-stat">
@@ -196,10 +203,19 @@
       <!-- Controls -->
       <div class="challan-header">
         <div class="challan-header-left">
-          <h2 class="challan-title">🚗 Parking Violation Records</h2>
+          <h2 class="challan-title">🚗 Parking Violation Records <span class="live-indicator" id="sseIndicator" style="display:none;"><span class="live-dot"></span>LIVE</span></h2>
           <p class="challan-subtitle">Vehicles detected staying more than 2 minutes</p>
         </div>
         <div class="challan-controls">
+          <select class="challan-filter" id="zoneFilter" onchange="loadChallans()">
+            <option value="">All Zones</option>
+          </select>
+          <select class="challan-filter" id="dateFilter" onchange="loadChallans()">
+            <option value="">All Time</option>
+            <option value="today">Today</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+          </select>
           <select class="challan-filter" id="filterSelect" onchange="loadChallans()">
             <option value="all">All Records</option>
             <option value="challan">Challans Only</option>
@@ -263,9 +279,8 @@
       }
 
       function openLightbox(src) {
-        const lb = document.getElementById('lightbox');
         document.getElementById('lightboxImg').src = src;
-        lb.classList.add('active');
+        document.getElementById('lightbox').classList.add('active');
       }
 
       function closeLightbox() {
@@ -274,39 +289,93 @@
 
       document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
 
+      // ── Date filter helpers ───────────────────────────────────────
+      function getSinceISO(dateFilter) {
+        if (!dateFilter) return null;
+        const now = new Date();
+        if (dateFilter === 'today') {
+          const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          return start.toISOString();
+        }
+        const days = dateFilter === '7d' ? 7 : dateFilter === '30d' ? 30 : 0;
+        if (days > 0) return new Date(now.getTime() - days * 86400000).toISOString();
+        return null;
+      }
+
+      // ── Populate zone filter from /state ──────────────────────────
+      async function populateZoneFilter() {
+        try {
+          const res = await fetch('/state');
+          const data = await res.json();
+          const zones = Object.keys(data.zones || {}).sort();
+          const sel = document.getElementById('zoneFilter');
+          for (const z of zones) {
+            const opt = document.createElement('option');
+            opt.value = z;
+            opt.textContent = `Zone ${z}`;
+            sel.appendChild(opt);
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // ── Load challans ─────────────────────────────────────────────
       async function loadChallans() {
         const filter = document.getElementById('filterSelect').value;
+        const zoneVal = document.getElementById('zoneFilter').value;
+        const dateVal = document.getElementById('dateFilter').value;
         const challanOnly = filter === 'challan' ? 'true' : 'false';
 
-        try {
-          const res = await fetch(`/challans?limit=200&challan_only=${challanOnly}`);
-          const data = await res.json();
+        const params = new URLSearchParams({ limit: '500', challan_only: challanOnly });
+        if (zoneVal) params.set('zone', zoneVal);
+        const since = getSinceISO(dateVal);
+        if (since) params.set('since', since);
 
+        try {
+          const res = await fetch(`/challans?${params}`);
+          const data = await res.json();
           let records = data.challans || [];
 
-          // Client-side filter for "cleared" option
+          // Client-side filter for "cleared"
           if (filter === 'cleared') {
             records = records.filter(r => !r.challan);
           }
 
-          // Stats
-          const allRes = await fetch('/challans?limit=500');
-          const allData = await allRes.json();
-          const all = allData.challans || [];
-          const totalCount = all.length;
-          const challanCount = all.filter(r => r.challan).length;
-          const clearedCount = totalCount - challanCount;
-
-          document.getElementById('statTotal').textContent = totalCount;
-          document.getElementById('statChallans').textContent = challanCount;
-          document.getElementById('statCleared').textContent = clearedCount;
-
+          updateStats(records);
           renderTable(records);
         } catch (err) {
           console.error('Failed to load challans:', err);
         }
       }
 
+      function updateStats(records) {
+        const totalCount = records.length;
+        const challanCount = records.filter(r => r.challan).length;
+        const clearedCount = totalCount - challanCount;
+        const sessions = new Set(records.map(r => r.capture_session_id).filter(Boolean));
+        // If no capture_session_id, fall back to counting unique first_image values
+        const incidentCount = sessions.size || new Set(records.map(r => r.first_image).filter(Boolean)).size;
+
+        document.getElementById('statIncidents').textContent = incidentCount;
+        document.getElementById('statTotal').textContent = totalCount;
+        document.getElementById('statChallans').textContent = challanCount;
+        document.getElementById('statCleared').textContent = clearedCount;
+      }
+
+      // ── Image HTML helpers ────────────────────────────────────────
+      function thumbHtml(path, alt) {
+        const f = filenameFromPath(path);
+        if (!f) return '<div class="no-thumb">No image</div>';
+        return `<img class="thumb" src="/snapshots/${f}" alt="${alt}" onclick="event.stopPropagation();openLightbox('/snapshots/${f}')" />`;
+      }
+
+      function platesChips(plates) {
+        if (!plates || plates.length === 0) return '';
+        return '<div class="second-plates-detail">' +
+          plates.map(p => `<span class="plate-badge-sm">${p}</span>`).join('') +
+          '</div>';
+      }
+
+      // ── Render grouped table ──────────────────────────────────────
       function renderTable(records) {
         const tbody = document.getElementById('challanBody');
         const emptyEl = document.getElementById('challanEmpty');
@@ -321,41 +390,96 @@
         tableWrap.style.display = 'block';
         emptyEl.style.display = 'none';
 
-        tbody.innerHTML = records.map(r => {
-          const f1 = filenameFromPath(r.first_image);
-          const f2 = filenameFromPath(r.second_image);
+        // Group records by capture_session_id (or first_image as fallback)
+        const groups = [];
+        const groupMap = new Map();
+        for (const r of records) {
+          const key = r.capture_session_id || r.first_image || Math.random().toString();
+          if (!groupMap.has(key)) {
+            const group = { key, records: [] };
+            groupMap.set(key, group);
+            groups.push(group);
+          }
+          groupMap.get(key).records.push(r);
+        }
 
-          const img1 = f1
-            ? `<img class="thumb" src="/snapshots/${f1}" alt="1st" onclick="event.stopPropagation();openLightbox('/snapshots/${f1}')" />`
-            : `<div class="no-thumb">No image</div>`;
+        let html = '';
+        for (const group of groups) {
+          const recs = group.records;
+          const first = recs[0];
+          const isMulti = recs.length > 1;
 
-          const img2 = f2
-            ? `<img class="thumb" src="/snapshots/${f2}" alt="2nd" onclick="event.stopPropagation();openLightbox('/snapshots/${f2}')" />`
-            : `<div class="no-thumb">No image</div>`;
+          // Session separator for multi-plate groups
+          if (isMulti) {
+            html += `<tr class="session-header-row"><td colspan="7">
+              <span class="session-label">─ ${first.slot_name || '—'} (Zone ${first.zone || '?'}) — ${recs.length} plates detected at ${fmtTime(first.first_time)}</span>
+            </td></tr>`;
+          }
 
-          const challanBadge = r.challan
-            ? `<span class="challan-badge yes">🚨 YES</span>`
-            : `<span class="challan-badge no">✅ NO</span>`;
+          for (let i = 0; i < recs.length; i++) {
+            const r = recs[i];
+            const challanBadge = r.challan
+              ? '<span class="challan-badge yes">🚨 YES</span>'
+              : '<span class="challan-badge no">✅ NO</span>';
 
-          return `
-            <tr>
+            // For multi-plate groups, show shared columns only on first row via rowspan
+            const showShared = !isMulti || i === 0;
+            const rowspan = isMulti && i === 0 ? ` rowspan="${recs.length}"` : '';
+
+            const slotCell = showShared
+              ? `<td${rowspan}>${r.slot_name || '—'} <span style="color:var(--muted);font-size:0.7rem;">(Zone ${r.zone || '?'})</span></td>`
+              : '';
+            const firstTimeCell = showShared
+              ? `<td${rowspan}>${fmtTime(r.first_time)}</td>`
+              : '';
+            const firstImgCell = showShared
+              ? `<td${rowspan}>${thumbHtml(r.first_image, '1st')}</td>`
+              : '';
+            const secondTimeCell = showShared
+              ? `<td${rowspan}>${fmtTime(r.second_time)}</td>`
+              : '';
+            const secondImgCell = showShared
+              ? `<td${rowspan}>${thumbHtml(r.second_image, '2nd')}${platesChips(r.second_plates)}</td>`
+              : '';
+
+            html += `<tr>
               <td><span class="plate-badge">${r.plate_text || 'UNKNOWN'}</span></td>
-              <td>${r.slot_name || '—'} <span style="color:var(--muted);font-size:0.7rem;">(Zone ${r.zone || '?'})</span></td>
-              <td>${fmtTime(r.first_time)}</td>
-              <td>${img1}</td>
-              <td>${fmtTime(r.second_time)}</td>
-              <td>${img2}</td>
+              ${slotCell}${firstTimeCell}${firstImgCell}${secondTimeCell}${secondImgCell}
               <td>${challanBadge}</td>
-            </tr>
-          `;
-        }).join('');
+            </tr>`;
+          }
+        }
+
+        tbody.innerHTML = html;
       }
 
-      // Initial load
-      loadChallans();
+      // ── SSE for near-real-time updates ────────────────────────────
+      let challanSSE = null;
+      function startChallanSSE() {
+        challanSSE = new EventSource('/events');
+        document.getElementById('sseIndicator').style.display = 'inline-flex';
 
-      // Auto refresh every 30 seconds
-      setInterval(loadChallans, 30000);
+        challanSSE.onmessage = (msg) => {
+          try {
+            const obj = JSON.parse(msg.data);
+            if (obj.event === 'challan_completed') {
+              loadChallans();
+            }
+          } catch (e) { /* ignore */ }
+        };
+
+        challanSSE.onerror = () => {
+          document.getElementById('sseIndicator').style.display = 'none';
+        };
+      }
+
+      // ── Init ──────────────────────────────────────────────────────
+      populateZoneFilter();
+      loadChallans();
+      startChallanSSE();
+
+      // Fallback polling every 60s (in case SSE drops)
+      setInterval(loadChallans, 60000);
     </script>
   </body>
 </html>

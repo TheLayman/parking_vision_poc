@@ -1446,3 +1446,78 @@ html, body {
     height: 200px;
   }
 }
+
+/* ── Small plate badge (used in alerts + slot tiles) ──────────── */
+.plate-badge-sm {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  background: rgba(99, 102, 241, 0.15);
+  color: var(--accent-bright);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+/* Plate list shown on slot tiles */
+.slot-plates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* Pending recheck indicator on slot tiles */
+.slot-pending-recheck {
+  margin-top: 4px;
+  font-size: 0.65rem;
+  color: var(--accent-bright);
+  animation: pulse-pending 2s ease-in-out infinite;
+}
+
+@keyframes pulse-pending {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Second plates detail row in challan table */
+.second-plates-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* Session group header row */
+.session-header-row td {
+  background: rgba(99, 102, 241, 0.05) !important;
+  border-bottom: 1px solid var(--border-light) !important;
+  padding-top: 16px !important;
+}
+
+.session-label {
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+/* SSE live indicator */
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.7rem;
+  color: var(--free);
+  margin-left: 12px;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--free);
+  animation: pulse-pending 1.5s ease-in-out infinite;
+}

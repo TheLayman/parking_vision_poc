@@ -26,6 +26,14 @@ PLATE_REGEX_PATTERN = os.getenv(
     r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$",
 )
 
+# Common Indian state codes for validation
+_INDIAN_STATE_CODES = {
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "GA",
+    "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH",
+    "ML", "MN", "MP", "MZ", "NL", "OD", "PB", "PY", "RJ", "SK",
+    "TN", "TR", "TS", "UK", "UP", "WB", "BH",  # BH = Bharat series
+}
+
 # ── OpenAI configuration ─────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_LPR_MODEL", "gpt-4o")
@@ -36,16 +44,38 @@ _openai_client = None  # openai.OpenAI
 
 # ── System prompt for GPT-4o vision ──────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    "You are an expert vehicle and license plate detection system. "
-    "You will receive a parking lot camera image.\n\n"
+    "You are an expert Indian vehicle license plate recognition system. "
+    "You will receive a parking lot camera image from India.\n\n"
     "Your tasks:\n"
-    "1. Determine whether any vehicle (car, truck, bus, motorcycle) is visible.\n"
+    "1. Determine whether any vehicle (car, truck, bus, motorcycle, auto-rickshaw) is visible.\n"
     "2. If vehicles are visible, read ALL license plate numbers you can see.\n\n"
+    "Indian license plate format:\n"
+    "- Standard format: SS DD XX NNNN\n"
+    "  - SS = State code (2 letters, e.g. MH, DL, KA, TN, AP, GJ, RJ, UP, WB, HR, TS)\n"
+    "  - DD = District/RTO code (1-2 digits)\n"
+    "  - XX = Series letters (1-3 letters)\n"
+    "  - NNNN = Number (1-4 digits)\n"
+    "- Examples: MH12AB1234, DL04CAF5765, KA01MR7189, TN09CE5765, TS08FA9087\n"
+    "- Bharat (BH) series: BH DD YYYY XXNNNN (e.g. BH02AA1234)\n"
+    "- Plates may have the Indian flag, Ashoka emblem, or state name on top.\n"
+    "- Plates can be white (private), yellow (commercial), green (electric), "
+    "or red (temporary).\n\n"
+    "IMPORTANT — Leading zeros:\n"
+    "- The district/RTO code is ALWAYS 2 digits on the physical plate (e.g. 01, 04, 09). "
+    "Always include leading zeros: KA01, not KA1.\n"
+    "- The trailing number is ALWAYS 4 digits (e.g. 0045, 0500). "
+    "Always include leading zeros: MR0045, not MR45 or MR5.\n"
+    "- Example: the plate 'KA 01 MR 0045' must be returned as KA01MR0045, "
+    "never KA1MR45 or KA1MR5.\n\n"
     "Rules for reading plates:\n"
-    "- Read each plate exactly as printed.\n"
+    "- Read each plate exactly as printed, preserving all leading zeros.\n"
     "- Use UPPERCASE letters and digits only.\n"
-    "- Remove all spaces, dashes, dots, and special characters.\n"
-    "- If a plate is partially obscured but you can still make a good guess, "
+    "- Remove all spaces, dashes, dots, bullet separators, and special characters.\n"
+    "- Indian plates often use a bullet (•) or dash between groups — ignore those.\n"
+    "- Common OCR confusions on Indian plates: 0↔O, 1↔I, 8↔B, 5↔S, 2↔Z. "
+    "Use the known Indian plate structure to resolve ambiguity "
+    "(state code must be letters, district code must be digits, etc.).\n"
+    "- If a plate is partially obscured but you can still make a reasonable guess, "
     "include it.\n"
     "- Do NOT invent or hallucinate plate numbers.\n\n"
     "Respond with ONLY valid JSON (no markdown, no code fences):\n"

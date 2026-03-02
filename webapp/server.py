@@ -5,11 +5,10 @@ import base64
 import logging
 import struct
 import time as _time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List
-import yaml
 import threading
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, Query, Request, HTTPException, Response
@@ -18,6 +17,19 @@ from fastapi.staticfiles import StaticFiles
 
 import os
 import atexit
+
+from webapp.helpers.data_io import (
+    append_jsonl, append_jsonl_batch, load_jsonl_records,
+    load_yaml, save_yaml, rotate_log_if_needed,
+)
+from webapp.helpers.slot_meta import (
+    load_slot_meta_by_id, load_slot_ids, get_slot_id_by_device_name,
+    calculate_zone_stats, build_state_from_log,
+)
+from webapp.helpers.analytics import (
+    parse_events_from_log, build_occupancy_series,
+    calculate_dwell_times, predict_occupancy,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -84,30 +96,23 @@ _state_cache_time = None
 STATE_CACHE_TTL = timedelta(seconds=30)
 
 # In-memory snapshot state (loaded once at startup, flushed periodically)
-_slots_snapshot: Dict[str, dict] = {}
+_slots_snapshot: dict[str, dict] = {}
 _slots_snapshot_dirty = False
 
 # In-memory alerts ring buffer (avoids full log scan on /alerts)
-_alerts_buffer: List[dict] = []  # state-change alerts
-_camera_captures: Dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
+_alerts_buffer: list[dict] = []  # state-change alerts
+_camera_captures: dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
 _ALERTS_MAX = 500
 
 # ── Challan (parking violation) tracking ──────────────────────────────────────
 # Challan re-check interval in seconds (70s × 2 checks ≈ detect >2 min stays)
 CHALLAN_RECHECK_INTERVAL = int(os.getenv("CHALLAN_RECHECK_INTERVAL", "70"))
 CHALLAN_LOG_PATH = REPO_ROOT / "data" / "challan_events.jsonl"
-_challan_records: List[dict] = []  # in-memory challan buffer
+_challan_records: list[dict] = []  # in-memory challan buffer
 _challan_lock = threading.Lock()
-_challan_pending: Dict[str, dict] = {}  # plate_text -> pending recheck info
+_challan_pending: dict[str, dict] = {}  # plate_text -> pending recheck info
 _CHALLAN_MAX = 1000
 
-# Reverse device-name lookup: device_name(upper) -> slot_id
-_device_name_to_slot: Dict[str, int] = {}
-
-# Metadata caching with file change detection
-_meta_cache = None
-_meta_cache_mtime = None
-_device_name_map_mtime = None  # tracks when reverse map was last rebuilt
 _max_streams = 50
 _active_streams = 0
 _streams_lock = threading.Lock()
@@ -119,65 +124,39 @@ _camera_worker_thread = None
 
 def load_snapshot_data() -> dict:
     """Load snapshot data from YAML file (cold-start only)."""
-    if not SNAPSHOT_PATH.exists():
-        return {"slots": {}}
     try:
-        with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        data = load_yaml(SNAPSHOT_PATH)
         return data if data else {"slots": {}}
-    except (IOError, OSError, yaml.YAMLError) as e:
+    except Exception as e:
         log.error("Error reading snapshot file: %s", e)
         return {"slots": {}}
 
 def save_snapshot_data(data: dict):
     """Save snapshot data to YAML file."""
-    SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    save_yaml(SNAPSHOT_PATH, data)
+
+
+def _extract_plates(image_path: str) -> dict:
+    """Extract license plate strings from an image via GPT-4o vision.
+
+    Returns ``{"plates": [...], "vehicle_detected": bool}``.
+    """
+    if not _license_plate_available:
+        log.debug("License plate extraction not available")
+        return {"plates": [], "vehicle_detected": True}
     try:
-        with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False)
-    except (IOError, OSError, yaml.YAMLError) as e:
-        log.error("Error writing snapshot file: %s", e)
-
-
-
-def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Dict[int, dict]) -> tuple:
-    """Calculate zone statistics and counts. Returns (zones_stats, free_count, total_count)."""
-    zones_stats = {}
-    free_count = 0
-    total_count = len(slot_ids)
-
-    for sid in slot_ids:
-        is_occupied = sid in occupied_ids
-        meta = meta_by_id.get(sid, {})
-        zone = meta.get("zone", "A")
-
-        if zone not in zones_stats:
-            zones_stats[zone] = {"total": 0, "free": 0, "occupied": 0}
-
-        zones_stats[zone]["total"] += 1
-        if is_occupied:
-            zones_stats[zone]["occupied"] += 1
-        else:
-            zones_stats[zone]["free"] += 1
-            free_count += 1
-
-    return zones_stats, free_count, total_count
-
-
-
-def rotate_log_if_needed(max_size_mb=50):
-    """Rotate event log if it exceeds max size to prevent disk exhaustion."""
-    if not EVENT_LOG_PATH.exists():
-        return
-    try:
-        file_size_mb = EVENT_LOG_PATH.stat().st_size / (1024 * 1024)
-        if file_size_mb > max_size_mb:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_path = EVENT_LOG_PATH.with_stem(f"{EVENT_LOG_PATH.stem}_{timestamp}")
-            EVENT_LOG_PATH.rename(backup_path)
-            log.info("Rotated event log to %s (size: %.1f MB)", backup_path.name, file_size_mb)
+        log.info("Extracting license plates from %s...", image_path)
+        result = extract_all_license_plates(image_path)
+        plates = [
+            p.get("plate_text", "")
+            for p in result.get("plates", [])
+            if p.get("plate_text") and p["plate_text"] != "UNKNOWN"
+        ]
+        return {"plates": plates, "vehicle_detected": result.get("vehicle_detected", True)}
     except Exception as e:
-        log.error("Error rotating event log: %s", e)
+        log.error("Error extracting license plates: %s", e)
+        return {"plates": [], "vehicle_detected": True}
+
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
@@ -193,11 +172,11 @@ CHIRPSTACK_APP_ID = os.getenv("CHIRPSTACK_APP_ID", "")  # Application UUID to fe
 
 # MQTT client reference
 _mqtt_client = None
-_mqtt_previous_states: Dict[int, str] = {}
+_mqtt_previous_states: dict[int, str] = {}
 _mqtt_last_snapshot_time = None
 
 # Device mapping for command queuing: slot_id -> {"applicationId": str, "devEui": str}
-_device_map: Dict[int, dict] = {}
+_device_map: dict[int, dict] = {}
 
 
 def _save_device_map():
@@ -240,7 +219,7 @@ def _fetch_devices_from_chirpstack():
         client = cs_api.DeviceServiceStub(channel)
         auth_token = [("authorization", f"Bearer {CHIRPSTACK_API_TOKEN}")]
 
-        meta_by_id = load_slot_meta_by_id()
+        meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
         matched = 0
         offset = 0
         limit = 100
@@ -260,7 +239,7 @@ def _fetch_devices_from_chirpstack():
                 dev_eui = device.dev_eui
 
                 # Match ChirpStack device name to a slot
-                slot_id = _get_slot_id_by_device_name(dev_name, meta_by_id)
+                slot_id = get_slot_id_by_device_name(dev_name, meta_by_id)
                 if slot_id is not None:
                     _device_map[slot_id] = {
                         "applicationId": CHIRPSTACK_APP_ID,
@@ -319,27 +298,13 @@ def _enqueue_via_chirpstack_grpc(dev_eui: str, data_hex: str, fport: int = 2) ->
         return False
 
 
-def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str, timestamp_str: str):
+def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str,
+                        timestamp_str: str, mqtt_event_ts: str | None = None):
     """Log camera capture result to event log with license plate extraction and challan tracking."""
-    license_plates = []
-    vehicle_detected = True  # default True when extractor is unavailable
-
-    if _license_plate_available:
-        try:
-            log.info("Extracting license plates from %s...", image_path)
-            extraction_result = extract_all_license_plates(image_path)
-            vehicle_detected = extraction_result.get("vehicle_detected", True)
-            plates_list = extraction_result.get("plates", [])
-            for p in plates_list:
-                pt = p.get("plate_text", "UNKNOWN")
-                if pt and pt != "UNKNOWN":
-                    license_plates.append(pt)
-        except Exception as e:
-            log.error("Error extracting license plates: %s", e)
-    else:
-        log.debug("License plate extraction not available")
-
-    # Use best plate for backward-compatible single-plate field
+    capture_session_id = str(uuid.uuid4())
+    extraction = _extract_plates(image_path)
+    license_plates = extraction["plates"]
+    vehicle_detected = extraction["vehicle_detected"]
     license_plate = license_plates[0] if license_plates else "UNKNOWN"
 
     event = {
@@ -351,14 +316,13 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         "image_path": image_path,
         "license_plate": license_plate,
         "license_plates": license_plates,
-        "vehicle_detected": vehicle_detected
+        "vehicle_detected": vehicle_detected,
+        "capture_session_id": capture_session_id,
     }
+    if mqtt_event_ts:
+        event["mqtt_event_ts"] = mqtt_event_ts
     try:
-        with _event_log_lock:
-            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event) + "\n")
-                f.flush()
-        # Update in-memory capture lookup
+        append_jsonl(EVENT_LOG_PATH, event, lock=_event_log_lock)
         _camera_captures[(slot_id, timestamp_str)] = {
             "image_path": image_path,
             "license_plate": license_plate,
@@ -368,30 +332,32 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
     except Exception as e:
         log.error("Error logging camera capture: %s", e)
 
-    # ── Challan tracking: schedule re-check for each detected plate ──────
+    # ── Challan tracking: schedule ONE batch re-check for all detected plates ──
     if license_plates and ENABLE_CAMERA_CONTROL and _camera_queue is not None:
-        meta_by_id = load_slot_meta_by_id()
+        meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
         meta = meta_by_id.get(slot_id, {})
         preset = meta.get("preset")
         if preset:
-            for plate in license_plates:
-                _schedule_challan_recheck(
-                    plate_text=plate,
-                    slot_id=slot_id,
-                    slot_name=slot_name,
-                    zone=zone,
-                    preset=preset,
-                    first_image=image_path,
-                    first_time=timestamp_str,
-                )
+            _schedule_slot_recheck(
+                plates=license_plates,
+                slot_id=slot_id,
+                slot_name=slot_name,
+                zone=zone,
+                preset=preset,
+                first_image=image_path,
+                first_time=timestamp_str,
+                capture_session_id=capture_session_id,
+                mqtt_event_ts=mqtt_event_ts,
+            )
 
 
-def _make_challan_recheck_callback(pending_key: str):
-    """Create callback for challan recheck capture completion.
+def _make_batch_recheck_callback(pending_key: str):
+    """Create callback for batch challan recheck capture completion.
 
-    The camera worker handles the move/settle/capture cycle.  This callback
-    performs the plate comparison and challan recording after the image has
-    been captured successfully.
+    One camera task covers ALL plates detected in the original capture.
+    This callback extracts plates from the single recheck image and
+    compares against every plate in the batch, emitting one challan
+    record per plate.
     """
     def callback(success, image_path, error_msg):
         with _challan_lock:
@@ -404,7 +370,7 @@ def _make_challan_recheck_callback(pending_key: str):
             log.error("Challan recheck capture failed for %s: %s", pending_key, error_msg)
             return
 
-        plate_text = pending["plate_text"]
+        first_plates = pending["plates"]
         slot_id = pending["slot_id"]
         slot_name = pending["slot_name"]
         zone = pending["zone"]
@@ -412,27 +378,21 @@ def _make_challan_recheck_callback(pending_key: str):
         first_image = pending["first_image"]
         first_time = pending["first_time"]
         recheck_count = pending.get("recheck_count", 0)
+        capture_session_id = pending.get("capture_session_id")
+        mqtt_event_ts = pending.get("mqtt_event_ts")
 
-        log.info("Challan recheck #%d complete for plate %s at slot %s",
-                 recheck_count + 1, plate_text, slot_name)
+        log.info("Batch challan recheck #%d complete for %d plate(s) at slot %s",
+                 recheck_count + 1, len(first_plates), slot_name)
 
         ts_str = datetime.now(timezone.utc).isoformat()
         second_image = image_path
 
-        # Extract plates from new capture
-        new_plates = []
-        if _license_plate_available:
-            try:
-                result = extract_all_license_plates(second_image)
-                for p in result.get("plates", []):
-                    pt = p.get("plate_text", "UNKNOWN")
-                    if pt and pt != "UNKNOWN":
-                        new_plates.append(pt)
-            except Exception as e:
-                log.error("Error extracting plates in challan recheck: %s", e)
+        # Extract plates from second capture (ONE GPT-4o call for all plates)
+        new_plates = _extract_plates(second_image)["plates"]
 
-        if plate_text in new_plates:
-            # Same plate still present → CHALLAN
+        # Compare each original plate against the second image
+        for plate_text in first_plates:
+            is_match = plate_text in new_plates
             _record_challan(
                 plate_text=plate_text,
                 slot_id=slot_id,
@@ -442,65 +402,64 @@ def _make_challan_recheck_callback(pending_key: str):
                 first_time=first_time,
                 second_image=second_image,
                 second_time=ts_str,
-                challan=True,
-            )
-        else:
-            # Different plates or plates not found
-            if new_plates and recheck_count < 1:
-                for np_text in new_plates:
-                    _schedule_challan_recheck(
-                        plate_text=np_text,
-                        slot_id=slot_id,
-                        slot_name=slot_name,
-                        zone=zone,
-                        preset=preset,
-                        first_image=second_image,
-                        first_time=ts_str,
-                    )
-                    new_key = f"{np_text}_{slot_id}"
-                    with _challan_lock:
-                        if new_key in _challan_pending:
-                            _challan_pending[new_key]["recheck_count"] = recheck_count + 1
-
-            # Record the check (no challan)
-            _record_challan(
-                plate_text=plate_text,
-                slot_id=slot_id,
-                slot_name=slot_name,
-                zone=zone,
-                first_image=first_image,
-                first_time=first_time,
-                second_image=second_image,
-                second_time=ts_str,
-                challan=False,
+                challan=is_match,
+                first_plates=first_plates,
                 second_plates=new_plates,
+                capture_session_id=capture_session_id,
+                mqtt_event_ts=mqtt_event_ts,
+            )
+
+        # Schedule batch recheck for NEW plates not in original list (max 1 re-recheck)
+        unseen_plates = [p for p in new_plates if p not in first_plates]
+        if unseen_plates and recheck_count < 1:
+            new_session_id = str(uuid.uuid4())
+            _schedule_slot_recheck(
+                plates=unseen_plates,
+                slot_id=slot_id,
+                slot_name=slot_name,
+                zone=zone,
+                preset=preset,
+                first_image=second_image,
+                first_time=ts_str,
+                capture_session_id=new_session_id,
+                mqtt_event_ts=mqtt_event_ts,
+                recheck_count=recheck_count + 1,
             )
 
     return callback
 
 
-def _schedule_challan_recheck(plate_text: str, slot_id: int, slot_name: str,
-                               zone: str, preset: int, first_image: str,
-                               first_time: str):
-    """Schedule a re-check by pushing a delayed task onto the camera queue.
+def _schedule_slot_recheck(plates: list, slot_id: int, slot_name: str,
+                           zone: str, preset: int, first_image: str,
+                           first_time: str, capture_session_id: str | None = None,
+                           mqtt_event_ts: str | None = None,
+                           recheck_count: int = 0):
+    """Schedule a SINGLE re-check for ALL detected plates at a slot.
 
-    Instead of using a threading.Timer (which bypasses the camera queue and
-    causes race conditions), this enqueues a ``challan_recheck`` task with a
-    ``scheduled_at`` field set to *now + CHALLAN_RECHECK_INTERVAL*.  The camera
-    worker will hold the task until it's due, then move/capture through the
-    single-threaded worker — eliminating concurrent camera access.
+    Instead of enqueueing N tasks (one per plate), this enqueues ONE
+    ``challan_recheck`` task carrying the full plates list.  The camera
+    worker performs one move/settle/capture cycle and the batch callback
+    compares all plates against the single second image.
+
+    The pending key uses ``{slot_id}_{capture_session_id}`` to avoid
+    collisions when the same plate re-occupies the same slot.
     """
-    key = f"{plate_text}_{slot_id}"
+    if not capture_session_id:
+        capture_session_id = str(uuid.uuid4())
+
+    key = f"{slot_id}_{capture_session_id}"
     with _challan_lock:
         _challan_pending[key] = {
-            "plate_text": plate_text,
+            "plates": list(plates),
             "slot_id": slot_id,
             "slot_name": slot_name,
             "zone": zone,
             "preset": preset,
             "first_image": first_image,
             "first_time": first_time,
-            "recheck_count": 0,
+            "recheck_count": recheck_count,
+            "capture_session_id": capture_session_id,
+            "mqtt_event_ts": mqtt_event_ts,
         }
 
     if _camera_queue is None:
@@ -516,21 +475,29 @@ def _schedule_challan_recheck(plate_text: str, slot_id: int, slot_name: str,
         "preset": preset,
         "scheduled_at": scheduled_at,
         "pending_key": key,
-        "plate_text": plate_text,
+        "plates": list(plates),
         "first_image": first_image,
         "first_time": first_time,
-        "recheck_count": 0,
-        "callback": _make_challan_recheck_callback(key),
+        "recheck_count": recheck_count,
+        "capture_session_id": capture_session_id,
+        "callback": _make_batch_recheck_callback(key),
     })
-    log.info("Challan recheck scheduled for plate %s at slot %s in %ds (via camera queue)",
-             plate_text, slot_name, CHALLAN_RECHECK_INTERVAL)
+    log.info("Batch challan recheck scheduled for %d plate(s) at slot %s in %ds (via camera queue)",
+             len(plates), slot_name, CHALLAN_RECHECK_INTERVAL)
 
 
 def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
                      first_image: str, first_time: str,
                      second_image: str, second_time: str,
-                     challan: bool, second_plates: list = None):
-    """Write a challan record to disk and keep in memory."""
+                     challan: bool, second_plates: list = None,
+                     first_plates: list = None,
+                     capture_session_id: str = None,
+                     mqtt_event_ts: str = None):
+    """Write a challan record to disk and keep in memory.
+
+    Also broadcasts a ``challan_completed`` event to the SSE log so
+    the challan dashboard can update in near-real-time.
+    """
     record = {
         "plate_text": plate_text,
         "slot_id": slot_id,
@@ -542,8 +509,11 @@ def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
         "second_time": second_time,
         "challan": challan,
     }
-    if second_plates is not None:
-        record["second_plates"] = second_plates
+    # Attach optional audit fields when present
+    for key, val in [("first_plates", first_plates), ("second_plates", second_plates),
+                     ("capture_session_id", capture_session_id), ("mqtt_event_ts", mqtt_event_ts)]:
+        if val is not None:
+            record[key] = val
 
     with _challan_lock:
         _challan_records.append(record)
@@ -552,21 +522,37 @@ def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
 
     # Persist to file
     try:
-        CHALLAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CHALLAN_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-            f.flush()
+        append_jsonl(CHALLAN_LOG_PATH, record)
         status = "CHALLAN" if challan else "cleared"
         log.info("Challan record: plate=%s slot=%s %s", plate_text, slot_name, status)
     except Exception as e:
         log.error("Error writing challan record: %s", e)
 
+    # Broadcast challan_completed event via SSE
+    sse_event = {
+        "event": "challan_completed",
+        "ts": second_time,
+        "plate_text": plate_text,
+        "slot_id": slot_id,
+        "slot_name": slot_name,
+        "zone": zone,
+        "challan": challan,
+    }
+    if capture_session_id:
+        sse_event["capture_session_id"] = capture_session_id
+    try:
+        append_jsonl(EVENT_LOG_PATH, sse_event, lock=_event_log_lock)
+    except Exception as e:
+        log.error("Error broadcasting challan_completed event: %s", e)
 
-def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str, timestamp_str: str):
+
+def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str,
+                                  timestamp_str: str, mqtt_event_ts: str | None = None):
     """Create callback for camera capture completion."""
     def callback(success, image_path, error_msg):
         if success and image_path:
-            _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str)
+            _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str,
+                                mqtt_event_ts=mqtt_event_ts)
     return callback
 
 def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_id: dict, timestamp_str: str) -> list:
@@ -594,6 +580,8 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                         timestamp_obj = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
                         slot_name = meta.get("name", str(sid))
                         zone = meta.get("zone", "A")
+                        # Pass the MQTT event timestamp so LoRa delay can be measured
+                        mqtt_event_ts = timestamp_str
 
                         _camera_queue.add_task({
                             "slot_id": sid,
@@ -602,7 +590,9 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                             "preset": preset,
                             "timestamp": timestamp_obj,
                             "event_id": f"{sid}_{timestamp_str}",
-                            "callback": _make_camera_capture_callback(sid, slot_name, zone, timestamp_str)
+                            "callback": _make_camera_capture_callback(
+                                sid, slot_name, zone, timestamp_str,
+                                mqtt_event_ts=mqtt_event_ts)
                         })
                     except Exception as e:
                         log.error("Error enqueueing camera task for slot %s: %s", sid, e)
@@ -634,40 +624,12 @@ def decode_uplink(payload_base64: str) -> dict:
     return {"status": status, "timestamp": timestamp}
 
 
-def _get_slot_id_by_device_name(device_name: str, meta_by_id: Dict[int, dict]) -> int | None:
-    """Map MQTT device name to slot ID via cached reverse lookup (O(1))."""
-    _rebuild_device_name_map_if_needed(meta_by_id)
-    return _device_name_to_slot.get(device_name.upper())
-
-
-def _rebuild_device_name_map_if_needed(meta_by_id: Dict[int, dict]):
-    """Rebuild the reverse device-name → slot_id map when metadata changes."""
-    global _device_name_to_slot, _device_name_map_mtime
-    if _device_name_map_mtime == _meta_cache_mtime and _device_name_to_slot:
-        return
-    lookup: Dict[str, int] = {}
-    for slot_id, meta in meta_by_id.items():
-        dn = meta.get("device_name")
-        if dn:
-            lookup[dn.upper()] = slot_id
-        name = meta.get("name", "")
-        if name:
-            lookup.setdefault(name.upper(), slot_id)
-    _device_name_to_slot = lookup
-    _device_name_map_mtime = _meta_cache_mtime
-
-
 def _log_events_to_file(events: list):
     """Write events to event log file."""
     if not events:
         return
-
-    rotate_log_if_needed(max_size_mb=50)
-    with _event_log_lock:
-        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
-            for evt in events:
-                f.write(json.dumps(evt) + "\n")
-            f.flush()
+    rotate_log_if_needed(EVENT_LOG_PATH, max_size_mb=50)
+    append_jsonl_batch(EVENT_LOG_PATH, events, lock=_event_log_lock)
 
 
 def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
@@ -723,7 +685,7 @@ def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
         return False
 
 
-def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, meta_by_id: Dict[int, dict]):
+def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, meta_by_id: dict[int, dict]):
     """Process sensor data from MQTT and update occupancy state."""
     global _mqtt_previous_states, _mqtt_last_snapshot_time, _state_cache, _slots_snapshot_dirty
 
@@ -775,7 +737,7 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, met
     has_state_changes = bool(events_to_log)
     _mqtt_previous_states = current_states.copy()
 
-    zones_stats, free_count, total_count = _calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
+    zones_stats, free_count, total_count = calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
 
     # Log snapshot periodically or on state changes
     if _mqtt_last_snapshot_time is None:
@@ -828,8 +790,8 @@ def on_mqtt_message(client, userdata, msg):
         log.info("MQTT Device: %s | status: %s | ts: %s", device_name, status, timestamp_str)
         
         # Single meta load for the entire message processing
-        meta_by_id = load_slot_meta_by_id()
-        slot_id = _get_slot_id_by_device_name(device_name, meta_by_id)
+        meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+        slot_id = get_slot_id_by_device_name(device_name, meta_by_id)
         
         if slot_id is None:
             log.warning("Device '%s' not mapped to any slot", device_name)
@@ -989,9 +951,15 @@ def _recover_pending_tasks():
         if task_type == "challan_recheck":
             pending_key = task.get("pending_key")
             if pending_key:
+                # Support both old single-plate and new batch format
+                plates = task.get("plates")
+                if not plates:
+                    # Legacy recovery: single plate_text → wrap in list
+                    pt = task.get("plate_text", "")
+                    plates = [pt] if pt else []
                 with _challan_lock:
                     _challan_pending[pending_key] = {
-                        "plate_text": task.get("plate_text", ""),
+                        "plates": plates,
                         "slot_id": task.get("slot_id"),
                         "slot_name": task.get("slot_name", ""),
                         "zone": task.get("zone", ""),
@@ -999,8 +967,10 @@ def _recover_pending_tasks():
                         "first_image": task.get("first_image", ""),
                         "first_time": task.get("first_time", ""),
                         "recheck_count": task.get("recheck_count", 0),
+                        "capture_session_id": task.get("capture_session_id"),
+                        "mqtt_event_ts": task.get("mqtt_event_ts"),
                     }
-                task["callback"] = _make_challan_recheck_callback(pending_key)
+                task["callback"] = _make_batch_recheck_callback(pending_key)
             challan_count += 1
         elif task_type == "camera_capture":
             slot_id = task.get("slot_id")
@@ -1021,35 +991,23 @@ def _recover_pending_tasks():
 
 def _init_alerts_from_log():
     """Populate in-memory alerts buffer and camera captures from the log on startup."""
-    if not EVENT_LOG_PATH.exists():
-        return
-    try:
-        with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    event_type = obj.get("event")
-                    if event_type == "slot_state_changed":
-                        _alerts_buffer.append(obj)
-                    elif event_type == "camera_capture":
-                        key = (obj.get("slot_id"), obj.get("ts"))
-                        _camera_captures[key] = {
-                            "image_path": obj.get("image_path"),
-                            "license_plate": obj.get("license_plate", "UNKNOWN"),
-                            "license_plates": obj.get("license_plates", []),
-                            "vehicle_detected": obj.get("vehicle_detected", True),
-                        }
-                except Exception:
-                    continue
-        # Keep only the last N alerts
-        while len(_alerts_buffer) > _ALERTS_MAX:
-            _alerts_buffer.pop(0)
-        log.info("Loaded %d alerts and %d camera captures from log", len(_alerts_buffer), len(_camera_captures))
-    except Exception as e:
-        log.error("Error loading alerts from log: %s", e)
+    records = load_jsonl_records(EVENT_LOG_PATH, _ALERTS_MAX * 10)  # load enough to find alerts
+    for obj in records:
+        event_type = obj.get("event")
+        if event_type == "slot_state_changed":
+            _alerts_buffer.append(obj)
+        elif event_type == "camera_capture":
+            key = (obj.get("slot_id"), obj.get("ts"))
+            _camera_captures[key] = {
+                "image_path": obj.get("image_path"),
+                "license_plate": obj.get("license_plate", "UNKNOWN"),
+                "license_plates": obj.get("license_plates", []),
+                "vehicle_detected": obj.get("vehicle_detected", True),
+            }
+    # Keep only the last N alerts
+    while len(_alerts_buffer) > _ALERTS_MAX:
+        _alerts_buffer.pop(0)
+    log.info("Loaded %d alerts and %d camera captures from log", len(_alerts_buffer), len(_camera_captures))
 
     # Load challan records
     _init_challan_from_log()
@@ -1057,129 +1015,10 @@ def _init_alerts_from_log():
 
 def _init_challan_from_log():
     """Populate in-memory challan records from log file on startup."""
-    if not CHALLAN_LOG_PATH.exists():
-        return
-    try:
-        with open(CHALLAN_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    _challan_records.append(record)
-                except Exception:
-                    continue
-        while len(_challan_records) > _CHALLAN_MAX:
-            _challan_records.pop(0)
-        log.info("Loaded %d challan records from log", len(_challan_records))
-    except Exception as e:
-        log.error("Error loading challan records: %s", e)
-
-def _load_yaml(path: Path):
-    if not path.exists():
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-def load_slot_ids() -> List[int]:
-    meta = load_slot_meta_by_id()
-    return sorted(meta.keys())
-
-
-def load_slot_meta_by_id() -> Dict[int, dict]:
-    global _meta_cache, _meta_cache_mtime
-
-    if not SLOT_META_PATH.exists():
-        return {}
-
-    # Check if cache is still valid based on file modification time
-    try:
-        current_mtime = SLOT_META_PATH.stat().st_mtime
-        if _meta_cache is not None and _meta_cache_mtime == current_mtime:
-            return _meta_cache
-    except Exception:
-        pass  # If stat fails, proceed to reload
-
-    # Load and parse metadata
-    data = _load_yaml(SLOT_META_PATH)
-    if not data:
-        return {}
-
-    meta: Dict[int, dict] = {}
-
-    if isinstance(data, dict):
-        for k, v in data.items():
-            try:
-                slot_id = int(k)
-            except Exception:
-                continue
-            if isinstance(v, dict):
-                meta[slot_id] = v
-    elif isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            try:
-                slot_id = int(item["id"])
-            except Exception:
-                continue
-            meta[slot_id] = item
-
-    # Update cache
-    _meta_cache = meta
-    _meta_cache_mtime = current_mtime
-
-    return meta
-
-
-def build_state_from_log(slot_ids: List[int], meta_by_id: Dict[int, dict], max_events: int = 200) -> dict:
-    state_by_id: Dict[int, str] = {slot_id: "FREE" for slot_id in slot_ids}
-    since_by_id: Dict[int, str] = {slot_id: "" for slot_id in slot_ids}
-    last_events: List[dict] = []
-
-    if EVENT_LOG_PATH.exists():
-        with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                if not (line := line.strip()):
-                    continue
-                try:
-                    obj = json.loads(line)
-                    event_type = obj.get("event")
-                    ts = obj.get("ts", "")
-
-                    if event_type == "snapshot":
-                        occupied_ids = set(obj.get("occupied_ids") or [])
-                        for slot_id in slot_ids:
-                            new_state = "OCCUPIED" if slot_id in occupied_ids else "FREE"
-                            if state_by_id[slot_id] != new_state:
-                                since_by_id[slot_id] = ts
-                            state_by_id[slot_id] = new_state
-                    elif event_type == "slot_state_changed":
-                        slot_id = int(obj.get("slot_id"))
-                        if slot_id in state_by_id and obj.get("new_state") in ("FREE", "OCCUPIED"):
-                            state_by_id[slot_id] = obj["new_state"]
-                            since_by_id[slot_id] = ts
-                        last_events.append(obj)
-                except Exception:
-                    continue
-
-    slots = [
-        {"id": sid, "name": meta_by_id.get(sid, {}).get("name") or str(sid), "zone": meta_by_id.get(sid, {}).get("zone") or "A"}
-        for sid in slot_ids
-    ]
-    occupied_ids = {sid for sid, st in state_by_id.items() if st == "OCCUPIED"}
-    zones, free_count, total_count = _calculate_zone_stats(slot_ids, occupied_ids, meta_by_id)
-
-    return {
-        "slots": slots,
-        "state_by_id": state_by_id,
-        "since_by_id": since_by_id,
-        "zones": zones,
-        "free_count": free_count,
-        "total_count": total_count,
-        "recent_events": last_events[-max_events:],
-    }
+    loaded = load_jsonl_records(CHALLAN_LOG_PATH, _CHALLAN_MAX)
+    _challan_records.extend(loaded)
+    if loaded:
+        log.info("Loaded %d challan records from log", len(loaded))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1203,9 +1042,9 @@ def state():
         return _state_cache
 
     # Build fresh state
-    slot_ids = load_slot_ids()
-    meta_by_id = load_slot_meta_by_id()
-    result = build_state_from_log(slot_ids=slot_ids, meta_by_id=meta_by_id)
+    slot_ids = load_slot_ids(SLOT_META_PATH)
+    meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+    result = build_state_from_log(EVENT_LOG_PATH, slot_ids=slot_ids, meta_by_id=meta_by_id)
 
     # Update cache
     _state_cache = result
@@ -1297,109 +1136,6 @@ async def events(request: Request):
         with _streams_lock:
             _active_streams -= 1
 
-def _parse_events_from_log(cutoff: datetime | None) -> tuple[list, list]:
-    """Parse snapshots and state changes from event log with optional time filter."""
-    snapshots, state_changes = [], []
-
-    if not EVENT_LOG_PATH.exists():
-        return snapshots, state_changes
-
-    with open(EVENT_LOG_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                ts_str = obj.get("ts")
-                if not ts_str:
-                    continue
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-
-                if cutoff and ts < cutoff:
-                    continue
-
-                event_type = obj.get("event")
-                if event_type == "snapshot":
-                    snapshots.append({
-                        "ts": ts,
-                        "zone_stats": obj.get("zones", obj.get("zone_stats", {})),
-                        "occupied_ids": obj.get("occupied_ids", []),
-                        "free_count": obj.get("free_count", 0),
-                        "total_count": obj.get("total_count", 0)
-                    })
-                elif event_type == "slot_state_changed":
-                    state_changes.append({
-                        "ts": ts,
-                        "slot_id": obj.get("slot_id"),
-                        "slot_name": obj.get("slot_name"),
-                        "zone": obj.get("zone", "A"),
-                        "prev_state": obj.get("prev_state"),
-                        "new_state": obj.get("new_state")
-                    })
-            except Exception:
-                continue
-
-    return snapshots, state_changes
-
-def _build_occupancy_series(snapshots: list) -> list:
-    """Convert snapshots to time series of zone occupancy percentages."""
-    occupancy_series = []
-    for snap in snapshots:
-        zone_data = {}
-        for zone, stats in snap.get("zone_stats", {}).items():
-            total = stats.get("total", 0)
-            occupied = stats.get("occupied", 0)
-            pct = (occupied / total * 100) if total > 0 else 0
-            zone_data[zone] = round(pct, 1)
-
-        occupancy_series.append({"time": snap["ts"].isoformat(), "zones": zone_data})
-
-    return occupancy_series
-
-def _calculate_dwell_times(state_changes: list) -> dict:
-    """Calculate average dwell time per zone from state changes."""
-    slot_occupied_at: Dict[int, datetime] = {}
-    dwell_times_by_zone: Dict[str, List[float]] = {}
-
-    for change in sorted(state_changes, key=lambda x: x["ts"]):
-        slot_id = change["slot_id"]
-        zone = change["zone"]
-
-        if change["new_state"] == "OCCUPIED":
-            slot_occupied_at[slot_id] = change["ts"]
-        elif change["new_state"] == "FREE" and slot_id in slot_occupied_at:
-            occupied_ts = slot_occupied_at.pop(slot_id)
-            dwell_minutes = (change["ts"] - occupied_ts).total_seconds() / 60
-            if 0 < dwell_minutes < 1440:  # Cap at 24 hours
-                dwell_times_by_zone.setdefault(zone, []).append(dwell_minutes)
-
-    return {zone: round(sum(times) / len(times), 1) for zone, times in dwell_times_by_zone.items() if times}
-
-def _predict_occupancy(occupancy_series: list) -> dict:
-    """Simple moving average prediction with trend adjustment."""
-    if len(occupancy_series) < 2:
-        return {}
-
-    all_zones = set()
-    for entry in occupancy_series:
-        all_zones.update(entry["zones"].keys())
-
-    predictions = {}
-    for zone in all_zones:
-        recent_values = [entry["zones"][zone] for entry in occupancy_series[-5:] if zone in entry["zones"]]
-
-        if recent_values:
-            avg = sum(recent_values) / len(recent_values)
-            if len(recent_values) >= 2:
-                trend = recent_values[-1] - recent_values[-2]
-                predicted = avg + (trend * 0.5)
-            else:
-                predicted = avg
-            predictions[zone] = round(max(0, min(100, predicted)), 1)
-
-    return predictions
-
 @app.get("/analytics/summary")
 def analytics_summary(range: str = Query(default="24h")):
     """Returns analytics data: occupancy series, dwell stats, predictions, summary."""
@@ -1407,10 +1143,10 @@ def analytics_summary(range: str = Query(default="24h")):
     delta = time_deltas.get(range)
     cutoff = (datetime.now(timezone.utc) - delta) if delta else None
 
-    snapshots, state_changes = _parse_events_from_log(cutoff)
-    occupancy_series = _build_occupancy_series(snapshots)
-    dwell_stats = _calculate_dwell_times(state_changes)
-    predictions = _predict_occupancy(occupancy_series)
+    snapshots, state_changes = parse_events_from_log(EVENT_LOG_PATH, cutoff)
+    occupancy_series = build_occupancy_series(snapshots)
+    dwell_stats = calculate_dwell_times(state_changes)
+    predictions = predict_occupancy(occupancy_series)
 
     current_occupancy = {}
     if snapshots:
@@ -1462,8 +1198,10 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
                 continue  # skip false positives
             entry["image_path"] = capture["image_path"]
             entry["license_plate"] = capture["license_plate"]
+            entry["license_plates"] = capture.get("license_plates", [])
         else:
             entry["license_plate"] = "UNKNOWN"
+            entry["license_plates"] = []
         merged.append(entry)
 
     merged.sort(key=lambda x: x.get("ts", ""), reverse=True)
@@ -1475,11 +1213,15 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
 
 @app.get("/challans")
 def get_challans(limit: int = Query(default=100, le=500), offset: int = Query(default=0),
-                 challan_only: bool = Query(default=False)):
+                 challan_only: bool = Query(default=False),
+                 zone: str = Query(default=None),
+                 since: str = Query(default=None)):
     """
     Returns challan (violation) records.
-    Each record has: plate_text, first_image, first_time, second_image, second_time, challan.
+    Each record has: plate_text, first_image, first_time, second_image, second_time, challan,
+    first_plates, second_plates, capture_session_id, mqtt_event_ts.
     Use challan_only=true to filter for confirmed violations only.
+    Use zone=X to filter by zone. Use since=ISO8601 to filter by date.
     """
     with _challan_lock:
         records = list(_challan_records)
@@ -1487,11 +1229,37 @@ def get_challans(limit: int = Query(default=100, le=500), offset: int = Query(de
     if challan_only:
         records = [r for r in records if r.get("challan")]
 
+    if zone:
+        records = [r for r in records if r.get("zone") == zone]
+
+    if since:
+        records = [r for r in records if r.get("first_time", "") >= since]
+
     records.sort(key=lambda r: r.get("first_time", ""), reverse=True)
     total = len(records)
     paginated = records[offset:offset + limit]
 
     return {"challans": paginated, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/challans/pending")
+def get_challans_pending():
+    """Returns currently pending challan rechecks with countdown info."""
+    now = datetime.now(timezone.utc)
+    pending_list = []
+    with _challan_lock:
+        for key, info in _challan_pending.items():
+            entry = {
+                "pending_key": key,
+                "slot_id": info.get("slot_id"),
+                "slot_name": info.get("slot_name"),
+                "zone": info.get("zone"),
+                "plates": info.get("plates", []),
+                "first_time": info.get("first_time"),
+                "capture_session_id": info.get("capture_session_id"),
+            }
+            pending_list.append(entry)
+    return {"pending": pending_list, "count": len(pending_list)}
 
 
 @app.get("/challan-dashboard", response_class=HTMLResponse)

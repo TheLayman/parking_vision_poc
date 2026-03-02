@@ -6,6 +6,16 @@ function fmtTs(ts) {
   return String(ts || "");
 }
 
+function filenameFromPath(path) {
+  if (!path) return null;
+  return path.split('/').pop().split('\\').pop();
+}
+
+function parseSlotId(obj) {
+  const raw = obj.slot_id;
+  return typeof raw === 'number' ? raw : Number(raw);
+}
+
 function computeCols(count) {
   if (!count || count <= 0) return 1;
   return Math.max(1, Math.ceil(Math.sqrt(count)));
@@ -346,6 +356,8 @@ let serverZoneStats = null; // use server-provided zone stats when available
 let collapsedZones = new Set();
 let calibratingSlots = new Set(); // Track slots currently being calibrated
 let failedSlots = new Map(); // Track slots that failed calibration with error message
+let slotPlates = {}; // slot_id -> [plate1, plate2, ...] from camera_capture SSE events
+let pendingRechecks = {}; // slot_id -> {plates: [...], slot_name, ...}
 
 function getSlotStatus(slotId) {
   const raw = stateById[slotId] || "FREE";
@@ -519,7 +531,20 @@ function renderZoneSections(zones) {
           if (!isNaN(d.getTime())) sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         } catch { }
       }
-      tile.querySelector(".slotMeta").innerHTML = sinceText;
+
+      // Build meta HTML: since + plates + pending recheck
+      let metaHtml = sinceText;
+      const plates = slotPlates[s.id];
+      if (plates && plates.length > 0 && status === "OCCUPIED") {
+        metaHtml += '<div class="slot-plates">' +
+          plates.map(p => `<span class="plate-badge-sm">${p}</span>`).join(' ') +
+          '</div>';
+      }
+      const pending = pendingRechecks[s.id];
+      if (pending) {
+        metaHtml += '<div class="slot-pending-recheck">⏳ Recheck pending</div>';
+      }
+      tile.querySelector(".slotMeta").innerHTML = metaHtml;
 
       // Update calibrate button state
       _updateCalibrateBtnState(tile.querySelector(".slot-calibrate-btn"), s.id);
@@ -666,7 +691,7 @@ function renderAlerts(alerts) {
     // Handle image
     let imageHtml = '';
     if (alert.image_path) {
-      const filename = alert.image_path.split('/').pop().split('\\').pop();
+      const filename = filenameFromPath(alert.image_path);
       imageHtml = `
         <div class="alert-image">
           <img src="/snapshots/${filename}" alt="Slot ${alert.slot_name}" loading="lazy" />
@@ -685,10 +710,15 @@ function renderAlerts(alerts) {
       `;
     }
 
-    // Handle license plate
-    const licensePlate = alert.license_plate || 'UNKNOWN';
-    const hasPlate = licensePlate !== 'UNKNOWN';
+    // Handle license plates (support array)
+    const licensePlates = alert.license_plates && alert.license_plates.length > 0
+      ? alert.license_plates
+      : (alert.license_plate && alert.license_plate !== 'UNKNOWN' ? [alert.license_plate] : []);
+    const hasPlate = licensePlates.length > 0;
     const plateClass = hasPlate ? 'has-plate' : 'no-plate';
+    const platesHtml = hasPlate
+      ? licensePlates.map(p => `<span class="plate-badge-sm">${p}</span>`).join(' ')
+      : 'UNKNOWN';
 
     return `
       <div class="alert-card ${stateClass}" style="--index: ${index}">
@@ -715,7 +745,7 @@ function renderAlerts(alerts) {
                 <line x1="6" y1="11" x2="6" y2="13"/>
                 <line x1="18" y1="11" x2="18" y2="13"/>
               </svg>
-              <span class="plate-text">${licensePlate}</span>
+              <span class="plate-text">${platesHtml}</span>
             </div>
             <div class="alert-time">${timeStr}</div>
           </div>
@@ -743,6 +773,11 @@ async function init() {
     prependLog(e);
   }
 
+  // Load pending rechecks on startup
+  fetchPendingRechecks();
+  // Poll pending rechecks every 15 seconds
+  setInterval(fetchPendingRechecks, 15000);
+
   const es = new EventSource("/events");
   es.onmessage = (msg) => {
     try {
@@ -751,6 +786,8 @@ async function init() {
         const occupied = new Set(obj.occupied_ids || []);
         for (const s of slots) {
           stateById[s.id] = occupied.has(s.id) ? "OCCUPIED" : "FREE";
+          // Clear plates when slot becomes free
+          if (!occupied.has(s.id)) delete slotPlates[s.id];
         }
         serverZoneStats = obj.zone_stats || null;
         refreshLayout();
@@ -758,36 +795,59 @@ async function init() {
       }
 
       if (obj.event === "slot_state_changed") {
-        serverZoneStats = null; // invalidate server stats on individual change
-        if (typeof obj.slot_id === "number") {
-          stateById[obj.slot_id] = obj.new_state;
-          sinceById[obj.slot_id] = obj.ts;
-        } else {
-          const id = Number(obj.slot_id);
-          if (!isNaN(id)) {
-            stateById[id] = obj.new_state;
-            sinceById[id] = obj.ts;
-          }
+        serverZoneStats = null;
+        const id = parseSlotId(obj);
+        if (!isNaN(id)) {
+          stateById[id] = obj.new_state;
+          sinceById[id] = obj.ts;
+          if (obj.new_state === "FREE") delete slotPlates[id];
         }
         refreshLayout();
         prependLog(obj);
 
-        // Update alerts if loaded
         if (alertsLoadedOnce) {
           alertsCache.unshift(obj);
-          alertsCache = alertsCache.slice(0, 100); // Keep only 100 most recent
-
-          // Re-render if alerts tab is active
+          alertsCache = alertsCache.slice(0, 100);
           const alertsTab = document.getElementById('alerts-tab');
           if (alertsTab && alertsTab.classList.contains('active')) {
             renderAlerts(alertsCache);
           }
         }
       }
+
+      // Track detected plates on slot tiles
+      if (obj.event === "camera_capture") {
+        const id = parseSlotId(obj);
+        if (!isNaN(id) && obj.license_plates && obj.license_plates.length > 0) {
+          slotPlates[id] = obj.license_plates;
+          refreshLayout();
+        }
+      }
+
+      // Refresh pending rechecks when a challan completes
+      if (obj.event === "challan_completed") {
+        fetchPendingRechecks();
+      }
     } catch (e) {
       // ignore parse errors
     }
   };
+}
+
+async function fetchPendingRechecks() {
+  try {
+    const res = await fetch('/challans/pending');
+    const data = await res.json();
+    const newPending = {};
+    for (const p of (data.pending || [])) {
+      if (p.slot_id != null) newPending[p.slot_id] = p;
+    }
+    const changed = JSON.stringify(pendingRechecks) !== JSON.stringify(newPending);
+    pendingRechecks = newPending;
+    if (changed) refreshLayout();
+  } catch (e) {
+    // silently ignore
+  }
 }
 
 async function handleSlotCalibrate(slotId, btn) {
