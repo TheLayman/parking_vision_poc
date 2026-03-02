@@ -791,111 +791,49 @@ async function init() {
 }
 
 async function handleSlotCalibrate(slotId, btn) {
-  // Prevent duplicate calibration requests
   if (calibratingSlots.has(slotId)) return;
-  
-  // Clear any previous failed state
   failedSlots.delete(slotId);
-  
   calibratingSlots.add(slotId);
-  const originalContent = btn.innerHTML;
-  
-  // Show loading state
-  btn.disabled = true;
-  btn.classList.add("loading");
-  btn.innerHTML = `
-    <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-    </svg>
-    ...
-  `;
-  
+  _updateCalibrateBtnState(btn, slotId);
+
   try {
     const res = await fetch(`/calibrate/${slotId}`, { method: "POST" });
-    
-    if (!res.ok) {
-      throw new Error(`Server returned ${res.status}`);
-    }
-    
+    if (!res.ok) throw new Error(`Server returned ${res.status}`);
     const data = await res.json();
-    
+    if (!data.success) throw new Error(data.message || "Calibration failed");
+
     calibratingSlots.delete(slotId);
-    
-    // Re-query the button in case DOM was rebuilt
     const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
     if (!currentBtn) return;
-    
-    if (data.success) {
-      // Show success feedback
-      currentBtn.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
-        Done!
-      `;
-      currentBtn.classList.remove("loading");
-      currentBtn.classList.add("success");
-      currentBtn.disabled = true;
-      
-      // Log calibration event
-      const slot = slots.find(s => s.id === slotId);
-      const slotName = slot ? slot.name : `Slot ${slotId}`;
-      const logItem = {
-        event: "calibration",
-        ts: new Date().toISOString(),
-        slot_name: slotName,
-        new_state: "CALIBRATED"
-      };
-      prependLog(logItem);
-      
-      // Reset button after 2 seconds
-      setTimeout(() => {
-        const btnToReset = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-        if (btnToReset) {
-          btnToReset.innerHTML = originalContent;
-          btnToReset.disabled = false;
-          btnToReset.classList.remove("success");
-        }
-      }, 2000);
-    } else {
-      throw new Error(data.message || "Calibration failed");
-    }
+
+    // Show success briefly
+    currentBtn.classList.remove("loading");
+    currentBtn.classList.add("success");
+    currentBtn.disabled = true;
+    currentBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+      Done!
+    `;
+    const slot = slots.find(s => s.id === slotId);
+    prependLog({ event: "calibration", ts: new Date().toISOString(), slot_name: slot ? slot.name : `Slot ${slotId}`, new_state: "CALIBRATED" });
+
+    setTimeout(() => {
+      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
+      if (b) { b.classList.remove("success"); _updateCalibrateBtnState(b, slotId); }
+    }, 2000);
   } catch (err) {
     console.error("Calibration error:", err);
     calibratingSlots.delete(slotId);
     failedSlots.set(slotId, err.message || "Calibration failed");
-    
-    // Re-query the button in case DOM was rebuilt
     const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-    if (currentBtn) {
-      currentBtn.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-        Failed
-      `;
-      currentBtn.title = err.message || "Calibration failed";
-      currentBtn.classList.remove("loading");
-      currentBtn.classList.add("error");
-      currentBtn.disabled = false; // Allow retry
-    }
-    
-    // Clear error state after 5 seconds
+    if (currentBtn) _updateCalibrateBtnState(currentBtn, slotId);
+
     setTimeout(() => {
       failedSlots.delete(slotId);
-      const btnToReset = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-      if (btnToReset && btnToReset.classList.contains("error")) {
-        btnToReset.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-          </svg>
-          Calibrate
-        `;
-        btnToReset.title = "";
-        btnToReset.classList.remove("error");
-      }
+      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
+      if (b && b.classList.contains("error")) _updateCalibrateBtnState(b, slotId);
     }, 5000);
   }
 }

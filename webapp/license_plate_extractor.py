@@ -536,21 +536,6 @@ def extract_license_plate(image_path) -> dict:
         return _empty_result()
 
 
-def extract_license_plate_from_cv2_image(image) -> dict:
-    """
-    Extract license plate from an OpenCV image (BGR) using the full pipeline.
-
-    Returns same dict as extract_license_plate().
-    """
-    if image is None:
-        return _empty_result()
-    try:
-        return _run_pipeline(image)
-    except Exception as e:
-        log.error("Error in license plate extraction pipeline: %s", e)
-        return _empty_result()
-
-
 def _empty_result() -> dict:
     return {
         "plate_text": "UNKNOWN",

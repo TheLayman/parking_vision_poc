@@ -128,8 +128,6 @@ def save_snapshot_data(data: dict):
 
 
 
-# _update_slot_baseline removed
-
 def _calculate_zone_stats(slot_ids: List[int], occupied_ids: set, meta_by_id: Dict[int, dict]) -> tuple:
     """Calculate zone statistics and counts. Returns (zones_stats, free_count, total_count)."""
     zones_stats = {}
@@ -445,22 +443,6 @@ def _rebuild_device_name_map_if_needed(meta_by_id: Dict[int, dict]):
     _device_name_map_mtime = _meta_cache_mtime
 
 
-def _update_slot_occupancy_state(slot_snapshot: dict, status: str):
-    """Update slot occupancy state based on device status."""
-    if status in ("00", "01"):
-        slot_snapshot["last_status"] = status
-    elif status == "cd":
-        log.info("Device reported Calibration Done (cd)")
-
-
-def _compute_occupied_slots(slots_snapshot: dict, all_slot_ids: list) -> set:
-    """Compute set of occupied slot IDs from snapshot data."""
-    return {
-        sid for sid in all_slot_ids
-        if slots_snapshot.get(str(sid), {}).get("last_status") == "01"
-    }
-
-
 def _log_events_to_file(events: list):
     """Write events to event log file."""
     if not events:
@@ -537,11 +519,18 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, met
         slot_key = str(slot_id)
         slot_snapshot = _slots_snapshot.get(slot_key, {})
 
-        _update_slot_occupancy_state(slot_snapshot, status)
+        if status in ("00", "01"):
+            slot_snapshot["last_status"] = status
+        elif status == "cd":
+            log.info("Device reported Calibration Done (cd)")
+
         _slots_snapshot[slot_key] = slot_snapshot
         _slots_snapshot_dirty = True
 
-        occupied_ids = _compute_occupied_slots(_slots_snapshot, all_configured_ids)
+        occupied_ids = {
+            sid for sid in all_configured_ids
+            if _slots_snapshot.get(str(sid), {}).get("last_status") == "01"
+        }
 
     # Invalidate cache so next /state request gets fresh data
     _state_cache = None
@@ -684,21 +673,15 @@ def stop_mqtt_listener():
         _mqtt_client.disconnect()
         _mqtt_client = None
 
-def _init_in_memory_snapshot():
-    """Load snapshot from disk into in-memory state at startup."""
-    global _slots_snapshot
-    data = load_snapshot_data()
-    _slots_snapshot = data.get("slots", {})
-    log.info("Loaded in-memory snapshot with %d slot(s)", len(_slots_snapshot))
-
-
 def _startup():
-    global _camera_queue, _camera_controller, _camera_worker_thread
+    global _camera_queue, _camera_controller, _camera_worker_thread, _slots_snapshot
 
     _shutdown_event.clear()
 
     # Load snapshot into memory
-    _init_in_memory_snapshot()
+    data = load_snapshot_data()
+    _slots_snapshot = data.get("slots", {})
+    log.info("Loaded in-memory snapshot with %d slot(s)", len(_slots_snapshot))
 
     # Initialise in-memory alerts from log (last N events)
     _init_alerts_from_log()
@@ -840,13 +823,6 @@ def load_slot_meta_by_id() -> Dict[int, dict]:
     return meta
 
 
-def describe_slot(slot_id: int, meta_by_id: Dict[int, dict]) -> dict:
-    meta = meta_by_id.get(slot_id, {})
-    name = meta.get("name") or str(slot_id)
-    zone = meta.get("zone") or "A"
-    return {"id": slot_id, "name": name, "zone": zone}
-
-
 def build_state_from_log(slot_ids: List[int], meta_by_id: Dict[int, dict], max_events: int = 200) -> dict:
     state_by_id: Dict[int, str] = {slot_id: "FREE" for slot_id in slot_ids}
     since_by_id: Dict[int, str] = {slot_id: "" for slot_id in slot_ids}
@@ -878,7 +854,10 @@ def build_state_from_log(slot_ids: List[int], meta_by_id: Dict[int, dict], max_e
                 except Exception:
                     continue
 
-    slots = [describe_slot(slot_id, meta_by_id) for slot_id in slot_ids]
+    slots = [
+        {"id": sid, "name": meta_by_id.get(sid, {}).get("name") or str(sid), "zone": meta_by_id.get(sid, {}).get("zone") or "A"}
+        for sid in slot_ids
+    ]
     occupied_ids = {sid for sid, st in state_by_id.items() if st == "OCCUPIED"}
     zones, free_count, total_count = _calculate_zone_stats(slot_ids, occupied_ids, meta_by_id)
 
@@ -1150,18 +1129,8 @@ def analytics_summary(range: str = Query(default="24h")):
 
 @app.get("/snapshot")
 def get_snapshot():
-    """
-    Returns the current snapshot data with baseline values and tracking info.
-    """
-    with _snapshot_lock:
-        snapshot_data = load_snapshot_data()
-    return snapshot_data
-
-
-
-# Legacy calibration functions removed
-# Use "cd" payload status from device if calibration is needed
-
+    """Returns the current in-memory snapshot data."""
+    return {"slots": dict(_slots_snapshot)}
 
 
 @app.get("/alerts")
