@@ -107,6 +107,8 @@ _ALERTS_MAX = 500
 # ── Challan (parking violation) tracking ──────────────────────────────────────
 # Challan re-check interval in seconds (70s × 2 checks ≈ detect >2 min stays)
 CHALLAN_RECHECK_INTERVAL = int(os.getenv("CHALLAN_RECHECK_INTERVAL", "70"))
+# Dedup window: skip plate if it already has a challan/pending recheck within this many seconds
+CHALLAN_DEDUP_WINDOW = int(os.getenv("CHALLAN_DEDUP_WINDOW", "600"))  # 10 minutes
 CHALLAN_LOG_PATH = REPO_ROOT / "data" / "challan_events.jsonl"
 _challan_records: list[dict] = []  # in-memory challan buffer
 _challan_lock = threading.Lock()
@@ -334,21 +336,27 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
 
     # ── Challan tracking: schedule ONE batch re-check for all detected plates ──
     if license_plates and ENABLE_CAMERA_CONTROL and _camera_queue is not None:
-        meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
-        meta = meta_by_id.get(slot_id, {})
-        preset = meta.get("preset")
-        if preset:
-            _schedule_slot_recheck(
-                plates=license_plates,
-                slot_id=slot_id,
-                slot_name=slot_name,
-                zone=zone,
-                preset=preset,
-                first_image=image_path,
-                first_time=timestamp_str,
-                capture_session_id=capture_session_id,
-                mqtt_event_ts=mqtt_event_ts,
-            )
+        # Filter out plates that already have a recent challan or pending recheck
+        fresh_plates = [p for p in license_plates if not _has_recent_challan_or_pending(p)]
+        for skipped in set(license_plates) - set(fresh_plates):
+            log.info("Skipping plate %s at slot %s — already processed within %ds window",
+                     skipped, slot_name, CHALLAN_DEDUP_WINDOW)
+        if fresh_plates:
+            meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+            meta = meta_by_id.get(slot_id, {})
+            preset = meta.get("preset")
+            if preset:
+                _schedule_slot_recheck(
+                    plates=fresh_plates,
+                    slot_id=slot_id,
+                    slot_name=slot_name,
+                    zone=zone,
+                    preset=preset,
+                    first_image=image_path,
+                    first_time=timestamp_str,
+                    capture_session_id=capture_session_id,
+                    mqtt_event_ts=mqtt_event_ts,
+                )
 
 
 def _make_batch_recheck_callback(pending_key: str):
@@ -411,6 +419,8 @@ def _make_batch_recheck_callback(pending_key: str):
 
         # Schedule batch recheck for NEW plates not in original list (max 1 re-recheck)
         unseen_plates = [p for p in new_plates if p not in first_plates]
+        # Filter out plates already processed within the dedup window
+        unseen_plates = [p for p in unseen_plates if not _has_recent_challan_or_pending(p)]
         if unseen_plates and recheck_count < 1:
             new_session_id = str(uuid.uuid4())
             _schedule_slot_recheck(
@@ -486,6 +496,29 @@ def _schedule_slot_recheck(plates: list, slot_id: int, slot_name: str,
              len(plates), slot_name, CHALLAN_RECHECK_INTERVAL)
 
 
+def _has_recent_challan_or_pending(plate_text: str) -> bool:
+    """Return True if *plate_text* already has a challan record or pending
+    recheck within the configured ``CHALLAN_DEDUP_WINDOW`` (default 10 min).
+
+    This prevents the same plate from being processed multiple times when it
+    is visible from overlapping camera presets or cascaded rechecks.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=CHALLAN_DEDUP_WINDOW)).isoformat()
+    with _challan_lock:
+        # Check completed challan records
+        for rec in reversed(_challan_records):
+            ft = rec.get("first_time", "")
+            if ft < cutoff:
+                break  # records are appended chronologically; no need to check older ones
+            if rec.get("plate_text") == plate_text:
+                return True
+        # Check pending rechecks
+        for pending in _challan_pending.values():
+            if plate_text in pending.get("plates", []):
+                return True
+    return False
+
+
 def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
                      first_image: str, first_time: str,
                      second_image: str, second_time: str,
@@ -498,6 +531,18 @@ def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
     Also broadcasts a ``challan_completed`` event to the SSE log so
     the challan dashboard can update in near-real-time.
     """
+    # Safety-net dedup: skip if this plate was already recorded within the window
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=CHALLAN_DEDUP_WINDOW)).isoformat()
+    with _challan_lock:
+        for rec in reversed(_challan_records):
+            ft = rec.get("first_time", "")
+            if ft < cutoff:
+                break
+            if rec.get("plate_text") == plate_text:
+                log.info("Duplicate challan skipped for plate %s at slot %s (already recorded)",
+                         plate_text, slot_name)
+                return
+
     record = {
         "plate_text": plate_text,
         "slot_id": slot_id,

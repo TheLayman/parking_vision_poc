@@ -39,6 +39,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_LPR_MODEL", "gpt-4o")
 OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_LPR_MAX_TOKENS", "300"))
 
+# Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
+PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
+
 # ── Singleton ─────────────────────────────────────────────────────────────────
 _openai_client = None  # openai.OpenAI
 
@@ -48,7 +51,12 @@ _SYSTEM_PROMPT = (
     "You will receive a parking lot camera image from India.\n\n"
     "Your tasks:\n"
     "1. Determine whether any vehicle (car, truck, bus, motorcycle, auto-rickshaw) is visible.\n"
-    "2. If vehicles are visible, read ALL license plate numbers you can see.\n\n"
+    "2. If vehicles are visible, read license plate numbers that are CLEARLY READABLE.\n\n"
+    "IMPORTANT — Only return plates you can read with confidence:\n"
+    "- Do NOT guess at plates that are too small, too far away, blurry, or at sharp angles.\n"
+    "- Do NOT attempt to read plates where fewer than half the characters are legible.\n"
+    "- If a plate is partially obscured and you cannot confidently read it, SKIP it entirely.\n"
+    "- Only include plates where you can clearly make out the characters.\n\n"
     "Indian license plate format:\n"
     "- Standard format: SS DD XX NNNN\n"
     "  - SS = State code (2 letters, e.g. MH, DL, KA, TN, AP, GJ, RJ, UP, WB, HR, TS)\n"
@@ -75,14 +83,17 @@ _SYSTEM_PROMPT = (
     "- Common OCR confusions on Indian plates: 0↔O, 1↔I, 8↔B, 5↔S, 2↔Z. "
     "Use the known Indian plate structure to resolve ambiguity "
     "(state code must be letters, district code must be digits, etc.).\n"
-    "- If a plate is partially obscured but you can still make a reasonable guess, "
-    "include it.\n"
     "- Do NOT invent or hallucinate plate numbers.\n\n"
+    "For each plate, rate your confidence:\n"
+    "- \"high\"  = plate is large, clear, fully visible\n"
+    "- \"medium\" = plate is readable but small or slightly angled\n"
+    "- \"low\"   = plate is distant, blurry, or partially obscured "
+    "(you should usually omit these)\n\n"
     "Respond with ONLY valid JSON (no markdown, no code fences):\n"
-    '{"vehicle_detected": true/false, "plates": ["PLATE1", "PLATE2", ...]}\n\n'
+    '{"vehicle_detected": true/false, "plates": [{"plate_text": "PLATE1", "confidence": "high"}, ...]}\n\n'
     "If no vehicle is visible, respond:\n"
     '{"vehicle_detected": false, "plates": []}\n\n'
-    "If vehicles are visible but no plates are readable, respond:\n"
+    "If vehicles are visible but no plates are clearly readable, respond:\n"
     '{"vehicle_detected": true, "plates": []}'
 )
 
@@ -163,14 +174,37 @@ def _call_openai_vision(image: np.ndarray) -> dict:
         if not isinstance(plates_raw, list):
             plates_raw = []
 
-        return {"vehicle_detected": vehicle, "plates": plates_raw}
+        # Normalise: accept both old format (list of strings) and new format (list of dicts)
+        confidence_map = {"high": 1.0, "medium": 0.7, "low": 0.3}
+        plates_out = []
+        for entry in plates_raw:
+            if isinstance(entry, str):
+                plates_out.append({"plate_text": entry, "confidence": 1.0})
+            elif isinstance(entry, dict):
+                text = entry.get("plate_text", "")
+                conf_label = entry.get("confidence", "medium")
+                conf_score = confidence_map.get(conf_label, 0.5)
+                plates_out.append({"plate_text": text, "confidence": conf_score})
+
+        # Filter by confidence threshold
+        dropped = [p for p in plates_out if p["confidence"] < PLATE_MIN_CONFIDENCE]
+        for d in dropped:
+            log.info("Dropping low-confidence plate: %s (%.1f < %.1f)",
+                     d["plate_text"], d["confidence"], PLATE_MIN_CONFIDENCE)
+        plates_out = [p for p in plates_out if p["confidence"] >= PLATE_MIN_CONFIDENCE]
+
+        return {
+            "vehicle_detected": vehicle,
+            "plates": [p["plate_text"] for p in plates_out],
+            "plates_detail": plates_out,
+        }
 
     except json.JSONDecodeError as e:
         log.error("Failed to parse GPT-4o JSON response: %s", e)
-        return {"vehicle_detected": False, "plates": []}
+        return {"vehicle_detected": False, "plates": [], "plates_detail": []}
     except Exception as e:
         log.error("OpenAI vision API call failed: %s", e)
-        return {"vehicle_detected": False, "plates": []}
+        return {"vehicle_detected": False, "plates": [], "plates_detail": []}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

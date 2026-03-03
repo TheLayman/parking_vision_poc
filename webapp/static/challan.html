@@ -174,14 +174,14 @@
           <div class="challan-stat-icon">�</div>
           <div>
             <div class="challan-stat-value" id="statIncidents">--</div>
-            <div class="challan-stat-label">Incidents</div>
+            <div class="challan-stat-label">Unique Slots</div>
           </div>
         </div>
         <div class="challan-stat">
           <div class="challan-stat-icon">📋</div>
           <div>
             <div class="challan-stat-value" id="statTotal">--</div>
-            <div class="challan-stat-label">Plate Checks</div>
+            <div class="challan-stat-label">Unique Plates</div>
           </div>
         </div>
         <div class="challan-stat">
@@ -235,17 +235,16 @@
         <table class="challan-table">
           <thead>
             <tr>
-              <th>Vehicle Number</th>
-              <th>Slot</th>
-              <th>1st Capture</th>
-              <th>1st Photo</th>
-              <th>2nd Capture</th>
-              <th>2nd Photo</th>
+              <th>Plate</th>
+              <th>1st Detection</th>
+              <th>Photo</th>
+              <th>2nd Detection (Latest)</th>
+              <th>Photo</th>
               <th>Challan</th>
             </tr>
           </thead>
           <tbody id="challanBody">
-            <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
+            <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -340,23 +339,20 @@
             records = records.filter(r => !r.challan);
           }
 
-          updateStats(records);
           renderTable(records);
         } catch (err) {
           console.error('Failed to load challans:', err);
         }
       }
 
-      function updateStats(records) {
-        const totalCount = records.length;
-        const challanCount = records.filter(r => r.challan).length;
-        const clearedCount = totalCount - challanCount;
-        const sessions = new Set(records.map(r => r.capture_session_id).filter(Boolean));
-        // If no capture_session_id, fall back to counting unique first_image values
-        const incidentCount = sessions.size || new Set(records.map(r => r.first_image).filter(Boolean)).size;
+      function updateStats(plateGroups) {
+        const totalPlates = plateGroups.length;
+        const challanCount = plateGroups.filter(g => g.challan).length;
+        const clearedCount = totalPlates - challanCount;
+        const uniqueSlots = new Set(plateGroups.flatMap(g => g.slots)).size;
 
-        document.getElementById('statIncidents').textContent = incidentCount;
-        document.getElementById('statTotal').textContent = totalCount;
+        document.getElementById('statIncidents').textContent = uniqueSlots;
+        document.getElementById('statTotal').textContent = totalPlates;
         document.getElementById('statChallans').textContent = challanCount;
         document.getElementById('statCleared').textContent = clearedCount;
       }
@@ -375,79 +371,77 @@
           '</div>';
       }
 
-      // ── Render grouped table ──────────────────────────────────────
+      // ── Group records by plate_text ────────────────────────────────
+      function groupByPlate(records) {
+        const map = new Map();
+        for (const r of records) {
+          const plate = r.plate_text || 'UNKNOWN';
+          if (!map.has(plate)) {
+            map.set(plate, {
+              plate,
+              first_time: r.first_time,
+              first_image: r.first_image,
+              second_time: r.second_time,
+              second_image: r.second_image,
+              challan: !!r.challan,
+              slots: new Set([r.slot_name || '—']),
+            });
+          } else {
+            const g = map.get(plate);
+            // Keep the earliest first detection
+            if (r.first_time && (!g.first_time || r.first_time < g.first_time)) {
+              g.first_time = r.first_time;
+              g.first_image = r.first_image;
+            }
+            // Keep the latest second detection
+            if (r.second_time && (!g.second_time || r.second_time > g.second_time)) {
+              g.second_time = r.second_time;
+              g.second_image = r.second_image;
+            }
+            // Challan = YES if any record says so
+            if (r.challan) g.challan = true;
+            if (r.slot_name) g.slots.add(r.slot_name);
+          }
+        }
+        // Convert Sets to arrays and return sorted by first_time descending
+        const groups = Array.from(map.values()).map(g => ({ ...g, slots: Array.from(g.slots) }));
+        groups.sort((a, b) => (b.first_time || '').localeCompare(a.first_time || ''));
+        return groups;
+      }
+
+      // ── Render per-plate table ─────────────────────────────────────
       function renderTable(records) {
         const tbody = document.getElementById('challanBody');
         const emptyEl = document.getElementById('challanEmpty');
         const tableWrap = document.getElementById('challanTableWrap');
 
-        if (records.length === 0) {
+        const plateGroups = groupByPlate(records);
+
+        if (plateGroups.length === 0) {
           tableWrap.style.display = 'none';
           emptyEl.style.display = 'flex';
+          updateStats([]);
           return;
         }
 
         tableWrap.style.display = 'block';
         emptyEl.style.display = 'none';
-
-        // Group records by capture_session_id (or first_image as fallback)
-        const groups = [];
-        const groupMap = new Map();
-        for (const r of records) {
-          const key = r.capture_session_id || r.first_image || Math.random().toString();
-          if (!groupMap.has(key)) {
-            const group = { key, records: [] };
-            groupMap.set(key, group);
-            groups.push(group);
-          }
-          groupMap.get(key).records.push(r);
-        }
+        updateStats(plateGroups);
 
         let html = '';
-        for (const group of groups) {
-          const recs = group.records;
-          const first = recs[0];
-          const isMulti = recs.length > 1;
+        for (const g of plateGroups) {
+          const challanBadge = g.challan
+            ? '<span class="challan-badge yes">🚨 YES</span>'
+            : '<span class="challan-badge no">✅ NO</span>';
 
-          // Session separator for multi-plate groups
-          if (isMulti) {
-            html += `<tr class="session-header-row"><td colspan="7">
-              <span class="session-label">─ ${first.slot_name || '—'} (Zone ${first.zone || '?'}) — ${recs.length} plates detected at ${fmtTime(first.first_time)}</span>
-            </td></tr>`;
-          }
-
-          for (let i = 0; i < recs.length; i++) {
-            const r = recs[i];
-            const challanBadge = r.challan
-              ? '<span class="challan-badge yes">🚨 YES</span>'
-              : '<span class="challan-badge no">✅ NO</span>';
-
-            // For multi-plate groups, show shared columns only on first row via rowspan
-            const showShared = !isMulti || i === 0;
-            const rowspan = isMulti && i === 0 ? ` rowspan="${recs.length}"` : '';
-
-            const slotCell = showShared
-              ? `<td${rowspan}>${r.slot_name || '—'} <span style="color:var(--muted);font-size:0.7rem;">(Zone ${r.zone || '?'})</span></td>`
-              : '';
-            const firstTimeCell = showShared
-              ? `<td${rowspan}>${fmtTime(r.first_time)}</td>`
-              : '';
-            const firstImgCell = showShared
-              ? `<td${rowspan}>${thumbHtml(r.first_image, '1st')}</td>`
-              : '';
-            const secondTimeCell = showShared
-              ? `<td${rowspan}>${fmtTime(r.second_time)}</td>`
-              : '';
-            const secondImgCell = showShared
-              ? `<td${rowspan}>${thumbHtml(r.second_image, '2nd')}${platesChips(r.second_plates)}</td>`
-              : '';
-
-            html += `<tr>
-              <td><span class="plate-badge">${r.plate_text || 'UNKNOWN'}</span></td>
-              ${slotCell}${firstTimeCell}${firstImgCell}${secondTimeCell}${secondImgCell}
-              <td>${challanBadge}</td>
-            </tr>`;
-          }
+          html += `<tr>
+            <td><span class="plate-badge">${g.plate}</span></td>
+            <td>${fmtTime(g.first_time)}</td>
+            <td>${thumbHtml(g.first_image, '1st detection')}</td>
+            <td>${fmtTime(g.second_time)}</td>
+            <td>${thumbHtml(g.second_image, '2nd detection')}</td>
+            <td>${challanBadge}</td>
+          </tr>`;
         }
 
         tbody.innerHTML = html;
