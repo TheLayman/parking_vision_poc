@@ -140,7 +140,7 @@ def save_snapshot_data(data: dict):
 
 
 def _extract_plates(image_path: str) -> dict:
-    """Extract license plate strings from an image via GPT-4o vision.
+    """Extract license plate strings from an image via OpenAI vision.
 
     Returns ``{"plates": [...], "vehicle_detected": bool}``.
     """
@@ -425,12 +425,14 @@ def _make_batch_recheck_callback(pending_key: str):
         ts_str = datetime.now(timezone.utc).isoformat()
         second_image = image_path
 
-        # Extract plates from second capture (ONE GPT-4o call for all plates)
+        # Extract plates from second capture (ONE OpenAI vision call for all plates)
         new_plates = _extract_plates(second_image)["plates"]
 
-        # Compare each original plate against the second image (fuzzy match)
+        # Compare each original plate against the second image (exact match
+        # required — fuzzy matching can let two different hallucinations
+        # confirm each other as a false-positive challan).
         for plate_text in first_plates:
-            is_match = _any_plate_matches(plate_text, new_plates)
+            is_match = plate_text in new_plates
             _record_challan(
                 plate_text=plate_text,
                 slot_id=slot_id,
@@ -540,11 +542,11 @@ def _has_recent_challan_or_pending(plate_text: str) -> bool:
             ft = rec.get("first_time", "")
             if ft < cutoff:
                 break  # records are appended chronologically; no need to check older ones
-            if rec.get("plate_text") == plate_text:
+            if _plates_match(rec.get("plate_text", ""), plate_text):
                 return True
         # Check pending rechecks
         for pending in _challan_pending.values():
-            if plate_text in pending.get("plates", []):
+            if _any_plate_matches(plate_text, pending.get("plates", [])):
                 return True
     return False
 
@@ -584,7 +586,7 @@ def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
         for rec in reversed(_challan_records):
             if rec.get("first_time", "") < cutoff:
                 break
-            if rec.get("plate_text") == plate_text:
+            if _plates_match(rec.get("plate_text", ""), plate_text):
                 log.info("Duplicate challan skipped for plate %s at slot %s (already recorded)",
                          plate_text, slot_name)
                 return

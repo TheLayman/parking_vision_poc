@@ -1,9 +1,9 @@
 """
-License plate extraction module using OpenAI GPT-4o vision.
+License plate extraction module using OpenAI vision (GPT-5.2).
 
 Pipeline (single API call per image):
   1. Load image & encode to base64 JPEG
-  2. Send to GPT-4o vision — detect vehicles + read all plates in one call
+  2. Send to OpenAI vision — detect vehicles + read all plates in one call
   3. Post-process (normalisation + regex validation)
 
 No local ML models (YOLO) or heavy OpenCV preprocessing required.
@@ -36,8 +36,8 @@ _INDIAN_STATE_CODES = {
 
 # ── OpenAI configuration ─────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_LPR_MODEL", "gpt-4o")
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_LPR_MAX_TOKENS", "300"))
+OPENAI_MODEL = os.getenv("OPENAI_LPR_MODEL", "gpt-5.2")
+OPENAI_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_LPR_MAX_TOKENS", "300"))
 
 # Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
 PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
@@ -46,56 +46,44 @@ _CONFIDENCE_SCORES: dict = {"high": 1.0, "medium": 0.7, "low": 0.3}
 # ── Singleton ─────────────────────────────────────────────────────────────────
 _openai_client = None  # openai.OpenAI
 
-# ── System prompt for GPT-4o vision ──────────────────────────────────────────
+# ── System prompt for OpenAI vision ──────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    "You are an expert Indian vehicle license plate recognition system. "
-    "You will receive a parking lot camera image from India.\n\n"
-    "Your tasks:\n"
-    "1. Determine whether any vehicle (car, truck, bus, motorcycle, auto-rickshaw) is visible.\n"
-    "2. If vehicles are visible, read license plate numbers that are CLEARLY READABLE.\n\n"
-    "IMPORTANT — Only return plates you can read with confidence:\n"
-    "- Do NOT guess at plates that are too small, too far away, blurry, or at sharp angles.\n"
-    "- Do NOT attempt to read plates where fewer than half the characters are legible.\n"
-    "- If a plate is partially obscured and you cannot confidently read it, SKIP it entirely.\n"
-    "- Only include plates where you can clearly make out the characters.\n\n"
-    "Indian license plate format:\n"
-    "- Standard format: SS DD XX NNNN\n"
-    "  - SS = State code (2 letters, e.g. MH, DL, KA, TN, AP, GJ, RJ, UP, WB, HR, TS)\n"
-    "  - DD = District/RTO code (1-2 digits)\n"
-    "  - XX = Series letters (1-3 letters)\n"
-    "  - NNNN = Number (1-4 digits)\n"
-    "- Examples: MH12AB1234, DL04CAF5765, KA01MR7189, TN09CE5765, TS08FA9087\n"
-    "- Bharat (BH) series: BH DD YYYY XXNNNN (e.g. BH02AA1234)\n"
-    "- Plates may have the Indian flag, Ashoka emblem, or state name on top.\n"
-    "- Plates can be white (private), yellow (commercial), green (electric), "
-    "or red (temporary).\n\n"
-    "IMPORTANT — Leading zeros:\n"
-    "- The district/RTO code is ALWAYS 2 digits on the physical plate (e.g. 01, 04, 09). "
-    "Always include leading zeros: KA01, not KA1.\n"
-    "- The trailing number is ALWAYS 4 digits (e.g. 0045, 0500). "
-    "Always include leading zeros: MR0045, not MR45 or MR5.\n"
-    "- Example: the plate 'KA 01 MR 0045' must be returned as KA01MR0045, "
-    "never KA1MR45 or KA1MR5.\n\n"
-    "Rules for reading plates:\n"
-    "- Read each plate exactly as printed, preserving all leading zeros.\n"
-    "- Use UPPERCASE letters and digits only.\n"
-    "- Remove all spaces, dashes, dots, bullet separators, and special characters.\n"
-    "- Indian plates often use a bullet (•) or dash between groups — ignore those.\n"
-    "- Common OCR confusions on Indian plates: 0↔O, 1↔I, 8↔B, 5↔S, 2↔Z. "
-    "Use the known Indian plate structure to resolve ambiguity "
-    "(state code must be letters, district code must be digits, etc.).\n"
-    "- Do NOT invent or hallucinate plate numbers.\n\n"
-    "For each plate, rate your confidence:\n"
-    "- \"high\"  = plate is large, clear, fully visible\n"
-    "- \"medium\" = plate is readable but small or slightly angled\n"
-    "- \"low\"   = plate is distant, blurry, or partially obscured "
-    "(you should usually omit these)\n\n"
+    "### ROLE\n"
+    "You are an expert Indian vehicle license plate recognition system analyzing parking lot camera feeds.\n\n"
+    "### CORE TASKS\n"
+    "1. Detect if any vehicle (car, truck, bus, motorcycle, auto-rickshaw) is visible.\n"
+    "2. Extract clearly readable license plate numbers.\n"
+    "3. Ignore non-plate text like phone numbers, fleet numbers, vehicle model names, or background signage.\n\n"
+    "### REJECTION CRITERIA (WHEN TO SKIP A PLATE)\n"
+    "Do NOT guess. Return NO plate if it meets ANY of these conditions:\n"
+    "- Too small, distant, blurry, or washed out by glare.\n"
+    "- At an extreme angle making characters ambiguous.\n"
+    "- Partially obscured, dirty, or faded, making characters illegible.\n"
+    "- CROPPED or CUT OFF at the edge of the image boundary.\n"
+    "- Fewer than half the characters are confidently legible.\n\n"
+    "### INDIAN LICENSE PLATE RULES\n"
+    "1. Standard Format: SS DD XX NNNN\n"
+    "   - SS: State code (2 letters, e.g., MH, DL, KA, TS, AP, UP).\n"
+    "   - DD: District/RTO code (ALWAYS 2 digits, e.g., '01', '09'). MUST include leading zeros.\n"
+    "   - XX: Series (1-3 letters).\n"
+    "   - NNNN: Number (ALWAYS 4 digits, e.g., '0045', '0500'). MUST include leading zeros.\n"
+    "2. Bharat Series: BH DD YYYY XXNNNN (e.g., BH02AA1234).\n"
+    "3. Multi-line Plates: Plates on motorcycles and commercial vehicles are often split across "
+    "two lines. Read the top line first, then the bottom line, and combine into a single string.\n"
+    "4. Formatting: UPPERCASE only. Remove all spaces, dashes, dots, or bullets (•). "
+    "Do not hallucinate characters.\n\n"
+    "### OCR ERROR CORRECTION\n"
+    "- Watch for common visual confusions: 0↔O, 1↔I, 8↔B, 5↔S, 2↔Z.\n"
+    "- Use the strict SS-DD-XX-NNNN structure to resolve ambiguities "
+    "(e.g., if the state code looks like 'M8', it is 'MH').\n\n"
+    "### CONFIDENCE SCORING\n"
+    "- 'high': Large, perfectly clear, directly facing the camera.\n"
+    "- 'medium': Readable, but smaller, slightly angled, or in dim lighting.\n"
+    "- 'low': Barely legible (usually omit these).\n\n"
     "Respond with ONLY valid JSON (no markdown, no code fences):\n"
-    '{"vehicle_detected": true/false, "plates": [{"plate_text": "PLATE1", "confidence": "high"}, ...]}\n\n'
-    "If no vehicle is visible, respond:\n"
-    '{"vehicle_detected": false, "plates": []}\n\n'
-    "If vehicles are visible but no plates are clearly readable, respond:\n"
-    '{"vehicle_detected": true, "plates": []}'
+    '{"vehicle_detected": true/false, "plates": [{"plate_text": "KA01MR0045", "confidence": "high"}]}\n'
+    "If no vehicle is visible or no plates are clearly readable, return:\n"
+    '{"vehicle_detected": false, "plates": []}'
 )
 
 
@@ -112,9 +100,13 @@ def _get_openai_client():
         if not api_key:
             raise RuntimeError(
                 "OPENAI_API_KEY environment variable is not set. "
-                "Set it to use GPT-4o for license plate reading."
+                "Set it to use OpenAI vision for license plate reading."
             )
-        _openai_client = OpenAI(api_key=api_key)
+        _openai_client = OpenAI(
+            api_key=api_key,
+            timeout=60.0,       # 60 s per-request timeout (image uploads)
+            max_retries=2,      # automatic retry on transient failures
+        )
         log.info("OpenAI client initialised (model: %s)", OPENAI_MODEL)
     return _openai_client
 
@@ -128,12 +120,45 @@ def _encode_image_to_base64(image: np.ndarray) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Core: single GPT-4o vision call
+# Core: single OpenAI vision call (Structured Outputs)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Strict JSON schema — guarantees the model returns exactly this structure.
+_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "license_plate_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "vehicle_detected": {"type": "boolean"},
+                "plates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "plate_text": {"type": "string"},
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low"],
+                            },
+                        },
+                        "required": ["plate_text", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["vehicle_detected", "plates"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 def _call_openai_vision(image: np.ndarray) -> dict:
     """
-    Send the full scene image to GPT-4o vision.
+    Send the full scene image to OpenAI vision.
 
     Returns parsed dict: {"vehicle_detected": bool, "plates": [str, ...]}
     Falls back to {"vehicle_detected": False, "plates": []} on any error.
@@ -144,8 +169,8 @@ def _call_openai_vision(image: np.ndarray) -> dict:
         client = _get_openai_client()
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
-            max_tokens=OPENAI_MAX_TOKENS,
-            response_format={"type": "json_object"},
+            max_completion_tokens=OPENAI_MAX_COMPLETION_TOKENS,
+            response_format=_RESPONSE_SCHEMA,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {
@@ -175,29 +200,17 @@ def _call_openai_vision(image: np.ndarray) -> dict:
         if not isinstance(plates_raw, list):
             plates_raw = []
 
-        # Normalise: accept both old format (list of strings) and new format (list of dicts)
+        # Map confidence labels to numeric scores and filter by threshold
         plates_out: list = []
         for entry in plates_raw:
-            if isinstance(entry, str):
-                plates_out.append({"plate_text": entry, "confidence": 1.0})
-            elif isinstance(entry, dict):
-                text = entry.get("plate_text", "")
-                conf_label = entry.get("confidence", "medium")
-                conf_score = _CONFIDENCE_SCORES.get(conf_label)
-                if conf_score is None:
-                    log.warning("Unknown confidence label %r for plate %s, treating as low", conf_label, text)
-                    conf_score = _CONFIDENCE_SCORES["low"]
+            text = entry.get("plate_text", "")
+            conf_label = entry.get("confidence", "medium")
+            conf_score = _CONFIDENCE_SCORES.get(conf_label, _CONFIDENCE_SCORES["low"])
+            if conf_score >= PLATE_MIN_CONFIDENCE:
                 plates_out.append({"plate_text": text, "confidence": conf_score})
-
-        # Filter by confidence threshold (single pass)
-        kept: list = []
-        for p in plates_out:
-            if p["confidence"] >= PLATE_MIN_CONFIDENCE:
-                kept.append(p)
             else:
                 log.info("Dropping low-confidence plate: %s (%.1f < %.1f)",
-                         p["plate_text"], p["confidence"], PLATE_MIN_CONFIDENCE)
-        plates_out = kept
+                         text, conf_score, PLATE_MIN_CONFIDENCE)
 
         return {
             "vehicle_detected": vehicle,
@@ -206,7 +219,7 @@ def _call_openai_vision(image: np.ndarray) -> dict:
         }
 
     except json.JSONDecodeError as e:
-        log.error("Failed to parse GPT-4o JSON response: %s", e)
+        log.error("Failed to parse LLM JSON response: %s", e)
         return {"vehicle_detected": False, "plates": [], "plates_detail": []}
     except Exception as e:
         log.error("OpenAI vision API call failed: %s", e)
@@ -237,7 +250,7 @@ def _fix_confusables(plate: str) -> Optional[str]:
       SS = 2 letters (state), DD = 1-2 digits (district),
       XX = 1-3 letters (series), NNNN = 1-4 digits (number).
 
-    When GPT-4o misreads e.g. 'Z' as '2', the character lands in the wrong
+    When the model misreads e.g. 'Z' as '2', the character lands in the wrong
     group and the regex fails.  This function tries every valid group-size
     split, translates confusable chars into the expected type, and returns
     the first candidate that satisfies the regex.
@@ -339,7 +352,7 @@ def extract_license_plate(image_path) -> dict:
 
 def extract_all_license_plates(image_path) -> dict:
     """
-    Extract ALL license plates from an image file using a single GPT-4o call.
+    Extract ALL license plates from an image file using a single OpenAI vision call.
 
     Args:
         image_path: Path to the image file.
