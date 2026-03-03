@@ -112,6 +112,20 @@
         color: var(--muted); font-size: 0.65rem;
       }
 
+      .thumb-load-btn {
+        width: 80px; height: 56px; border-radius: 6px;
+        border: 1px dashed var(--border);
+        background: rgba(42, 51, 80, 0.45);
+        color: var(--muted);
+        font-size: 0.68rem;
+        cursor: pointer;
+        transition: border-color 0.2s, color 0.2s;
+      }
+      .thumb-load-btn:hover {
+        border-color: var(--accent);
+        color: var(--text);
+      }
+
       .challan-empty {
         display: flex; flex-direction: column; align-items: center; justify-content: center;
         padding: 80px 20px; color: var(--muted); text-align: center;
@@ -298,6 +312,8 @@
         return path.split('/').pop().split('\\').pop();
       }
 
+      const INITIAL_IMAGE_ROWS = 5;
+
       function openLightbox(src) {
         document.getElementById('lightboxImg').src = src;
         document.getElementById('lightbox').classList.add('active');
@@ -376,10 +392,22 @@
       }
 
       // ── Image HTML helpers ────────────────────────────────────────
-      function thumbHtml(path, alt) {
+      function thumbHtml(path, alt, shouldLoad) {
         const f = filenameFromPath(path);
         if (!f) return '<div class="no-thumb">No image</div>';
-        return `<img class="thumb" src="/snapshots/${f}" alt="${alt}" onclick="event.stopPropagation();openLightbox('/snapshots/${f}')" />`;
+        const src = `/snapshots/${f}`;
+        if (shouldLoad) {
+          return `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${alt}" loading="lazy" /></a>`;
+        }
+        return `<button class="thumb-load-btn" type="button" data-src="${src}" data-alt="${alt}" onclick="loadThumb(this)">Load image</button>`;
+      }
+
+      function loadThumb(btn) {
+        if (!btn) return;
+        const src = btn.dataset.src;
+        const alt = btn.dataset.alt || 'snapshot';
+        if (!src) return;
+        btn.outerHTML = `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${alt}" loading="lazy" /></a>`;
       }
 
       function platesChips(plates) {
@@ -455,7 +483,8 @@
         updateStats(plateGroups);
 
         let html = '';
-        for (const g of plateGroups) {
+        plateGroups.forEach((g, index) => {
+          const shouldLoadImages = index < INITIAL_IMAGE_ROWS;
           const challanBadge = g.challan
             ? '<span class="challan-badge yes">🚨 YES</span>'
             : '<span class="challan-badge no">✅ NO</span>';
@@ -463,12 +492,12 @@
           html += `<tr>
             <td><span class="plate-badge">${g.plate}</span></td>
             <td>${fmtTime(g.first_time)}</td>
-            <td>${thumbHtml(g.first_image, '1st detection')}</td>
+            <td>${thumbHtml(g.first_image, '1st detection', shouldLoadImages)}</td>
             <td>${fmtTime(g.second_time)}</td>
-            <td>${thumbHtml(g.second_image, '2nd detection')}</td>
+            <td>${thumbHtml(g.second_image, '2nd detection', shouldLoadImages)}</td>
             <td>${challanBadge}</td>
           </tr>`;
-        }
+        });
 
         tbody.innerHTML = html;
       }

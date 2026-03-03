@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -33,6 +33,8 @@ def parse_events_from_log(event_log_path: Path,
                 if not ts_str:
                     continue
                 ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
 
                 if cutoff and ts < cutoff:
                     continue
@@ -137,8 +139,13 @@ def build_dwell_distribution(all_dwells: list[dict], zone: str | None = None) ->
     }
 
 
-def build_hourly_incidents(state_changes: list) -> list[dict]:
+def build_hourly_incidents(state_changes: list,
+                           start: datetime | None = None,
+                           end: datetime | None = None) -> list[dict]:
     """Group FREE→OCCUPIED transitions by hour for charting.
+
+    If ``start`` and ``end`` are provided, includes empty hourly buckets in
+    that range so charts can render continuous windows up to "now".
 
     Returns a sorted list of ``{"hour": "2026-03-02T11:00", "all": int, "zones": {"B": int}}``.
     """
@@ -147,9 +154,17 @@ def build_hourly_incidents(state_changes: list) -> list[dict]:
     for change in state_changes:
         if change.get("prev_state") == "FREE" and change.get("new_state") == "OCCUPIED":
             ts: datetime = change["ts"]
-            hour_key = ts.strftime("%Y-%m-%dT%H:00")
+            hour_key = ts.replace(minute=0, second=0, microsecond=0).isoformat()
             zone = change.get("zone", "A")
             hourly[hour_key][zone] += 1
+
+    if start and end and start <= end:
+        current = start.replace(minute=0, second=0, microsecond=0)
+        end_hour = end.replace(minute=0, second=0, microsecond=0)
+        while current <= end_hour:
+            hour_key = current.isoformat()
+            _ = hourly[hour_key]
+            current += timedelta(hours=1)
 
     result = []
     for hour_key in sorted(hourly.keys()):

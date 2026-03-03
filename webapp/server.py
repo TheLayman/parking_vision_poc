@@ -1240,7 +1240,8 @@ def analytics_summary(range: str = Query(default="24h"),
     """Returns unauthorized parking analytics data."""
     time_deltas = {"1h": timedelta(hours=1), "6h": timedelta(hours=6), "24h": timedelta(hours=24), "7d": timedelta(days=7), "all": None}
     delta = time_deltas.get(range)
-    cutoff = (datetime.now(timezone.utc) - delta) if delta else None
+    now_ts = datetime.now(timezone.utc)
+    cutoff = (now_ts - delta) if delta else None
 
     parsed = parse_events_from_log(EVENT_LOG_PATH, cutoff)
     snapshots = parsed["snapshots"]
@@ -1275,8 +1276,12 @@ def analytics_summary(range: str = Query(default="24h"),
     # Dwell distribution buckets
     dwell_distribution = build_dwell_distribution(all_dwells, zone=zone)
 
-    # Hourly incidents series (always full — frontend filters visually)
-    hourly_incidents = build_hourly_incidents(state_changes)
+    # Hourly incidents series (continuous buckets for bounded ranges)
+    hourly_incidents = build_hourly_incidents(
+        state_changes,
+        start=cutoff if delta else None,
+        end=now_ts if delta else None,
+    )
 
     # Challan summary
     challan_summary = build_challan_summary(challans, zone=zone)
