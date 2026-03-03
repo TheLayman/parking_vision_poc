@@ -80,7 +80,7 @@ async def _lifespan(application: FastAPI):
     yield
     _shutdown()
 
-app = FastAPI(title="Parking Vision Dashboard", lifespan=_lifespan)
+app = FastAPI(title="Unauthorized Parking POC", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
 _shutdown_event = threading.Event()

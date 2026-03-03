@@ -155,28 +155,49 @@
             <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
             <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
           </svg>
-          Challan Dashboard
+          Unauthorized Parking POC
+        </div>
+        <div class="tab-bar">
+          <a class="tab-btn" href="/" data-tab="dashboard" style="text-decoration:none;">Dashboard</a>
+          <a class="tab-btn" href="/?tab=analytics" data-tab="analytics" style="text-decoration:none;">Analytics</a>
+          <a class="tab-btn" href="/?tab=alerts" data-tab="alerts" style="text-decoration:none;">Alerts</a>
+          <a class="tab-btn active" href="/challan-dashboard" data-tab="challans" style="text-decoration:none;">Challans</a>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="tab-settings-wrap">
+          <button class="tab-settings-btn" onclick="toggleTabSettings()" title="Show/Hide Tabs">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+          <div class="tab-settings-dropdown" id="tabSettingsDropdown">
+            <div class="tab-settings-title">Visible Tabs</div>
+            <label class="tab-toggle">
+              <span>Dashboard</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('dashboard', this.checked)" data-tab-toggle="dashboard">
+            </label>
+            <label class="tab-toggle">
+              <span>Analytics</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('analytics', this.checked)" data-tab-toggle="analytics">
+            </label>
+            <label class="tab-toggle">
+              <span>Alerts</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('alerts', this.checked)" data-tab-toggle="alerts">
+            </label>
+            <label class="tab-toggle">
+              <span>Challans</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('challans', this.checked)" data-tab-toggle="challans">
+            </label>
+          </div>
         </div>
       </div>
     </header>
 
     <main class="challan-page">
-      <a href="/" class="back-link">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
-        </svg>
-        Back to Dashboard
-      </a>
 
       <!-- Stats -->
       <div class="challan-stats" id="challanStats">
-        <div class="challan-stat">
-          <div class="challan-stat-icon">�</div>
-          <div>
-            <div class="challan-stat-value" id="statIncidents">--</div>
-            <div class="challan-stat-label">Unique Slots</div>
-          </div>
-        </div>
         <div class="challan-stat">
           <div class="challan-stat-icon">📋</div>
           <div>
@@ -349,9 +370,6 @@
         const totalPlates = plateGroups.length;
         const challanCount = plateGroups.filter(g => g.challan).length;
         const clearedCount = totalPlates - challanCount;
-        const uniqueSlots = new Set(plateGroups.flatMap(g => g.slots)).size;
-
-        document.getElementById('statIncidents').textContent = uniqueSlots;
         document.getElementById('statTotal').textContent = totalPlates;
         document.getElementById('statChallans').textContent = challanCount;
         document.getElementById('statCleared').textContent = clearedCount;
@@ -380,9 +398,10 @@
         const map = new Map();
         for (const r of records) {
           const plate = r.plate_text || 'UNKNOWN';
-          // Use capture_session_id as the primary key; fall back to plate
-          // for legacy records that lack a session id.
-          const key = r.capture_session_id || plate;
+          // Use capture_session_id + plate as the primary key so that
+          // multiple plates from the same capture each get their own row.
+          // Fall back to plate alone for legacy records without a session id.
+          const key = r.capture_session_id ? `${r.capture_session_id}_${plate}` : plate;
           if (!map.has(key)) {
             map.set(key, {
               plate,
@@ -481,6 +500,55 @@
 
       // Fallback polling every 60s (in case SSE drops)
       setInterval(loadChallans, 60000);
+
+      // ── Tab visibility settings (shared with main dashboard) ──────
+      const TAB_VIS_KEY = 'parking_tab_visibility';
+
+      function _loadTabVisibility() {
+        try {
+          const saved = localStorage.getItem(TAB_VIS_KEY);
+          if (saved) return JSON.parse(saved);
+        } catch {}
+        return { dashboard: true, analytics: true, alerts: true, challans: true };
+      }
+
+      function _saveTabVisibility(vis) {
+        localStorage.setItem(TAB_VIS_KEY, JSON.stringify(vis));
+      }
+
+      function toggleTabSettings() {
+        document.getElementById('tabSettingsDropdown').classList.toggle('open');
+      }
+
+      document.addEventListener('click', function(e) {
+        const wrap = document.querySelector('.tab-settings-wrap');
+        if (wrap && !wrap.contains(e.target)) {
+          document.getElementById('tabSettingsDropdown').classList.remove('open');
+        }
+      });
+
+      function toggleTabVisibility(tabKey, visible) {
+        const vis = _loadTabVisibility();
+        vis[tabKey] = visible;
+        _saveTabVisibility(vis);
+        _applyTabVisibility(vis);
+      }
+
+      function _applyTabVisibility(vis) {
+        if (!vis) vis = _loadTabVisibility();
+        document.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+          const key = btn.dataset.tab;
+          if (key && vis[key] !== undefined) {
+            btn.style.display = vis[key] ? '' : 'none';
+          }
+        });
+        document.querySelectorAll('[data-tab-toggle]').forEach(cb => {
+          const key = cb.getAttribute('data-tab-toggle');
+          if (vis[key] !== undefined) cb.checked = vis[key];
+        });
+      }
+
+      _applyTabVisibility();
     </script>
   </body>
 </html>

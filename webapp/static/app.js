@@ -52,6 +52,73 @@ function switchTab(tabId) {
   }
 }
 
+// ── Tab visibility settings ─────────────────────────────────────────────────
+const TAB_VIS_KEY = 'parking_tab_visibility';
+
+function _loadTabVisibility() {
+  try {
+    const saved = localStorage.getItem(TAB_VIS_KEY);
+    if (saved) return JSON.parse(saved);
+  } catch {}
+  return { dashboard: true, analytics: true, alerts: true, challans: true };
+}
+
+function _saveTabVisibility(vis) {
+  localStorage.setItem(TAB_VIS_KEY, JSON.stringify(vis));
+}
+
+function toggleTabSettings() {
+  document.getElementById('tabSettingsDropdown').classList.toggle('open');
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+  const wrap = document.querySelector('.tab-settings-wrap');
+  if (wrap && !wrap.contains(e.target)) {
+    document.getElementById('tabSettingsDropdown').classList.remove('open');
+  }
+});
+
+function toggleTabVisibility(tabKey, visible) {
+  const vis = _loadTabVisibility();
+  vis[tabKey] = visible;
+  _saveTabVisibility(vis);
+  _applyTabVisibility(vis);
+}
+
+function _applyTabVisibility(vis) {
+  if (!vis) vis = _loadTabVisibility();
+  // Tab buttons (all tabs now have data-tab, including Challans)
+  document.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+    const key = btn.dataset.tab;
+    if (key && vis[key] !== undefined) {
+      btn.style.display = vis[key] ? '' : 'none';
+    }
+  });
+  // Sync checkboxes
+  document.querySelectorAll('[data-tab-toggle]').forEach(cb => {
+    const key = cb.getAttribute('data-tab-toggle');
+    if (vis[key] !== undefined) cb.checked = vis[key];
+  });
+  // If the currently active tab is hidden, switch to the first visible one
+  const activeBtn = document.querySelector('.tab-btn.active[data-tab]');
+  if (activeBtn && activeBtn.style.display === 'none') {
+    const firstVisible = document.querySelector('.tab-btn[data-tab]:not([style*="display: none"])');
+    if (firstVisible) switchTab(firstVisible.dataset.tab);
+  }
+}
+
+// Apply on page load
+document.addEventListener('DOMContentLoaded', function() {
+  _applyTabVisibility();
+  // Handle ?tab= query param from cross-page navigation
+  const params = new URLSearchParams(window.location.search);
+  const requestedTab = params.get('tab');
+  if (requestedTab && ['dashboard', 'analytics', 'alerts'].includes(requestedTab)) {
+    switchTab(requestedTab);
+  }
+});
+
 // Chart instances
 let occupancyChart = null;
 let dwellChart = null;
@@ -390,8 +457,7 @@ function computeTotals(zones) {
 }
 
 function renderSummary(freeCount, totalCount) {
-  const el = document.getElementById("summary");
-  el.textContent = `Free: ${freeCount}/${totalCount}`;
+  // Summary display removed
 }
 
 function renderZones(zones) {
