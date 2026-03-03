@@ -799,6 +799,12 @@ html, body {
   padding: 10px;
 }
 
+.analytics-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
 /* Stats Row */
 .stats-row {
   display: grid;
@@ -824,6 +830,45 @@ html, body {
   transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(99, 102, 241, 0.15);
 }
+
+/* Accent colors for different stat card types */
+.stat-card--incidents .stat-icon {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.2) 0%, rgba(239, 68, 68, 0.1) 100%);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.stat-card--incidents:hover { border-color: #ef4444; box-shadow: 0 8px 25px rgba(239, 68, 68, 0.15); }
+
+.stat-card--duration .stat-icon {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.2) 0%, rgba(245, 158, 11, 0.1) 100%);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+.stat-card--duration:hover { border-color: #f59e0b; box-shadow: 0 8px 25px rgba(245, 158, 11, 0.15); }
+
+.stat-card--challans .stat-icon {
+  background: linear-gradient(135deg, rgba(168, 85, 247, 0.2) 0%, rgba(168, 85, 247, 0.1) 100%);
+  border: 1px solid rgba(168, 85, 247, 0.3);
+}
+.stat-card--challans:hover { border-color: #a855f7; box-shadow: 0 8px 25px rgba(168, 85, 247, 0.15); }
+
+.stat-card--gt15 .stat-icon,
+.stat-card--gt30 .stat-icon {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(16, 185, 129, 0.1) 100%);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.stat-card--gt15:hover,
+.stat-card--gt30:hover { border-color: #10b981; box-shadow: 0 8px 25px rgba(16, 185, 129, 0.15); }
+
+.stat-card--gt45 .stat-icon {
+  background: linear-gradient(135deg, rgba(251, 146, 60, 0.2) 0%, rgba(251, 146, 60, 0.1) 100%);
+  border: 1px solid rgba(251, 146, 60, 0.3);
+}
+.stat-card--gt45:hover { border-color: #fb923c; box-shadow: 0 8px 25px rgba(251, 146, 60, 0.15); }
+
+.stat-card--gt1h .stat-icon {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.25) 0%, rgba(220, 38, 38, 0.15) 100%);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.stat-card--gt1h:hover { border-color: #ef4444; box-shadow: 0 8px 25px rgba(239, 68, 68, 0.2); }
 
 .stat-icon {
   font-size: 32px;
@@ -1068,11 +1113,19 @@ html, body {
   }
   
   .stats-row {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(3, 1fr);
   }
 }
 
 @media (max-width: 768px) {
+  .stats-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .analytics-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
   .topbar-left {
     flex-direction: column;
     align-items: flex-start;

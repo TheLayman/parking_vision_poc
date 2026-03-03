@@ -30,6 +30,8 @@ from webapp.helpers.slot_meta import (
 from webapp.helpers.analytics import (
     parse_events_from_log, build_occupancy_series,
     calculate_dwell_times, predict_occupancy,
+    build_dwell_distribution, build_hourly_incidents,
+    build_challan_summary,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -103,7 +105,9 @@ _slots_snapshot_dirty = False
 # In-memory alerts ring buffer (avoids full log scan on /alerts)
 _alerts_buffer: list[dict] = []  # state-change alerts
 _camera_captures: dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
+_camera_captures_order: list[tuple] = []  # insertion-order keys for LRU eviction
 _ALERTS_MAX = 500
+_CAMERA_CAPTURES_MAX = 1000  # cap to prevent unbounded memory growth
 
 # ── Challan (parking violation) tracking ──────────────────────────────────────
 # Challan re-check interval in seconds (70s × 2 checks ≈ detect >2 min stays)
@@ -177,6 +181,7 @@ CHIRPSTACK_APP_ID = os.getenv("CHIRPSTACK_APP_ID", "")  # Application UUID to fe
 _mqtt_client = None
 _mqtt_previous_states: dict[int, str] = {}
 _mqtt_last_snapshot_time = None
+_mqtt_last_logged_occupied: set[int] | None = None  # suppress identical periodic snapshots
 
 # Device mapping for command queuing: slot_id -> {"applicationId": str, "devEui": str}
 _device_map: dict[int, dict] = {}
@@ -326,12 +331,18 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         event["mqtt_event_ts"] = mqtt_event_ts
     try:
         append_jsonl(EVENT_LOG_PATH, event, lock=_event_log_lock)
-        _camera_captures[(slot_id, timestamp_str)] = {
+        cap_key = (slot_id, timestamp_str)
+        _camera_captures[cap_key] = {
             "image_path": image_path,
             "license_plate": license_plate,
             "license_plates": license_plates,
             "vehicle_detected": vehicle_detected,
         }
+        _camera_captures_order.append(cap_key)
+        # Evict oldest entries when over cap
+        while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
+            old_key = _camera_captures_order.pop(0)
+            _camera_captures.pop(old_key, None)
     except Exception as e:
         log.error("Error logging camera capture: %s", e)
 
@@ -761,7 +772,7 @@ def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
 
 def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, meta_by_id: dict[int, dict]):
     """Process sensor data from MQTT and update occupancy state."""
-    global _mqtt_previous_states, _mqtt_last_snapshot_time, _state_cache, _slots_snapshot_dirty
+    global _mqtt_previous_states, _mqtt_last_snapshot_time, _state_cache, _slots_snapshot_dirty, _mqtt_last_logged_occupied
 
     all_configured_ids = sorted(meta_by_id.keys())
 
@@ -813,11 +824,14 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, met
 
     zones_stats, free_count, total_count = calculate_zone_stats(all_configured_ids, occupied_ids, meta_by_id)
 
-    # Log snapshot periodically or on state changes
+    # Log snapshot on state changes, or periodically (5 min) only when occupancy actually changed
     if _mqtt_last_snapshot_time is None:
         _mqtt_last_snapshot_time = timestamp
 
-    if has_state_changes or (timestamp - _mqtt_last_snapshot_time) >= timedelta(minutes=1):
+    periodic_due = (timestamp - _mqtt_last_snapshot_time) >= timedelta(minutes=5)
+    occupancy_changed = (_mqtt_last_logged_occupied is None or occupied_ids != _mqtt_last_logged_occupied)
+
+    if has_state_changes or (periodic_due and occupancy_changed):
         events_to_log.append({
             "event": "snapshot",
             "ts": timestamp_str,
@@ -827,7 +841,12 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, met
             "free_count": free_count
         })
         _mqtt_last_snapshot_time = timestamp
+        _mqtt_last_logged_occupied = set(occupied_ids)
         # Flush in-memory snapshot to disk periodically
+        _flush_snapshot_to_disk()
+    elif periodic_due:
+        # Occupancy unchanged — still flush in-memory state & reset timer, but skip the log line
+        _mqtt_last_snapshot_time = timestamp
         _flush_snapshot_to_disk()
 
     _log_events_to_file(events_to_log)
@@ -1078,6 +1097,11 @@ def _init_alerts_from_log():
                 "license_plates": obj.get("license_plates", []),
                 "vehicle_detected": obj.get("vehicle_detected", True),
             }
+            _camera_captures_order.append(key)
+    # Evict oldest camera captures over cap
+    while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
+        old_key = _camera_captures_order.pop(0)
+        _camera_captures.pop(old_key, None)
     # Keep only the last N alerts
     while len(_alerts_buffer) > _ALERTS_MAX:
         _alerts_buffer.pop(0)
@@ -1211,39 +1235,78 @@ async def events(request: Request):
             _active_streams -= 1
 
 @app.get("/analytics/summary")
-def analytics_summary(range: str = Query(default="24h")):
-    """Returns analytics data: occupancy series, dwell stats, predictions, summary."""
+def analytics_summary(range: str = Query(default="24h"),
+                      zone: str = Query(default=None)):
+    """Returns unauthorized parking analytics data."""
     time_deltas = {"1h": timedelta(hours=1), "6h": timedelta(hours=6), "24h": timedelta(hours=24), "7d": timedelta(days=7), "all": None}
     delta = time_deltas.get(range)
     cutoff = (datetime.now(timezone.utc) - delta) if delta else None
 
-    snapshots, state_changes = parse_events_from_log(EVENT_LOG_PATH, cutoff)
-    occupancy_series = build_occupancy_series(snapshots)
-    dwell_stats = calculate_dwell_times(state_changes)
-    predictions = predict_occupancy(occupancy_series)
+    parsed = parse_events_from_log(EVENT_LOG_PATH, cutoff)
+    snapshots = parsed["snapshots"]
+    state_changes = parsed["state_changes"]
+    challans = parsed["challans"]
 
-    current_occupancy = {}
-    if snapshots:
-        for zone, stats in snapshots[-1].get("zone_stats", {}).items():
-            total = stats.get("total", 0)
-            occupied = stats.get("occupied", 0)
-            current_occupancy[zone] = {
-                "occupied": occupied,
-                "total": total,
-                "percent": round((occupied / total * 100) if total > 0 else 0, 1)
-            }
+    # Collect available zones
+    all_zones = sorted({sc["zone"] for sc in state_changes} | {c["zone"] for c in challans})
+
+    # Filter by zone if requested
+    if zone:
+        state_changes_filtered = [sc for sc in state_changes if sc["zone"] == zone]
+        challans_filtered = [c for c in challans if c["zone"] == zone]
+    else:
+        state_changes_filtered = state_changes
+        challans_filtered = challans
+
+    # Total unauthorized incidents = FREE→OCCUPIED transitions
+    incidents = [sc for sc in state_changes_filtered
+                 if sc.get("prev_state") == "FREE" and sc.get("new_state") == "OCCUPIED"]
+    total_incidents = len(incidents)
+
+    # Dwell times (always compute from full data, then filter)
+    dwell_result = calculate_dwell_times(state_changes)
+    all_dwells = dwell_result["all_dwells"]
+    avg_dwell = dwell_result["avg"]
+
+    # Average parking time for the selected zone
+    dwells_filtered = all_dwells if zone is None else [d for d in all_dwells if d["zone"] == zone]
+    avg_parking_minutes = round(sum(d["minutes"] for d in dwells_filtered) / len(dwells_filtered), 1) if dwells_filtered else 0
+
+    # Dwell distribution buckets
+    dwell_distribution = build_dwell_distribution(all_dwells, zone=zone)
+
+    # Hourly incidents series (always full — frontend filters visually)
+    hourly_incidents = build_hourly_incidents(state_changes)
+
+    # Challan summary
+    challan_summary = build_challan_summary(challans, zone=zone)
+
+    # Per-zone stats
+    zone_stats = {}
+    for z in all_zones:
+        z_incidents = [sc for sc in state_changes
+                       if sc.get("prev_state") == "FREE" and sc.get("new_state") == "OCCUPIED"
+                       and sc["zone"] == z]
+        z_dwells = [d for d in all_dwells if d["zone"] == z]
+        z_avg = round(sum(d["minutes"] for d in z_dwells) / len(z_dwells), 1) if z_dwells else 0
+        z_challan = build_challan_summary(challans, zone=z)
+        z_dist = build_dwell_distribution(all_dwells, zone=z)
+        zone_stats[z] = {
+            "total_incidents": len(z_incidents),
+            "avg_parking_minutes": z_avg,
+            "challans_generated": z_challan["confirmed"],
+            "dwell_distribution": z_dist,
+        }
 
     return {
-        "occupancy_series": occupancy_series,
-        "dwell_stats": dwell_stats,
-        "predictions": predictions,
-        "current_occupancy": current_occupancy,
-        "summary": {
-            "total_events": len(state_changes),
-            "total_snapshots": len(snapshots),
-            "time_range": range,
-            "data_points": len(occupancy_series)
-        }
+        "total_incidents": total_incidents,
+        "avg_parking_minutes": avg_parking_minutes,
+        "challans_generated": challan_summary["confirmed"],
+        "dwell_distribution": dwell_distribution,
+        "hourly_incidents": hourly_incidents,
+        "zones": all_zones,
+        "zone_stats": zone_stats,
+        "time_range": range,
     }
 
 

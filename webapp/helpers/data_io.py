@@ -49,10 +49,15 @@ def append_jsonl_batch(path: Path, records: list[dict],
 
 
 def load_jsonl_records(path: Path, max_records: int) -> list[dict]:
-    """Load JSONL records from *path*, keeping at most *max_records*."""
-    records: list[dict] = []
+    """Load JSONL records from *path*, keeping at most the last *max_records*.
+
+    Uses a collections.deque to cap memory usage instead of reading all
+    records then trimming.
+    """
+    from collections import deque
+    ring: deque[dict] = deque(maxlen=max_records)
     if not path.exists():
-        return records
+        return []
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -60,14 +65,12 @@ def load_jsonl_records(path: Path, max_records: int) -> list[dict]:
                 if not line:
                     continue
                 try:
-                    records.append(json.loads(line))
+                    ring.append(json.loads(line))
                 except Exception:
                     continue
-        while len(records) > max_records:
-            records.pop(0)
     except Exception as e:
         log.error("Error loading records from %s: %s", path, e)
-    return records
+    return list(ring)
 
 
 # ── YAML helpers ──────────────────────────────────────────────────────────────

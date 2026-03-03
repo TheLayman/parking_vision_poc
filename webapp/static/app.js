@@ -120,9 +120,10 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // Chart instances
-let occupancyChart = null;
-let dwellChart = null;
-let predictionChart = null;
+let hourlyIncidentsChart = null;
+
+// Analytics data cache (to avoid re-fetching on zone filter change)
+let analyticsDataCache = null;
 
 // Alerts state
 let alertsCache = [];
@@ -164,256 +165,166 @@ const chartDefaults = {
 
 async function loadAnalytics() {
   const range = document.getElementById('timeRange')?.value || '24h';
+  const zone = document.getElementById('zoneFilter')?.value || '';
 
   try {
-    const res = await fetch(`/analytics/summary?range=${range}`);
+    const url = `/analytics/summary?range=${range}` + (zone ? `&zone=${zone}` : '');
+    const res = await fetch(url);
     const data = await res.json();
 
-    const hasData = data.occupancy_series && data.occupancy_series.length > 0;
+    analyticsDataCache = data;
+
+    const hasData = data.total_incidents > 0 || (data.hourly_incidents && data.hourly_incidents.length > 0);
 
     // Show/hide empty state
     document.querySelector('.analytics-grid').style.display = hasData ? 'grid' : 'none';
     document.querySelector('.stats-row').style.display = hasData ? 'grid' : 'none';
     document.getElementById('analyticsEmpty').style.display = hasData ? 'none' : 'flex';
 
+    // Populate zone filter dropdown (preserve selection)
+    populateZoneFilter(data.zones || []);
+
     if (!hasData) return;
 
-    renderOccupancyChart(data.occupancy_series);
-    renderDwellChart(data.dwell_stats);
-    renderPredictionChart(data.predictions, data.current_occupancy);
-    renderStatsRow(data);
-    renderPredictionsGrid(data.predictions, data.current_occupancy);
+    renderIncidentStats(data);
+    renderHourlyIncidentsChart(data.hourly_incidents, zone);
 
   } catch (err) {
     console.error('Failed to load analytics:', err);
   }
 }
 
-function renderOccupancyChart(series) {
-  const ctx = document.getElementById('occupancyChart')?.getContext('2d');
+function onAnalyticsFilterChange() {
+  loadAnalytics();
+}
+
+function populateZoneFilter(zones) {
+  const select = document.getElementById('zoneFilter');
+  if (!select) return;
+  const current = select.value;
+  // Keep "All Zones" as first option
+  const options = '<option value="">All Zones</option>' +
+    zones.map(z => `<option value="${z}"${z === current ? ' selected' : ''}>Zone ${z}</option>`).join('');
+  select.innerHTML = options;
+}
+
+function renderIncidentStats(data) {
+  document.getElementById('statIncidents').textContent = data.total_incidents || 0;
+  const avgMin = data.avg_parking_minutes;
+  document.getElementById('statAvgDuration').textContent = avgMin > 0 ? `${avgMin} min` : '--';
+  document.getElementById('statChallans').textContent = data.challans_generated || 0;
+
+  const dist = data.dwell_distribution || {};
+  document.getElementById('statGt15').textContent = dist.gt_15m || 0;
+  document.getElementById('statGt30').textContent = dist.gt_30m || 0;
+  document.getElementById('statGt45').textContent = dist.gt_45m || 0;
+  document.getElementById('statGt1h').textContent = dist.gt_1h || 0;
+}
+
+function renderHourlyIncidentsChart(hourlyData, selectedZone) {
+  const ctx = document.getElementById('hourlyIncidentsChart')?.getContext('2d');
   if (!ctx) return;
 
-  // Destroy existing chart
-  if (occupancyChart) {
-    occupancyChart.destroy();
+  if (hourlyIncidentsChart) {
+    hourlyIncidentsChart.destroy();
   }
 
-  // Get all zones from data
-  const zones = new Set();
-  series.forEach(entry => {
-    Object.keys(entry.zones).forEach(z => zones.add(z));
+  // Update badge
+  const badge = document.getElementById('hourlyChartBadge');
+  if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
+
+  const labels = (hourlyData || []).map(entry => {
+    const d = new Date(entry.hour);
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   });
 
-  // Build datasets
-  const datasets = Array.from(zones).sort().map(zone => {
-    const color = getZoneColor(zone);
-    return {
-      label: `Zone ${zone}`,
-      data: series.map(entry => entry.zones[zone] || 0),
+  let datasets;
+
+  if (!selectedZone) {
+    // Collect all zones present
+    const allZones = new Set();
+    (hourlyData || []).forEach(entry => {
+      Object.keys(entry.zones || {}).forEach(z => allZones.add(z));
+    });
+    const zoneList = Array.from(allZones).sort();
+
+    if (zoneList.length <= 1) {
+      // Single zone or "all" total — show a single series
+      datasets = [{
+        label: 'Incidents',
+        data: (hourlyData || []).map(e => e.all || 0),
+        backgroundColor: 'rgba(239, 68, 68, 0.6)',
+        borderColor: '#ef4444',
+        borderWidth: 2,
+        borderRadius: 6,
+      }];
+    } else {
+      // Multiple zones — stacked bars
+      datasets = zoneList.map(zone => {
+        const color = getZoneColor(zone);
+        return {
+          label: `Zone ${zone}`,
+          data: (hourlyData || []).map(e => (e.zones || {})[zone] || 0),
+          backgroundColor: color.border + 'AA',
+          borderColor: color.border,
+          borderWidth: 1,
+          borderRadius: 4,
+        };
+      });
+    }
+  } else {
+    // Specific zone selected
+    const color = getZoneColor(selectedZone);
+    datasets = [{
+      label: `Zone ${selectedZone}`,
+      data: (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0),
+      backgroundColor: color.border + 'AA',
       borderColor: color.border,
-      backgroundColor: color.bg,
-      fill: true,
-      tension: 0.3
-    };
-  });
+      borderWidth: 2,
+      borderRadius: 6,
+    }];
+  }
 
-  // Format time labels
-  const labels = series.map(entry => {
-    const d = new Date(entry.time);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  });
-
-  occupancyChart = new Chart(ctx, {
-    type: 'line',
+  hourlyIncidentsChart = new Chart(ctx, {
+    type: 'bar',
     data: { labels, datasets },
     options: {
       ...chartDefaults,
       plugins: {
         ...chartDefaults.plugins,
-        title: { display: false }
-      },
-      scales: {
-        ...chartDefaults.scales,
-        y: {
-          ...chartDefaults.scales.y,
-          min: 0,
-          max: 100,
-          ticks: {
-            ...chartDefaults.scales.y.ticks,
-            callback: v => `${v}%`
+        title: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => items[0]?.label || '',
+            label: (item) => `${item.dataset.label}: ${item.raw} incident${item.raw !== 1 ? 's' : ''}`,
           }
         }
-      }
-    }
-  });
-}
-
-function renderDwellChart(dwellStats) {
-  const ctx = document.getElementById('dwellChart')?.getContext('2d');
-  if (!ctx) return;
-
-  if (dwellChart) {
-    dwellChart.destroy();
-  }
-
-  const zones = Object.keys(dwellStats).sort();
-  const values = zones.map(z => dwellStats[z]);
-  const colors = zones.map(z => getZoneColor(z));
-
-  dwellChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: zones.map(z => `Zone ${z}`),
-      datasets: [{
-        label: 'Avg Dwell Time (min)',
-        data: values,
-        backgroundColor: colors.map(c => c.bg),
-        borderColor: colors.map(c => c.border),
-        borderWidth: 2
-      }]
-    },
-    options: {
-      ...chartDefaults,
-      plugins: {
-        ...chartDefaults.plugins,
-        legend: { display: false }
       },
       scales: {
         ...chartDefaults.scales,
+        x: {
+          ...chartDefaults.scales.x,
+          stacked: !selectedZone,
+          ticks: {
+            ...chartDefaults.scales.x.ticks,
+            maxRotation: 45,
+            autoSkip: true,
+            maxTicksLimit: 24,
+          }
+        },
         y: {
           ...chartDefaults.scales.y,
+          stacked: !selectedZone,
           beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
-            callback: v => `${v} min`
+            stepSize: 1,
+            callback: v => Number.isInteger(v) ? v : '',
           }
         }
       }
     }
   });
-}
-
-function renderPredictionChart(predictions, currentOccupancy) {
-  const ctx = document.getElementById('predictionChart')?.getContext('2d');
-  if (!ctx) return;
-
-  if (predictionChart) {
-    predictionChart.destroy();
-  }
-
-  const zones = Object.keys(predictions).sort();
-  const predictedValues = zones.map(z => predictions[z]);
-  const currentValues = zones.map(z => currentOccupancy[z]?.percent || 0);
-  const colors = zones.map(z => getZoneColor(z));
-
-  predictionChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: zones.map(z => `Zone ${z}`),
-      datasets: [
-        {
-          label: 'Current',
-          data: currentValues,
-          backgroundColor: colors.map(c => c.bg),
-          borderColor: colors.map(c => c.border),
-          borderWidth: 2
-        },
-        {
-          label: 'Predicted',
-          data: predictedValues,
-          backgroundColor: colors.map(c => c.border + '80'),
-          borderColor: colors.map(c => c.border),
-          borderWidth: 2,
-          borderDash: [5, 5]
-        }
-      ]
-    },
-    options: {
-      ...chartDefaults,
-      scales: {
-        ...chartDefaults.scales,
-        y: {
-          ...chartDefaults.scales.y,
-          min: 0,
-          max: 100,
-          ticks: {
-            ...chartDefaults.scales.y.ticks,
-            callback: v => `${v}%`
-          }
-        }
-      }
-    }
-  });
-}
-
-function renderStatsRow(data) {
-  const { summary, current_occupancy, dwell_stats } = data;
-
-  // Calculate overall stats
-  let totalOccupied = 0;
-  let totalSlots = 0;
-  Object.values(current_occupancy || {}).forEach(z => {
-    totalOccupied += z.occupied || 0;
-    totalSlots += z.total || 0;
-  });
-
-  const overallPct = totalSlots > 0 ? ((totalOccupied / totalSlots) * 100).toFixed(1) : 0;
-
-  // Average dwell time across all zones
-  const dwellValues = Object.values(dwell_stats || {});
-  const avgDwell = dwellValues.length > 0
-    ? (dwellValues.reduce((a, b) => a + b, 0) / dwellValues.length).toFixed(1)
-    : '--';
-
-  // Update stat cards
-  document.getElementById('statOccupancy').textContent = `${overallPct}%`;
-  document.getElementById('statDwell').textContent = avgDwell !== '--' ? `${avgDwell} min` : '--';
-  document.getElementById('statEvents').textContent = summary?.total_events || 0;
-  document.getElementById('statPoints').textContent = summary?.data_points || 0;
-}
-
-function renderPredictionsGrid(predictions, currentOccupancy) {
-  const container = document.getElementById('predictionsGrid');
-  if (!container) return;
-
-  const zones = Object.keys(predictions || {}).sort();
-
-  if (zones.length === 0) {
-    container.innerHTML = '<div class="prediction-loading">Not enough data for predictions yet</div>';
-    return;
-  }
-
-  const html = zones.map(zone => {
-    const current = currentOccupancy[zone]?.percent || 0;
-    const predicted = predictions[zone] || 0;
-    const diff = predicted - current;
-    const trendClass = diff > 2 ? 'up' : diff < -2 ? 'down' : 'stable';
-    const trendIcon = diff > 2 ? '↑' : diff < -2 ? '↓' : '→';
-    const trendText = diff > 2 ? 'Rising' : diff < -2 ? 'Falling' : 'Stable';
-    const color = getZoneColor(zone);
-
-    return `
-      <div class="prediction-card" style="border-left: 3px solid ${color.border}">
-        <div class="prediction-header">
-          <span class="prediction-zone">Zone ${zone}</span>
-          <span class="prediction-trend ${trendClass}">${trendIcon} ${trendText}</span>
-        </div>
-        <div class="prediction-values">
-          <div class="prediction-current">
-            <span class="prediction-label">Current</span>
-            <span class="prediction-value">${current.toFixed(0)}%</span>
-          </div>
-          <div class="prediction-arrow">→</div>
-          <div class="prediction-next">
-            <span class="prediction-label">Predicted</span>
-            <span class="prediction-value" style="color: ${color.border}">${predicted.toFixed(0)}%</span>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  container.innerHTML = html;
 }
 
 let slots = [];
