@@ -223,9 +223,46 @@ def _normalise(raw: str) -> str:
     return "".join(ch for ch in cleaned if ch.isalnum())
 
 
+# Maps for fixing OCR-confusable characters in the wrong position type.
+# Digits that should be letters (e.g. '2' in a letter slot is probably 'Z').
+_DIGIT_TO_LETTER = str.maketrans("02581", "OZSBI")
+# Letters that should be digits (e.g. 'O' in a digit slot is probably '0').
+_LETTER_TO_DIGIT = str.maketrans("OZSBI", "02581")
+
+
+def _fix_confusables(plate: str) -> Optional[str]:
+    """Try to fix OCR-confusable characters based on expected Indian plate structure.
+
+    Indian plates follow:  SS  DD  XX  NNNN
+      SS = 2 letters (state), DD = 1-2 digits (district),
+      XX = 1-3 letters (series), NNNN = 1-4 digits (number).
+
+    When GPT-4o misreads e.g. 'Z' as '2', the character lands in the wrong
+    group and the regex fails.  This function tries every valid group-size
+    split, translates confusable chars into the expected type, and returns
+    the first candidate that satisfies the regex.
+    """
+    for d_len in (2, 1):          # district: prefer 2-digit
+        for s_len in (2, 1, 3):   # series: prefer 2-letter, then 1, then 3
+            prefix_len = 2 + d_len + s_len
+            num_len = len(plate) - prefix_len
+            if num_len < 1 or num_len > 4:
+                continue
+
+            state    = plate[:2].translate(_DIGIT_TO_LETTER)
+            district = plate[2:2 + d_len].translate(_LETTER_TO_DIGIT)
+            series   = plate[2 + d_len:prefix_len].translate(_DIGIT_TO_LETTER)
+            number   = plate[prefix_len:].translate(_LETTER_TO_DIGIT)
+
+            candidate = state + district + series + number
+            if re.match(PLATE_REGEX_PATTERN, candidate):
+                return candidate
+    return None
+
+
 def _postprocess_plate_text(raw_ocr_text: str) -> Tuple[str, Optional[bool]]:
     """
-    Post-processing: normalise -> regex validation.
+    Post-processing: normalise -> regex validation -> confusable fix.
     Returns (cleaned_plate_text, matched_regex).
     """
     if not raw_ocr_text:
@@ -238,13 +275,18 @@ def _postprocess_plate_text(raw_ocr_text: str) -> Tuple[str, Optional[bool]]:
         if re.match(PLATE_REGEX_PATTERN, normalised):
             matched = True
         else:
-            # Try to extract a valid plate as a substring
-            search_pattern = PLATE_REGEX_PATTERN.lstrip("^").rstrip("$")
-            found = re.search(search_pattern, normalised)
-            if found:
-                normalised = found.group(0)
+            # Try fixing OCR-confusable characters (Z↔2, O↔0, B↔8, etc.)
+            fixed = _fix_confusables(normalised)
+            if fixed:
+                log.info("Fixed confusable chars: %s -> %s", normalised, fixed)
+                normalised = fixed
                 matched = True
             else:
+                # Keep the normalised string as-is; do NOT extract a
+                # substring — that mangles plates by shifting/truncating
+                # characters to force a regex match.
+                log.warning("Plate %s does not match regex and could not be "
+                            "auto-corrected; keeping as-is", normalised)
                 matched = False
 
     return normalised, matched

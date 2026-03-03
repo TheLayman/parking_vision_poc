@@ -371,13 +371,20 @@
           '</div>';
       }
 
-      // ── Group records by plate_text ────────────────────────────────
+      // ── Group records by capture session ────────────────────────────
+      // Each capture_session_id represents one independent detection cycle
+      // (first capture → recheck). Grouping by plate alone would merge
+      // unrelated events at different slots/times into a single row,
+      // making it look like the recheck window was hours instead of ~70s.
       function groupByPlate(records) {
         const map = new Map();
         for (const r of records) {
           const plate = r.plate_text || 'UNKNOWN';
-          if (!map.has(plate)) {
-            map.set(plate, {
+          // Use capture_session_id as the primary key; fall back to plate
+          // for legacy records that lack a session id.
+          const key = r.capture_session_id || plate;
+          if (!map.has(key)) {
+            map.set(key, {
               plate,
               first_time: r.first_time,
               first_image: r.first_image,
@@ -387,7 +394,7 @@
               slots: new Set([r.slot_name || '—']),
             });
           } else {
-            const g = map.get(plate);
+            const g = map.get(key);
             // Keep the earliest first detection
             if (r.first_time && (!g.first_time || r.first_time < g.first_time)) {
               g.first_time = r.first_time;

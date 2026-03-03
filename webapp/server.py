@@ -8,6 +8,7 @@ import time as _time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 import threading
 import paho.mqtt.client as mqtt
@@ -362,6 +363,32 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
                 )
 
 
+# ---------------------------------------------------------------------------
+# Fuzzy license-plate matching
+# ---------------------------------------------------------------------------
+_PLATE_MATCH_THRESHOLD = 0.85          # min similarity ratio (0-1)
+
+def _plates_match(a: str, b: str) -> bool:
+    """Return True if two plate strings are identical or very similar.
+
+    OCR often confuses visually similar characters (B/8, P/R, 0/O, Z/2,
+    etc.).  A high SequenceMatcher ratio handles the common single- or
+    double-character misread without risking false positives on genuinely
+    different plates.  Plates whose lengths differ by more than 1 are
+    never considered a match.
+    """
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= _PLATE_MATCH_THRESHOLD
+
+
+def _any_plate_matches(plate: str, plate_list: list[str]) -> bool:
+    """Check if *plate* fuzzy-matches any entry in *plate_list*."""
+    return any(_plates_match(plate, p) for p in plate_list)
+
+
 def _make_batch_recheck_callback(pending_key: str):
     """Create callback for batch challan recheck capture completion.
 
@@ -401,9 +428,9 @@ def _make_batch_recheck_callback(pending_key: str):
         # Extract plates from second capture (ONE GPT-4o call for all plates)
         new_plates = _extract_plates(second_image)["plates"]
 
-        # Compare each original plate against the second image
+        # Compare each original plate against the second image (fuzzy match)
         for plate_text in first_plates:
-            is_match = plate_text in new_plates
+            is_match = _any_plate_matches(plate_text, new_plates)
             _record_challan(
                 plate_text=plate_text,
                 slot_id=slot_id,
@@ -421,7 +448,7 @@ def _make_batch_recheck_callback(pending_key: str):
             )
 
         # Schedule batch recheck for NEW plates not in original list (max 1 re-recheck)
-        unseen_plates = [p for p in new_plates if p not in first_plates]
+        unseen_plates = [p for p in new_plates if not _any_plate_matches(p, first_plates)]
         # Filter out plates already processed within the dedup window
         unseen_plates = [p for p in unseen_plates if not _has_recent_challan_or_pending(p)]
         if unseen_plates and recheck_count < 1:
