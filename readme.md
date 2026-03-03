@@ -56,6 +56,12 @@ CAMERA_IP=192.168.1.100
 CAMERA_USER=admin
 CAMERA_PASS=your_password
 CAMERA_RTSP_URL=rtsp://admin:password@192.168.1.100/stream1
+CAMERA_SETTLE_TIME=8
+CAMERA_CAPTURE_TIMEOUT=10
+CAMERA_QUEUE_MAXSIZE=50
+
+# Inference pipeline (OpenAI post-processing queue)
+INFERENCE_QUEUE_MAXSIZE=200
 
 # ChirpStack gRPC API (for downlink commands)
 CHIRPSTACK_HOST=localhost
@@ -214,16 +220,18 @@ CAMERA_PASS=your_password
 2. Camera moves to preset position (HTTP command)
 3. Wait for camera to settle
 4. Capture frame via RTSP stream
-5. Extract all license plates using OpenAI Vision API
-6. Save image to `data/camera_snapshots/slot_<id>_<timestamp>.jpg`
-7. Log capture event with plates to `data/occupancy_events.jsonl`
-8. Schedule challan recheck after `CHALLAN_RECHECK_INTERVAL` seconds
+5. Save image to `data/camera_snapshots/slot_<id>_<timestamp>.jpg`
+6. Enqueue inference job (camera worker remains non-blocking)
+7. Inference worker extracts all license plates using OpenAI Vision API
+8. Log capture event with plates to `data/occupancy_events.jsonl`
+9. Schedule challan recheck after `CHALLAN_RECHECK_INTERVAL` seconds
 
 **Challan Recheck:**
 1. Camera recaptures the same slot after the configured interval
-2. If the same plate is still present → **challan confirmed**
-3. If the plate is gone → **challan cleared**
-4. Dedup window prevents re-processing the same plate within `CHALLAN_DEDUP_WINDOW`
+2. Recheck image is processed by inference worker (single OpenAI call for all plates)
+3. If the same plate is still present → **challan confirmed**
+4. If the plate is gone → **challan cleared**
+5. Dedup window prevents re-processing the same plate within `CHALLAN_DEDUP_WINDOW`
 
 **Testing without hardware:** Set `ENABLE_CAMERA_CONTROL=false` — alerts will show without images.
 

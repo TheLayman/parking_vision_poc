@@ -36,9 +36,9 @@ RTSP_URL = os.getenv(
 )
 
 # Camera operation parameters
-CAMERA_SETTLE_TIME = 8  # Seconds to wait after camera movement
-CAMERA_CAPTURE_TIMEOUT = 10  # Seconds to wait for RTSP frame
-MAX_QUEUE_SIZE = 50  # Maximum number of pending camera tasks
+CAMERA_SETTLE_TIME = float(os.getenv("CAMERA_SETTLE_TIME", "8"))  # Seconds to wait after camera movement
+CAMERA_CAPTURE_TIMEOUT = float(os.getenv("CAMERA_CAPTURE_TIMEOUT", "10"))  # Seconds to wait for RTSP frame
+MAX_QUEUE_SIZE = int(os.getenv("CAMERA_QUEUE_MAXSIZE", "50"))  # Maximum number of pending camera tasks
 
 # Storage paths
 REPO_ROOT = Path(__file__).parent.parent
@@ -64,6 +64,8 @@ class CameraController:
         self.password = password
         self.rtsp_url = rtsp_url
         self.auth = HTTPDigestAuth(user, password)
+        self.session = requests.Session()
+        self.session.auth = self.auth
 
     def move_to_preset(self, preset_number: int) -> bool:
         """
@@ -84,9 +86,8 @@ class CameraController:
             url = f"http://{self.ip}/ISAPI/PTZCtrl/channels/1/presets/{preset_number}/goto"
 
             print(f"Moving camera to preset {preset_number}...")
-            response = requests.put(
+            response = self.session.put(
                 url,
-                auth=self.auth,
                 timeout=5
             )
 
@@ -171,14 +172,20 @@ class CameraController:
             True if camera responds, False otherwise
         """
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"http://{self.ip}/",
-                auth=self.auth,
                 timeout=3
             )
             return response.status_code in (200, 401)  # 401 means auth required but reachable
         except Exception:
             return False
+
+    def close(self):
+        """Close persistent HTTP session resources."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
 
 class CameraTaskQueue:

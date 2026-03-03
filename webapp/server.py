@@ -6,6 +6,7 @@ import logging
 import struct
 import time as _time
 import uuid
+import queue as _queue
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -129,6 +130,195 @@ _camera_queue = None
 _camera_controller = None
 _camera_worker_thread = None
 
+# Inference pipeline components (decoupled from camera worker)
+INFERENCE_QUEUE_MAXSIZE = int(os.getenv("INFERENCE_QUEUE_MAXSIZE", "200"))
+_inference_queue = _queue.Queue(maxsize=INFERENCE_QUEUE_MAXSIZE)
+_inference_worker_thread = None
+_inference_shutdown_event = threading.Event()
+
+# Basic runtime metrics
+_metrics_lock = threading.Lock()
+_pipeline_metrics = {
+    "inference_jobs_enqueued": 0,
+    "inference_jobs_processed": 0,
+    "inference_jobs_dropped": 0,
+    "inference_job_errors": 0,
+    "camera_enqueue_failures": 0,
+    "openai_calls": 0,
+    "openai_failures": 0,
+    "openai_total_ms": 0.0,
+    "openai_last_ms": 0.0,
+    "capture_to_plate_last_ms": 0.0,
+}
+
+
+def _metric_inc(name: str, delta: int = 1):
+    with _metrics_lock:
+        _pipeline_metrics[name] = _pipeline_metrics.get(name, 0) + delta
+
+
+def _metric_set(name: str, value):
+    with _metrics_lock:
+        _pipeline_metrics[name] = value
+
+
+def _metric_snapshot() -> dict:
+    with _metrics_lock:
+        return dict(_pipeline_metrics)
+
+
+def _safe_qsize(qobj) -> int:
+    try:
+        return qobj.qsize() if qobj is not None else 0
+    except Exception:
+        return 0
+
+
+def _enqueue_inference_job(job: dict) -> bool:
+    """Enqueue a heavy inference job so camera worker stays non-blocking."""
+    job.setdefault("queued_at", datetime.now(timezone.utc).isoformat())
+
+    try:
+        if _inference_queue.qsize() >= INFERENCE_QUEUE_MAXSIZE:
+            try:
+                _inference_queue.get_nowait()
+                _metric_inc("inference_jobs_dropped")
+                log.warning("Inference queue full; dropped oldest job")
+            except _queue.Empty:
+                pass
+
+        _inference_queue.put(job, block=False)
+        _metric_inc("inference_jobs_enqueued")
+        return True
+    except _queue.Full:
+        _metric_inc("inference_jobs_dropped")
+        log.warning("Inference queue full; failed to enqueue job")
+        return False
+
+
+def _cleanup_pending_recheck(pending_key: str, reason: str):
+    """Remove a pending recheck entry when processing cannot continue."""
+    with _challan_lock:
+        _challan_pending.pop(pending_key, None)
+    log.warning("Dropped pending recheck %s: %s", pending_key, reason)
+
+
+def _run_batch_recheck_inference(pending_key: str, image_path: str):
+    """Process challan recheck OCR and record outcomes (runs in inference worker)."""
+    with _challan_lock:
+        pending = _challan_pending.pop(pending_key, None)
+    if pending is None:
+        log.warning("Challan recheck worker: no pending entry for key %s", pending_key)
+        return
+
+    first_plates = pending["plates"]
+    slot_id = pending["slot_id"]
+    slot_name = pending["slot_name"]
+    zone = pending["zone"]
+    preset = pending["preset"]
+    first_image = pending["first_image"]
+    first_time = pending["first_time"]
+    recheck_count = pending.get("recheck_count", 0)
+    capture_session_id = pending.get("capture_session_id")
+    mqtt_event_ts = pending.get("mqtt_event_ts")
+
+    log.info("Batch challan recheck #%d complete for %d plate(s) at slot %s",
+             recheck_count + 1, len(first_plates), slot_name)
+
+    ts_str = datetime.now(timezone.utc).isoformat()
+    second_image = image_path
+    new_plates = _extract_plates(second_image)["plates"]
+
+    for plate_text in first_plates:
+        is_match = plate_text in new_plates
+        _record_challan(
+            plate_text=plate_text,
+            slot_id=slot_id,
+            slot_name=slot_name,
+            zone=zone,
+            first_image=first_image,
+            first_time=first_time,
+            second_image=second_image,
+            second_time=ts_str,
+            challan=is_match,
+            first_plates=first_plates,
+            second_plates=new_plates,
+            capture_session_id=capture_session_id,
+            mqtt_event_ts=mqtt_event_ts,
+        )
+
+    unseen_plates = [p for p in new_plates if not _any_plate_matches(p, first_plates)]
+    unseen_plates = [p for p in unseen_plates if not _has_recent_challan_or_pending(p)]
+    if unseen_plates and recheck_count < 1:
+        new_session_id = str(uuid.uuid4())
+        _schedule_slot_recheck(
+            plates=unseen_plates,
+            slot_id=slot_id,
+            slot_name=slot_name,
+            zone=zone,
+            preset=preset,
+            first_image=second_image,
+            first_time=ts_str,
+            capture_session_id=new_session_id,
+            mqtt_event_ts=mqtt_event_ts,
+            recheck_count=recheck_count + 1,
+        )
+
+
+def _inference_worker():
+    """Background worker for OpenAI-heavy post-capture processing."""
+    log.info("Inference worker thread started")
+
+    while not _inference_shutdown_event.is_set():
+        try:
+            job = _inference_queue.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+
+        started = _time.time()
+        job_type = job.get("job_type", "unknown")
+
+        try:
+            if job_type == "camera_capture":
+                _log_camera_capture(
+                    slot_id=job["slot_id"],
+                    slot_name=job["slot_name"],
+                    zone=job["zone"],
+                    image_path=job["image_path"],
+                    timestamp_str=job["timestamp_str"],
+                    mqtt_event_ts=job.get("mqtt_event_ts"),
+                )
+
+                mqtt_ts = job.get("mqtt_event_ts")
+                if mqtt_ts:
+                    try:
+                        capture_to_plate_ms = (
+                            datetime.now(timezone.utc) -
+                            datetime.fromisoformat(mqtt_ts.replace("Z", "+00:00"))
+                        ).total_seconds() * 1000.0
+                        _metric_set("capture_to_plate_last_ms", round(capture_to_plate_ms, 2))
+                    except Exception:
+                        pass
+
+            elif job_type == "challan_recheck":
+                _run_batch_recheck_inference(
+                    pending_key=job["pending_key"],
+                    image_path=job["image_path"],
+                )
+            else:
+                log.warning("Unknown inference job_type=%s", job_type)
+
+            _metric_inc("inference_jobs_processed")
+        except Exception as e:
+            _metric_inc("inference_job_errors")
+            log.error("Inference worker error for job_type=%s: %s", job_type, e)
+        finally:
+            elapsed_ms = (_time.time() - started) * 1000.0
+            log.info("Inference job complete type=%s duration_ms=%.1f queue_depth=%d",
+                     job_type, elapsed_ms, _safe_qsize(_inference_queue))
+
+    log.info("Inference worker thread stopped")
+
 def load_snapshot_data() -> dict:
     """Load snapshot data from YAML file (cold-start only)."""
     try:
@@ -152,8 +342,14 @@ def _extract_plates(image_path: str) -> dict:
         log.debug("License plate extraction not available")
         return {"plates": [], "vehicle_detected": True}
     try:
+        started = _time.time()
+        _metric_inc("openai_calls")
         log.info("Extracting license plates from %s...", image_path)
         result = extract_all_license_plates(image_path)
+        elapsed_ms = (_time.time() - started) * 1000.0
+        with _metrics_lock:
+            _pipeline_metrics["openai_total_ms"] += elapsed_ms
+            _pipeline_metrics["openai_last_ms"] = round(elapsed_ms, 2)
         plates = [
             p.get("plate_text", "")
             for p in result.get("plates", [])
@@ -161,6 +357,7 @@ def _extract_plates(image_path: str) -> dict:
         ]
         return {"plates": plates, "vehicle_detected": result.get("vehicle_detected", True)}
     except Exception as e:
+        _metric_inc("openai_failures")
         log.error("Error extracting license plates: %s", e)
         return {"plates": [], "vehicle_detected": True}
 
@@ -409,75 +606,16 @@ def _make_batch_recheck_callback(pending_key: str):
     record per plate.
     """
     def callback(success, image_path, error_msg):
-        with _challan_lock:
-            pending = _challan_pending.pop(pending_key, None)
-        if pending is None:
-            log.warning("Challan recheck callback: no pending entry for key %s", pending_key)
-            return
-
         if not success or not image_path:
+            _cleanup_pending_recheck(pending_key, f"capture failed: {error_msg}")
             log.error("Challan recheck capture failed for %s: %s", pending_key, error_msg)
             return
-
-        first_plates = pending["plates"]
-        slot_id = pending["slot_id"]
-        slot_name = pending["slot_name"]
-        zone = pending["zone"]
-        preset = pending["preset"]
-        first_image = pending["first_image"]
-        first_time = pending["first_time"]
-        recheck_count = pending.get("recheck_count", 0)
-        capture_session_id = pending.get("capture_session_id")
-        mqtt_event_ts = pending.get("mqtt_event_ts")
-
-        log.info("Batch challan recheck #%d complete for %d plate(s) at slot %s",
-                 recheck_count + 1, len(first_plates), slot_name)
-
-        ts_str = datetime.now(timezone.utc).isoformat()
-        second_image = image_path
-
-        # Extract plates from second capture (ONE OpenAI vision call for all plates)
-        new_plates = _extract_plates(second_image)["plates"]
-
-        # Compare each original plate against the second image (exact match
-        # required — fuzzy matching can let two different hallucinations
-        # confirm each other as a false-positive challan).
-        for plate_text in first_plates:
-            is_match = plate_text in new_plates
-            _record_challan(
-                plate_text=plate_text,
-                slot_id=slot_id,
-                slot_name=slot_name,
-                zone=zone,
-                first_image=first_image,
-                first_time=first_time,
-                second_image=second_image,
-                second_time=ts_str,
-                challan=is_match,
-                first_plates=first_plates,
-                second_plates=new_plates,
-                capture_session_id=capture_session_id,
-                mqtt_event_ts=mqtt_event_ts,
-            )
-
-        # Schedule batch recheck for NEW plates not in original list (max 1 re-recheck)
-        unseen_plates = [p for p in new_plates if not _any_plate_matches(p, first_plates)]
-        # Filter out plates already processed within the dedup window
-        unseen_plates = [p for p in unseen_plates if not _has_recent_challan_or_pending(p)]
-        if unseen_plates and recheck_count < 1:
-            new_session_id = str(uuid.uuid4())
-            _schedule_slot_recheck(
-                plates=unseen_plates,
-                slot_id=slot_id,
-                slot_name=slot_name,
-                zone=zone,
-                preset=preset,
-                first_image=second_image,
-                first_time=ts_str,
-                capture_session_id=new_session_id,
-                mqtt_event_ts=mqtt_event_ts,
-                recheck_count=recheck_count + 1,
-            )
+        if not _enqueue_inference_job({
+            "job_type": "challan_recheck",
+            "pending_key": pending_key,
+            "image_path": image_path,
+        }):
+            _cleanup_pending_recheck(pending_key, "inference queue full")
 
     return callback
 
@@ -636,8 +774,18 @@ def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str,
     """Create callback for camera capture completion."""
     def callback(success, image_path, error_msg):
         if success and image_path:
-            _log_camera_capture(slot_id, slot_name, zone, image_path, timestamp_str,
-                                mqtt_event_ts=mqtt_event_ts)
+            enqueued = _enqueue_inference_job({
+                "job_type": "camera_capture",
+                "slot_id": slot_id,
+                "slot_name": slot_name,
+                "zone": zone,
+                "image_path": image_path,
+                "timestamp_str": timestamp_str,
+                "mqtt_event_ts": mqtt_event_ts,
+            })
+            if not enqueued:
+                _metric_inc("camera_enqueue_failures")
+                log.warning("Dropped camera inference job for slot %s (queue full)", slot_name)
     return callback
 
 def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_id: dict, timestamp_str: str) -> list:
@@ -943,9 +1091,10 @@ def stop_mqtt_listener():
         _mqtt_client = None
 
 def _startup():
-    global _camera_queue, _camera_controller, _camera_worker_thread, _slots_snapshot
+    global _camera_queue, _camera_controller, _camera_worker_thread, _slots_snapshot, _inference_worker_thread
 
     _shutdown_event.clear()
+    _inference_shutdown_event.clear()
 
     # Load snapshot into memory
     data = load_snapshot_data()
@@ -984,6 +1133,14 @@ def _startup():
     else:
         log.info("Camera control %s", "disabled" if not ENABLE_CAMERA_CONTROL else "module not available")
 
+    # Start inference worker (decouples OpenAI calls from camera worker)
+    _inference_worker_thread = threading.Thread(
+        target=_inference_worker,
+        daemon=True,
+        name="InferenceWorker",
+    )
+    _inference_worker_thread.start()
+
     if ENABLE_MQTT:
         log.info("MQTT enabled. Starting listener for %s:%s...", MQTT_BROKER, MQTT_PORT)
         start_mqtt_listener()
@@ -997,6 +1154,7 @@ def _startup():
 def _shutdown():
     log.info("Shutting down...")
     _shutdown_event.set()
+    _inference_shutdown_event.set()
 
     # Flush snapshot to disk
     _flush_snapshot_to_disk()
@@ -1012,11 +1170,24 @@ def _shutdown():
                 log.warning("Camera worker did not terminate within 15s")
             else:
                 log.info("Camera worker stopped gracefully")
+    if _camera_controller is not None:
+        try:
+            _camera_controller.close()
+        except Exception:
+            pass
+    if _inference_worker_thread is not None and _inference_worker_thread.is_alive():
+        log.info("Shutting down inference worker...")
+        _inference_worker_thread.join(timeout=15)
+        if _inference_worker_thread.is_alive():
+            log.warning("Inference worker did not terminate within 15s")
+        else:
+            log.info("Inference worker stopped gracefully")
 
 
 def _atexit_handler():
     """Safety net for unclean exits (Ctrl+C, kill) that bypass the FastAPI lifespan."""
     _shutdown_event.set()
+    _inference_shutdown_event.set()
     if _camera_queue is not None:
         _camera_queue.shutdown_event.set()
     _flush_snapshot_to_disk()
@@ -1447,6 +1618,8 @@ def camera_status():
     is_available = False
     queue_size = 0
     worker_active = False
+    inference_queue_size = 0
+    inference_worker_active = False
 
     try:
         if _camera_controller:
@@ -1455,13 +1628,32 @@ def camera_status():
             queue_size = _camera_queue.queue.qsize()
         if _camera_worker_thread:
             worker_active = _camera_worker_thread.is_alive()
+        inference_queue_size = _safe_qsize(_inference_queue)
+        if _inference_worker_thread:
+            inference_worker_active = _inference_worker_thread.is_alive()
     except Exception as e:
         log.error("Error checking camera status: %s", e)
+
+    metrics = _metric_snapshot()
+    openai_avg_ms = round(metrics["openai_total_ms"] / metrics["openai_calls"], 2) if metrics["openai_calls"] else 0.0
 
     return {
         "enabled": True,
         "available": is_available,
         "queue_size": queue_size,
         "worker_active": worker_active,
-        "camera_ip": CAMERA_IP
+        "camera_ip": CAMERA_IP,
+        "inference_queue_size": inference_queue_size,
+        "inference_worker_active": inference_worker_active,
+        "metrics": {
+            "inference_jobs_enqueued": metrics["inference_jobs_enqueued"],
+            "inference_jobs_processed": metrics["inference_jobs_processed"],
+            "inference_jobs_dropped": metrics["inference_jobs_dropped"],
+            "inference_job_errors": metrics["inference_job_errors"],
+            "openai_calls": metrics["openai_calls"],
+            "openai_failures": metrics["openai_failures"],
+            "openai_last_ms": metrics["openai_last_ms"],
+            "openai_avg_ms": openai_avg_ms,
+            "capture_to_plate_last_ms": metrics["capture_to_plate_last_ms"],
+        }
     }
