@@ -41,6 +41,7 @@ OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_LPR_MAX_TOKENS", "300"))
 
 # Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
 PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
+_CONFIDENCE_SCORES: dict = {"high": 1.0, "medium": 0.7, "low": 0.3}
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
 _openai_client = None  # openai.OpenAI
@@ -175,23 +176,28 @@ def _call_openai_vision(image: np.ndarray) -> dict:
             plates_raw = []
 
         # Normalise: accept both old format (list of strings) and new format (list of dicts)
-        confidence_map = {"high": 1.0, "medium": 0.7, "low": 0.3}
-        plates_out = []
+        plates_out: list = []
         for entry in plates_raw:
             if isinstance(entry, str):
                 plates_out.append({"plate_text": entry, "confidence": 1.0})
             elif isinstance(entry, dict):
                 text = entry.get("plate_text", "")
                 conf_label = entry.get("confidence", "medium")
-                conf_score = confidence_map.get(conf_label, 0.5)
+                conf_score = _CONFIDENCE_SCORES.get(conf_label)
+                if conf_score is None:
+                    log.warning("Unknown confidence label %r for plate %s, treating as low", conf_label, text)
+                    conf_score = _CONFIDENCE_SCORES["low"]
                 plates_out.append({"plate_text": text, "confidence": conf_score})
 
-        # Filter by confidence threshold
-        dropped = [p for p in plates_out if p["confidence"] < PLATE_MIN_CONFIDENCE]
-        for d in dropped:
-            log.info("Dropping low-confidence plate: %s (%.1f < %.1f)",
-                     d["plate_text"], d["confidence"], PLATE_MIN_CONFIDENCE)
-        plates_out = [p for p in plates_out if p["confidence"] >= PLATE_MIN_CONFIDENCE]
+        # Filter by confidence threshold (single pass)
+        kept: list = []
+        for p in plates_out:
+            if p["confidence"] >= PLATE_MIN_CONFIDENCE:
+                kept.append(p)
+            else:
+                log.info("Dropping low-confidence plate: %s (%.1f < %.1f)",
+                         p["plate_text"], p["confidence"], PLATE_MIN_CONFIDENCE)
+        plates_out = kept
 
         return {
             "vehicle_detected": vehicle,
@@ -272,13 +278,14 @@ def extract_license_plate(image_path) -> dict:
         result = _empty_result()
         result["vehicle_detected"] = vision["vehicle_detected"]
 
-        if not vision["plates"]:
+        if not vision["plates_detail"]:
             return result
 
         # Take the first (best) plate and post-process
-        plate_text, _matched = _postprocess_plate_text(vision["plates"][0])
+        best = vision["plates_detail"][0]
+        plate_text, _matched = _postprocess_plate_text(best["plate_text"])
         result["plate_text"] = plate_text if plate_text else "UNKNOWN"
-        result["confidence"] = 0.95 if plate_text else 0.0
+        result["confidence"] = best["confidence"] if plate_text else 0.0
 
         log.info("License plate detected: %s", result["plate_text"])
         return result
@@ -310,13 +317,13 @@ def extract_all_license_plates(image_path) -> dict:
         vision = _call_openai_vision(image)
 
         plates = []
-        for raw_plate in vision["plates"]:
-            plate_text, _matched = _postprocess_plate_text(raw_plate)
+        for detail in vision["plates_detail"]:
+            plate_text, _matched = _postprocess_plate_text(detail["plate_text"])
             if not plate_text:
                 continue
             plates.append({
                 "plate_text": plate_text,
-                "confidence": 0.95,
+                "confidence": detail["confidence"],
                 "detection_confidence": 0.0,
             })
             log.info("License plate detected: %s", plate_text)
