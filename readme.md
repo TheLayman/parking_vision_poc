@@ -83,6 +83,15 @@ LPR_EASYOCR_LANGS=en
 LPR_EASYOCR_DOWNLOAD=0
 LPR_PREPROCESS=1
 
+# Max image dimension fed to EasyOCR (longest edge, px). Lower = faster CPU inference.
+# 1280 (default): ~10-15 s per readtext() call | 960: ~5-8 s | 1920: ~45 s (too slow)
+LPR_OCR_MAX_DIM=1280
+
+# Limit PyTorch OpenMP thread pool size (reduces child-process count in task manager).
+# Default: PyTorch uses all CPU cores. Set to 1-4 to cap threads; minor speed trade-off.
+OMP_NUM_THREADS=4
+MKL_NUM_THREADS=4
+
 PLATE_MIN_CONFIDENCE=0.65
 PLATE_REGEX_PATTERN=^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$
 

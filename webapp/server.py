@@ -270,6 +270,13 @@ def _inference_worker():
     """Background worker for OpenAI-heavy post-capture processing."""
     log.info("Inference worker thread started")
 
+    if _license_plate_available:
+        try:
+            from webapp.license_plate_extractor import warm_up
+            warm_up()
+        except Exception as e:
+            log.warning("OCR pre-warm failed (will warm on first job): %s", e)
+
     while not _inference_shutdown_event.is_set():
         try:
             job = _inference_queue.get(timeout=1.0)
@@ -530,17 +537,20 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
     try:
         append_jsonl(EVENT_LOG_PATH, event, lock=_event_log_lock)
         cap_key = (slot_id, timestamp_str)
+        key_is_new = cap_key not in _camera_captures
+        # Always overwrite with real inference results (placeholder may already exist from callback)
         _camera_captures[cap_key] = {
             "image_path": image_path,
             "license_plate": license_plate,
             "license_plates": license_plates,
             "vehicle_detected": vehicle_detected,
         }
-        _camera_captures_order.append(cap_key)
-        # Evict oldest entries when over cap
-        while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
-            old_key = _camera_captures_order.popleft()
-            _camera_captures.pop(old_key, None)
+        if key_is_new:
+            _camera_captures_order.append(cap_key)
+            # Evict oldest entries when over cap
+            while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
+                old_key = _camera_captures_order.popleft()
+                _camera_captures.pop(old_key, None)
     except Exception as e:
         log.error("Error logging camera capture: %s", e)
 
@@ -773,6 +783,21 @@ def _make_camera_capture_callback(slot_id: int, slot_name: str, zone: str,
     """Create callback for camera capture completion."""
     def callback(success, image_path, error_msg):
         if success and image_path:
+            # Pre-populate so the image appears in /alerts immediately (before OCR completes).
+            # license_plate will be updated to the real value once inference finishes.
+            cap_key = (slot_id, timestamp_str)
+            if cap_key not in _camera_captures:
+                _camera_captures[cap_key] = {
+                    "image_path": image_path,
+                    "license_plate": "UNKNOWN",
+                    "license_plates": [],
+                    "vehicle_detected": True,
+                }
+                _camera_captures_order.append(cap_key)
+                while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
+                    old_key = _camera_captures_order.popleft()
+                    _camera_captures.pop(old_key, None)
+
             enqueued = _enqueue_inference_job({
                 "job_type": "camera_capture",
                 "slot_id": slot_id,

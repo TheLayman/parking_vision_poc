@@ -165,6 +165,20 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
+def warm_up():
+    """Pre-load the active OCR backend so the first real inference job is not slow.
+
+    Call this once at server startup (e.g. from the inference worker thread before
+    entering the main loop).  For EasyOCR this triggers PyTorch model loading from
+    disk (~5–10 s); subsequent calls reuse the in-memory singleton.
+    """
+    backend = _resolve_backend()
+    if backend == "easyocr":
+        log.info("Pre-warming EasyOCR reader (this may take a few seconds)…")
+        _get_easyocr_reader()
+        log.info("EasyOCR reader ready")
+
+
 def _encode_image_to_base64(image: np.ndarray) -> str:
     """Encode an OpenCV image (BGR numpy array) to a base64 JPEG string."""
     success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -203,6 +217,21 @@ def _preprocess_for_ocr(image: np.ndarray) -> list:
     # poor-contrast plates well.
 
     return variants
+
+
+def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
+    """Downscale image so its longest edge ≤ _OCR_MAX_DIM (aspect ratio preserved).
+
+    EasyOCR's CRAFT detector is O(W×H); skipping this on a 1080p frame means
+    ~45 s per readtext() call on CPU.  At 1280 px the same call takes ~10–15 s.
+    """
+    h, w = image.shape[:2]
+    max_dim = max(h, w)
+    if max_dim <= _OCR_MAX_DIM:
+        return image
+    scale = _OCR_MAX_DIM / max_dim
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -315,6 +344,7 @@ def _call_openai_vision(image: np.ndarray) -> dict:
 def _call_local_ocr(image: np.ndarray) -> dict:
     try:
         reader = _get_easyocr_reader()
+        image = _resize_for_ocr(image)
         variants = _preprocess_for_ocr(image)
         detected: dict = {}
         saw_text = False
