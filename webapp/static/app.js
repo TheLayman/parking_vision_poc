@@ -177,7 +177,7 @@ async function loadAnalytics() {
 
     analyticsDataCache = data;
 
-    const hasData = data.total_incidents > 0 || (data.hourly_incidents && data.hourly_incidents.length > 0);
+    const hasData = data.total_incidents > 0 || data.challans_generated > 0;
 
     // Show/hide empty state
     document.querySelector('.analytics-grid').style.display = hasData ? 'grid' : 'none';
@@ -254,10 +254,11 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
     if (zoneList.length <= 1) {
       const counts = (hourlyData || []).map(e => e.all || 0);
       const peakVal = Math.max(...counts, 0);
+      const peakIdx = peakVal > 0 ? counts.indexOf(peakVal) : -1;
       datasets = [{
         label: 'Incidents',
         data: counts,
-        backgroundColor: counts.map(v => v === peakVal && peakVal > 0
+        backgroundColor: counts.map((v, i) => i === peakIdx
           ? 'rgba(239, 68, 68, 0.95)'
           : 'rgba(239, 68, 68, 0.45)'),
         borderColor: '#ef4444',
@@ -283,10 +284,11 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
     const color = getZoneColor(selectedZone);
     const counts = (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0);
     const peakVal = Math.max(...counts, 0);
+    const peakIdx = peakVal > 0 ? counts.indexOf(peakVal) : -1;
     datasets = [{
       label: `Zone ${selectedZone}`,
       data: counts,
-      backgroundColor: counts.map(v => v === peakVal && peakVal > 0
+      backgroundColor: counts.map((v, i) => i === peakIdx
         ? color.border + 'F0'
         : color.border + '55'),
       borderColor: color.border,

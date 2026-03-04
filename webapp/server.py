@@ -1418,10 +1418,8 @@ def analytics_summary(range: str = Query(default="24h"),
     # Filter by zone if requested
     if zone:
         state_changes_filtered = [sc for sc in state_changes if sc["zone"] == zone]
-        challans_filtered = [c for c in challans if c["zone"] == zone]
     else:
         state_changes_filtered = state_changes
-        challans_filtered = challans
 
     # Total unauthorized incidents = FREE→OCCUPIED transitions
     incidents = [sc for sc in state_changes_filtered
@@ -1431,7 +1429,6 @@ def analytics_summary(range: str = Query(default="24h"),
     # Dwell times (always compute from full data, then filter)
     dwell_result = calculate_dwell_times(state_changes)
     all_dwells = dwell_result["all_dwells"]
-    avg_dwell = dwell_result["avg"]
 
     # Average parking time for the selected zone
     dwells_filtered = all_dwells if zone is None else [d for d in all_dwells if d["zone"] == zone]
