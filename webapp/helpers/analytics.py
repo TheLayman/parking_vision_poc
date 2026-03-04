@@ -131,12 +131,14 @@ def build_dwell_distribution(all_dwells: list[dict], zone: str | None = None) ->
     Buckets are cumulative (a 50-min stay counts in gt_15m, gt_30m, gt_45m).
     """
     filtered = all_dwells if zone is None else [d for d in all_dwells if d["zone"] == zone]
-    return {
-        "gt_15m": sum(1 for d in filtered if d["minutes"] > 15),
-        "gt_30m": sum(1 for d in filtered if d["minutes"] > 30),
-        "gt_45m": sum(1 for d in filtered if d["minutes"] > 45),
-        "gt_1h":  sum(1 for d in filtered if d["minutes"] > 60),
-    }
+    gt_15 = gt_30 = gt_45 = gt_60 = 0
+    for d in filtered:
+        m = d["minutes"]
+        if m > 15: gt_15 += 1
+        if m > 30: gt_30 += 1
+        if m > 45: gt_45 += 1
+        if m > 60: gt_60 += 1
+    return {"gt_15m": gt_15, "gt_30m": gt_30, "gt_45m": gt_45, "gt_1h": gt_60}
 
 
 def build_hourly_incidents(state_changes: list,

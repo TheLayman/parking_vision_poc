@@ -7,6 +7,7 @@ import struct
 import time as _time
 import uuid
 import queue as _queue
+from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -29,8 +30,8 @@ from webapp.helpers.slot_meta import (
     calculate_zone_stats, build_state_from_log,
 )
 from webapp.helpers.analytics import (
-    parse_events_from_log, build_occupancy_series,
-    calculate_dwell_times, predict_occupancy,
+    parse_events_from_log,
+    calculate_dwell_times,
     build_dwell_distribution, build_hourly_incidents,
     build_challan_summary,
 )
@@ -104,11 +105,11 @@ _slots_snapshot: dict[str, dict] = {}
 _slots_snapshot_dirty = False
 
 # In-memory alerts ring buffer (avoids full log scan on /alerts)
-_alerts_buffer: list[dict] = []  # state-change alerts
-_camera_captures: dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
-_camera_captures_order: list[tuple] = []  # insertion-order keys for LRU eviction
 _ALERTS_MAX = 500
 _CAMERA_CAPTURES_MAX = 1000  # cap to prevent unbounded memory growth
+_alerts_buffer: deque[dict] = deque(maxlen=_ALERTS_MAX)  # state-change alerts
+_camera_captures: dict[tuple, dict] = {}  # (slot_id, ts) -> capture info
+_camera_captures_order: deque[tuple] = deque()  # insertion-order keys for LRU eviction
 
 # ── Challan (parking violation) tracking ──────────────────────────────────────
 # Challan re-check interval in seconds (70s × 2 checks ≈ detect >2 min stays)
@@ -116,10 +117,10 @@ CHALLAN_RECHECK_INTERVAL = int(os.getenv("CHALLAN_RECHECK_INTERVAL", "70"))
 # Dedup window: skip plate if it already has a challan/pending recheck within this many seconds
 CHALLAN_DEDUP_WINDOW = int(os.getenv("CHALLAN_DEDUP_WINDOW", "600"))  # 10 minutes
 CHALLAN_LOG_PATH = REPO_ROOT / "data" / "challan_events.jsonl"
-_challan_records: list[dict] = []  # in-memory challan buffer
+_CHALLAN_MAX = 1000
+_challan_records: deque[dict] = deque(maxlen=_CHALLAN_MAX)  # in-memory challan buffer
 _challan_lock = threading.Lock()
 _challan_pending: dict[str, dict] = {}  # plate_text -> pending recheck info
-_CHALLAN_MAX = 1000
 
 _max_streams = 50
 _active_streams = 0
@@ -538,7 +539,7 @@ def _log_camera_capture(slot_id: int, slot_name: str, zone: str, image_path: str
         _camera_captures_order.append(cap_key)
         # Evict oldest entries when over cap
         while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
-            old_key = _camera_captures_order.pop(0)
+            old_key = _camera_captures_order.popleft()
             _camera_captures.pop(old_key, None)
     except Exception as e:
         log.error("Error logging camera capture: %s", e)
@@ -740,8 +741,6 @@ def _record_challan(plate_text: str, slot_id: int, slot_name: str, zone: str,
                          plate_text, slot_name)
                 return
         _challan_records.append(record)
-        if len(_challan_records) > _CHALLAN_MAX:
-            _challan_records.pop(0)
 
     # Persist to file
     try:
@@ -964,8 +963,6 @@ def _process_mqtt_sensor_data(slot_id: int, status: str, timestamp_str: str, met
     for evt in events_to_log:
         if evt.get("event") == "slot_state_changed":
             _alerts_buffer.append(evt)
-            if len(_alerts_buffer) > _ALERTS_MAX:
-                _alerts_buffer.pop(0)
 
     has_state_changes = bool(events_to_log)
     _mqtt_previous_states = current_states.copy()
@@ -1271,11 +1268,8 @@ def _init_alerts_from_log():
             _camera_captures_order.append(key)
     # Evict oldest camera captures over cap
     while len(_camera_captures_order) > _CAMERA_CAPTURES_MAX:
-        old_key = _camera_captures_order.pop(0)
+        old_key = _camera_captures_order.popleft()
         _camera_captures.pop(old_key, None)
-    # Keep only the last N alerts
-    while len(_alerts_buffer) > _ALERTS_MAX:
-        _alerts_buffer.pop(0)
     log.info("Loaded %d alerts and %d camera captures from log", len(_alerts_buffer), len(_camera_captures))
 
     # Load challan records
@@ -1311,8 +1305,8 @@ def state():
         return _state_cache
 
     # Build fresh state
-    slot_ids = load_slot_ids(SLOT_META_PATH)
     meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+    slot_ids = sorted(meta_by_id.keys())
     result = build_state_from_log(EVENT_LOG_PATH, slot_ids=slot_ids, meta_by_id=meta_by_id)
 
     # Update cache
@@ -1374,7 +1368,6 @@ async def events(request: Request):
 
     try:
         async def gen():
-            EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             EVENT_LOG_PATH.touch(exist_ok=True)
 
             try:
@@ -1457,21 +1450,36 @@ def analytics_summary(range: str = Query(default="24h"),
     # Challan summary
     challan_summary = build_challan_summary(challans, zone=zone)
 
+    # Pre-group data by zone to avoid O(zones × n) rescans
+    incidents_by_zone: dict[str, int] = defaultdict(int)
+    for sc in state_changes:
+        if sc.get("prev_state") == "FREE" and sc.get("new_state") == "OCCUPIED":
+            incidents_by_zone[sc["zone"]] += 1
+    dwells_by_zone: dict[str, list[float]] = defaultdict(list)
+    for d in all_dwells:
+        dwells_by_zone[d["zone"]].append(d["minutes"])
+    challans_by_zone: dict[str, list[dict]] = defaultdict(list)
+    for c in challans:
+        challans_by_zone[c.get("zone", "A")].append(c)
+
     # Per-zone stats
     zone_stats = {}
     for z in all_zones:
-        z_incidents = [sc for sc in state_changes
-                       if sc.get("prev_state") == "FREE" and sc.get("new_state") == "OCCUPIED"
-                       and sc["zone"] == z]
-        z_dwells = [d for d in all_dwells if d["zone"] == z]
-        z_avg = round(sum(d["minutes"] for d in z_dwells) / len(z_dwells), 1) if z_dwells else 0
-        z_challan = build_challan_summary(challans, zone=z)
-        z_dist = build_dwell_distribution(all_dwells, zone=z)
+        z_dwell_list = dwells_by_zone[z]
+        z_avg = round(sum(z_dwell_list) / len(z_dwell_list), 1) if z_dwell_list else 0
+        z_challans = challans_by_zone[z]
+        z_confirmed = sum(1 for c in z_challans if c.get("challan"))
+        gt_15 = gt_30 = gt_45 = gt_60 = 0
+        for m in z_dwell_list:
+            if m > 15: gt_15 += 1
+            if m > 30: gt_30 += 1
+            if m > 45: gt_45 += 1
+            if m > 60: gt_60 += 1
         zone_stats[z] = {
-            "total_incidents": len(z_incidents),
+            "total_incidents": incidents_by_zone[z],
             "avg_parking_minutes": z_avg,
-            "challans_generated": z_challan["confirmed"],
-            "dwell_distribution": z_dist,
+            "challans_generated": z_confirmed,
+            "dwell_distribution": {"gt_15m": gt_15, "gt_30m": gt_30, "gt_45m": gt_45, "gt_1h": gt_60},
         }
 
     return {

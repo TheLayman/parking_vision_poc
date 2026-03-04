@@ -20,6 +20,7 @@ from pathlib import Path
 from requests.auth import HTTPDigestAuth
 from urllib.parse import quote
 from dotenv import load_dotenv
+from webapp.helpers.data_io import append_jsonl
 
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -44,6 +45,12 @@ MAX_QUEUE_SIZE = int(os.getenv("CAMERA_QUEUE_MAXSIZE", "50"))  # Maximum number 
 REPO_ROOT = Path(__file__).parent.parent
 CAMERA_SNAPSHOTS_DIR = REPO_ROOT / "data" / "camera_snapshots"
 QUEUE_LOG_PATH = REPO_ROOT / "data" / "camera_queue.jsonl"
+
+
+def _parse_utc(ts_str: str) -> datetime:
+    """Parse an ISO-8601 timestamp string to an aware UTC datetime."""
+    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 class CameraController:
@@ -271,84 +278,25 @@ class CameraTaskQueue:
 
     def _append_to_log(self, entry: dict):
         """Append a single entry to the JSONL log, filtering non-serializable fields."""
-        serializable = {}
-        for k, v in entry.items():
-            if k == "callback":
-                continue  # skip non-serializable callables
-            if isinstance(v, datetime):
-                serializable[k] = v.isoformat()
-            else:
-                serializable[k] = v
+        serializable = {
+            k: (v.isoformat() if isinstance(v, datetime) else v)
+            for k, v in entry.items()
+            if k != "callback"
+        }
         try:
-            self.queue_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._log_lock:
-                with open(self.queue_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(serializable) + "\n")
-                    f.flush()
+            append_jsonl(self.queue_log_path, serializable, lock=self._log_lock)
         except Exception as e:
             print(f"WARNING: Failed to write queue log: {e}")
 
-    def compact_log(self, max_age_seconds: int = 300):
-        """Rewrite the JSONL keeping only non-completed, non-stale entries."""
-        try:
-            if not self.queue_log_path.exists():
-                return
+    def _read_pending_log_entries(self, max_age_seconds: int) -> tuple[list[dict], int]:
+        """Parse the JSONL log and return (pending_entries, stale_count).
 
-            with self._log_lock:
-                entries = []
-                completed_ids = set()
-                cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
-
-                with open(self.queue_log_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                            if obj.get("status") == "completed":
-                                completed_ids.add(obj.get("task_id"))
-                            else:
-                                entries.append(obj)
-                        except Exception:
-                            continue
-
-                # Filter: keep only non-completed, non-stale
-                surviving = []
-                for entry in entries:
-                    if entry.get("task_id") in completed_ids:
-                        continue
-                    queued_at = entry.get("queued_at", "")
-                    if queued_at:
-                        try:
-                            task_time = datetime.fromisoformat(queued_at)
-                            if task_time.tzinfo is None:
-                                task_time = task_time.replace(tzinfo=timezone.utc)
-                            if task_time < cutoff:
-                                continue
-                        except Exception:
-                            pass
-                    surviving.append(entry)
-
-                # Rewrite
-                with open(self.queue_log_path, "w", encoding="utf-8") as f:
-                    for entry in surviving:
-                        f.write(json.dumps(entry) + "\n")
-                    f.flush()
-
-                print(f"Queue log compacted: {len(surviving)} pending tasks kept")
-        except Exception as e:
-            print(f"WARNING: Failed to compact queue log: {e}")
-
-    def recover_tasks(self, max_age_seconds: int = 300) -> list:
-        """Read the JSONL and return pending tasks (non-completed, not stale)."""
-        if not self.queue_log_path.exists():
-            return []
-
+        Filters out completed tasks and tasks older than *max_age_seconds*.
+        Returns an empty list (not raising) on any read error.
+        """
         entries = []
-        completed_ids = set()
+        completed_ids: set[str] = set()
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
-
         try:
             with open(self.queue_log_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -364,10 +312,9 @@ class CameraTaskQueue:
                     except Exception:
                         continue
         except Exception as e:
-            print(f"WARNING: Failed to read queue log for recovery: {e}")
-            return []
+            print(f"WARNING: Failed to read queue log: {e}")
+            return [], 0
 
-        # Filter
         pending = []
         stale_count = 0
         for entry in entries:
@@ -376,19 +323,41 @@ class CameraTaskQueue:
             queued_at = entry.get("queued_at", "")
             if queued_at:
                 try:
-                    task_time = datetime.fromisoformat(queued_at)
-                    if task_time.tzinfo is None:
-                        task_time = task_time.replace(tzinfo=timezone.utc)
-                    if task_time < cutoff:
+                    if _parse_utc(queued_at) < cutoff:
                         stale_count += 1
                         continue
                 except Exception:
                     pass
             pending.append(entry)
+        return pending, stale_count
 
+    def compact_log(self, max_age_seconds: int = 300):
+        """Rewrite the JSONL keeping only non-completed, non-stale entries."""
+        try:
+            if not self.queue_log_path.exists():
+                return
+
+            # Read outside the lock to minimise lock-hold time
+            surviving, _ = self._read_pending_log_entries(max_age_seconds)
+
+            # Atomic rewrite under lock
+            with self._log_lock:
+                with open(self.queue_log_path, "w", encoding="utf-8") as f:
+                    for entry in surviving:
+                        f.write(json.dumps(entry) + "\n")
+                    f.flush()
+
+            print(f"Queue log compacted: {len(surviving)} pending tasks kept")
+        except Exception as e:
+            print(f"WARNING: Failed to compact queue log: {e}")
+
+    def recover_tasks(self, max_age_seconds: int = 300) -> list:
+        """Read the JSONL and return pending tasks (non-completed, not stale)."""
+        if not self.queue_log_path.exists():
+            return []
+        pending, stale_count = self._read_pending_log_entries(max_age_seconds)
         if stale_count > 0:
             print(f"Discarded {stale_count} stale tasks (>{max_age_seconds}s old)")
-
         return pending
 
 
@@ -422,10 +391,7 @@ def camera_worker(controller: CameraController, task_queue: CameraTaskQueue):
         ready_idx = None
         for i, dt in enumerate(_delayed_tasks):
             try:
-                scheduled = datetime.fromisoformat(dt["scheduled_at"])
-                if scheduled.tzinfo is None:
-                    scheduled = scheduled.replace(tzinfo=timezone.utc)
-                if scheduled <= now:
+                if _parse_utc(dt["scheduled_at"]) <= now:
                     ready_idx = i
                     break
             except Exception:
@@ -445,10 +411,7 @@ def camera_worker(controller: CameraController, task_queue: CameraTaskQueue):
             scheduled_at = task.get("scheduled_at")
             if scheduled_at:
                 try:
-                    scheduled = datetime.fromisoformat(scheduled_at)
-                    if scheduled.tzinfo is None:
-                        scheduled = scheduled.replace(tzinfo=timezone.utc)
-                    if scheduled > now:
+                    if _parse_utc(scheduled_at) > now:
                         _delayed_tasks.append(task)
                         continue
                 except Exception:
@@ -468,7 +431,7 @@ def camera_worker(controller: CameraController, task_queue: CameraTaskQueue):
             timestamp = ts_raw
         elif isinstance(ts_raw, str):
             try:
-                timestamp = datetime.fromisoformat(ts_raw)
+                timestamp = _parse_utc(ts_raw)
             except Exception:
                 timestamp = datetime.now(timezone.utc)
         else:
