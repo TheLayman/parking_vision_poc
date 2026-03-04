@@ -121,6 +121,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // Chart instances
 let hourlyIncidentsChart = null;
+let dwellDistributionChart = null;
+let challanDonutChart = null;
+let zoneComparisonChart = null;
 
 // Analytics data cache (to avoid re-fetching on zone filter change)
 let analyticsDataCache = null;
@@ -312,6 +315,194 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
         y: {
           ...chartDefaults.scales.y,
           stacked: !selectedZone,
+          beginAtZero: true,
+          ticks: {
+            ...chartDefaults.scales.y.ticks,
+            stepSize: 1,
+            callback: v => Number.isInteger(v) ? v : '',
+          }
+        }
+      }
+    }
+  });
+}
+
+function renderDwellDistributionChart(dist, selectedZone) {
+  const ctx = document.getElementById('dwellDistributionChart')?.getContext('2d');
+  if (!ctx) return;
+
+  if (dwellDistributionChart) {
+    dwellDistributionChart.destroy();
+  }
+
+  const badge = document.getElementById('dwellChartBadge');
+  if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
+
+  const d = dist || {};
+  const data = [d.gt_15m || 0, d.gt_30m || 0, d.gt_45m || 0, d.gt_1h || 0];
+  const labels = ['>15 min', '>30 min', '>45 min', '>1 hour'];
+
+  dwellDistributionChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Vehicles',
+        data,
+        backgroundColor: 'rgba(245, 158, 11, 0.7)',
+        borderColor: '#f59e0b',
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      indexAxis: 'y',
+      plugins: {
+        ...chartDefaults.plugins,
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (item) => ` ${item.raw} vehicle${item.raw !== 1 ? 's' : ''}`,
+          }
+        }
+      },
+      scales: {
+        x: {
+          ...chartDefaults.scales.x,
+          beginAtZero: true,
+          ticks: {
+            ...chartDefaults.scales.x.ticks,
+            stepSize: 1,
+            callback: v => Number.isInteger(v) ? v : '',
+          }
+        },
+        y: { ...chartDefaults.scales.y }
+      }
+    }
+  });
+}
+
+function renderChallanDonutChart(challanSummary) {
+  const ctx = document.getElementById('challanDonutChart')?.getContext('2d');
+  if (!ctx) return;
+
+  if (challanDonutChart) {
+    challanDonutChart.destroy();
+  }
+
+  const confirmed = challanSummary?.confirmed || 0;
+  const cleared = challanSummary?.cleared || 0;
+  const total = confirmed + cleared;
+
+  const noData = total === 0;
+
+  challanDonutChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: noData ? ['No data'] : ['Challan Issued', 'Cleared'],
+      datasets: [{
+        data: noData ? [1] : [confirmed, cleared],
+        backgroundColor: noData
+          ? ['rgba(107, 114, 128, 0.3)']
+          : ['rgba(239, 68, 68, 0.7)', 'rgba(16, 185, 129, 0.7)'],
+        borderColor: noData
+          ? ['rgba(107, 114, 128, 0.5)']
+          : ['#ef4444', '#10b981'],
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: { color: '#c5cee0', font: { family: 'Inter' }, padding: 16 }
+        },
+        tooltip: {
+          callbacks: {
+            label: (item) => noData
+              ? ' No challan data'
+              : ` ${item.label}: ${item.raw} (${total > 0 ? Math.round(item.raw / total * 100) : 0}%)`,
+          }
+        }
+      },
+      cutout: '65%',
+    },
+    plugins: [{
+      id: 'centreLabel',
+      afterDraw(chart) {
+        if (!chart.chartArea) return;
+        const { ctx: c, chartArea: { width, height, left, top } } = chart;
+        c.save();
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        const cx = left + width / 2;
+        const cy = top + height / 2;
+        c.fillStyle = '#c5cee0';
+        c.font = 'bold 22px Inter';
+        c.fillText(noData ? '—' : total, cx, cy - 8);
+        c.font = '11px Inter';
+        c.fillStyle = '#8b96b0';
+        c.fillText('total', cx, cy + 12);
+        c.restore();
+      }
+    }]
+  });
+}
+
+function renderZoneComparisonChart(zoneStats, zones) {
+  const ctx = document.getElementById('zoneComparisonChart')?.getContext('2d');
+  if (!ctx) return;
+
+  if (zoneComparisonChart) {
+    zoneComparisonChart.destroy();
+  }
+
+  const zoneList = zones || Object.keys(zoneStats || {});
+
+  zoneComparisonChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: zoneList.map(z => `Zone ${z}`),
+      datasets: [
+        {
+          label: 'Incidents',
+          data: zoneList.map(z => zoneStats?.[z]?.total_incidents || 0),
+          backgroundColor: 'rgba(99, 102, 241, 0.7)',
+          borderColor: '#6366f1',
+          borderWidth: 1,
+          borderRadius: 4,
+        },
+        {
+          label: 'Challans',
+          data: zoneList.map(z => zoneStats?.[z]?.challans_generated || 0),
+          backgroundColor: 'rgba(239, 68, 68, 0.7)',
+          borderColor: '#ef4444',
+          borderWidth: 1,
+          borderRadius: 4,
+        }
+      ]
+    },
+    options: {
+      ...chartDefaults,
+      plugins: {
+        ...chartDefaults.plugins,
+        tooltip: {
+          callbacks: {
+            afterBody: (items) => {
+              const z = zoneList[items[0]?.dataIndex];
+              const avg = zoneStats?.[z]?.avg_parking_minutes;
+              return avg ? [`Avg dwell: ${avg} min`] : [];
+            }
+          }
+        }
+      },
+      scales: {
+        ...chartDefaults.scales,
+        x: { ...chartDefaults.scales.x },
+        y: {
+          ...chartDefaults.scales.y,
           beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
