@@ -114,7 +114,7 @@ document.addEventListener('DOMContentLoaded', function() {
   // Handle ?tab= query param from cross-page navigation
   const params = new URLSearchParams(window.location.search);
   const requestedTab = params.get('tab');
-  if (requestedTab && ['dashboard', 'analytics', 'alerts'].includes(requestedTab)) {
+  if (requestedTab && ['dashboard', 'analytics', 'alerts', 'challans'].includes(requestedTab)) {
     switchTab(requestedTab);
   }
 });
@@ -216,9 +216,6 @@ function renderIncidentStats(data) {
 
   const dist = data.dwell_distribution || {};
   document.getElementById('statGt15').textContent = dist.gt_15m || 0;
-  document.getElementById('statGt30').textContent = dist.gt_30m || 0;
-  document.getElementById('statGt45').textContent = dist.gt_45m || 0;
-  document.getElementById('statGt1h').textContent = dist.gt_1h || 0;
 }
 
 function renderHourlyIncidentsChart(hourlyData, selectedZone) {
