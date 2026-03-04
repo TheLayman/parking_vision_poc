@@ -39,6 +39,10 @@ LPR_EASYOCR_LANGS = [
 ]
 LPR_EASYOCR_DOWNLOAD = os.getenv("LPR_EASYOCR_DOWNLOAD", "0").strip().lower() in {"1", "true", "yes"}
 LPR_PREPROCESS = os.getenv("LPR_PREPROCESS", "1").strip().lower() not in {"0", "false", "no"}
+# Max image dimension before passing to EasyOCR. CRAFT detector is O(W×H) on CPU;
+# a 1920×1080 image takes ~45 s/call × 3 variants = ~2 min. 1280 keeps quality while
+# cutting time to ~10–15 s/call. Override with LPR_OCR_MAX_DIM=960 for faster inference.
+_OCR_MAX_DIM = int(os.getenv("LPR_OCR_MAX_DIM", "1280"))
 
 # Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
 PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
@@ -144,6 +148,20 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
+def warm_up():
+    """Pre-load the active OCR backend so the first real inference job is not slow.
+
+    Call this once at server startup (e.g. from the inference worker thread before
+    entering the main loop).  For EasyOCR this triggers PyTorch model loading from
+    disk (~5–10 s); subsequent calls reuse the in-memory singleton.
+    """
+    backend = _resolve_backend()
+    if backend == "easyocr":
+        log.info("Pre-warming EasyOCR reader (this may take a few seconds)…")
+        _get_easyocr_reader()
+        log.info("EasyOCR reader ready")
+
+
 def _encode_image_to_base64(image: np.ndarray) -> str:
     """Encode an OpenCV image (BGR numpy array) to a base64 JPEG string."""
     success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -175,6 +193,21 @@ def _preprocess_for_ocr(image: np.ndarray) -> list:
     variants.append(cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR))
 
     return variants
+
+
+def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
+    """Downscale image so its longest edge ≤ _OCR_MAX_DIM (aspect ratio preserved).
+
+    EasyOCR's CRAFT detector is O(W×H); skipping this on a 1080p frame means
+    ~45 s per readtext() call on CPU.  At 1280 px the same call takes ~10–15 s.
+    """
+    h, w = image.shape[:2]
+    max_dim = max(h, w)
+    if max_dim <= _OCR_MAX_DIM:
+        return image
+    scale = _OCR_MAX_DIM / max_dim
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,12 +320,13 @@ def _call_openai_vision(image: np.ndarray) -> dict:
 def _call_local_ocr(image: np.ndarray) -> dict:
     try:
         reader = _get_easyocr_reader()
+        image = _resize_for_ocr(image)
         variants = _preprocess_for_ocr(image)
         detected: dict = {}
         saw_text = False
 
         for variant in variants:
-            output = reader.readtext(variant, detail=1, paragraph=False)
+            output = reader.readtext(variant, detail=1, paragraph=False, canvas_size=_OCR_MAX_DIM)
             if not output:
                 continue
 
