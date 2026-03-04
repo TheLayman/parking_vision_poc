@@ -1486,6 +1486,8 @@ def analytics_summary(range: str = Query(default="24h"),
         "total_incidents": total_incidents,
         "avg_parking_minutes": avg_parking_minutes,
         "challans_generated": challan_summary["confirmed"],
+        # by_zone omitted here — per-zone breakdown is already in zone_stats
+        "challan_summary": {k: v for k, v in challan_summary.items() if k != "by_zone"},
         "dwell_distribution": dwell_distribution,
         "hourly_incidents": hourly_incidents,
         "zones": all_zones,
