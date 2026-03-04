@@ -39,6 +39,11 @@ LPR_EASYOCR_LANGS = [
 ]
 LPR_EASYOCR_DOWNLOAD = os.getenv("LPR_EASYOCR_DOWNLOAD", "0").strip().lower() in {"1", "true", "yes"}
 LPR_PREPROCESS = os.getenv("LPR_PREPROCESS", "1").strip().lower() not in {"0", "false", "no"}
+LPR_EASYOCR_GPU = os.getenv("LPR_EASYOCR_GPU", "auto").strip().lower()
+
+# Downscale large images before OCR to save time & memory.
+# Frames wider than this are resized (aspect-ratio preserved).
+LPR_MAX_OCR_WIDTH = int(os.getenv("LPR_MAX_OCR_WIDTH", "1024"))
 
 # Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
 PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
@@ -124,21 +129,37 @@ def _resolve_backend() -> str:
     return backend
 
 
+def _detect_gpu() -> bool:
+    """Return True if CUDA is available and user hasn't explicitly disabled GPU."""
+    if LPR_EASYOCR_GPU in {"0", "false", "no", "off", "cpu"}:
+        return False
+    if LPR_EASYOCR_GPU in {"1", "true", "yes", "on"}:
+        return True
+    # auto-detect
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
 def _get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None:
         import easyocr
 
         langs = LPR_EASYOCR_LANGS or ["en"]
+        use_gpu = _detect_gpu()
         _easyocr_reader = easyocr.Reader(
             langs,
-            gpu=False,
+            gpu=use_gpu,
             verbose=False,
             download_enabled=LPR_EASYOCR_DOWNLOAD,
         )
         log.info(
-            "EasyOCR initialised (langs: %s, download_enabled: %s)",
+            "EasyOCR initialised (langs: %s, gpu: %s, download_enabled: %s)",
             ",".join(langs),
+            use_gpu,
             LPR_EASYOCR_DOWNLOAD,
         )
     return _easyocr_reader
@@ -152,27 +173,34 @@ def _encode_image_to_base64(image: np.ndarray) -> str:
     return base64.b64encode(buffer).decode("utf-8")
 
 
+def _downscale(image: np.ndarray, max_width: int = LPR_MAX_OCR_WIDTH) -> np.ndarray:
+    """Resize image so its width <= *max_width* (aspect-ratio preserved)."""
+    h, w = image.shape[:2]
+    if w <= max_width:
+        return image
+    scale = max_width / w
+    return cv2.resize(image, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
 def _preprocess_for_ocr(image: np.ndarray) -> list:
+    """Return at most 2 variants (original + CLAHE-enhanced) to limit OCR passes."""
+    # Downscale first to speed up both preprocessing and OCR inference.
+    image = _downscale(image)
     variants = [image]
     if not LPR_PREPROCESS:
         return variants
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # CLAHE + light denoise (d=5 is much faster than d=9, still effective)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    denoised = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
+    denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
     variants.append(cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR))
 
-    adaptive = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        7,
-    )
-    variants.append(cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR))
+    # Dropped adaptive-threshold variant — it rarely helps and adds a full
+    # extra OCR pass (~30-40 s on CPU).  The CLAHE variant already handles
+    # poor-contrast plates well.
 
     return variants
 
@@ -291,8 +319,16 @@ def _call_local_ocr(image: np.ndarray) -> dict:
         detected: dict = {}
         saw_text = False
 
+        _allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         for variant in variants:
-            output = reader.readtext(variant, detail=1, paragraph=False)
+            output = reader.readtext(
+                variant,
+                detail=1,
+                paragraph=False,
+                decoder="greedy",         # ~2× faster than beamsearch
+                allowlist=_allowlist,      # skip non-plate characters
+                batch_size=8,             # batch text-recognition crops
+            )
             if not output:
                 continue
 
