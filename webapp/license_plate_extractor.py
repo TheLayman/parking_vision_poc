@@ -219,21 +219,6 @@ def _preprocess_for_ocr(image: np.ndarray) -> list:
     return variants
 
 
-def _resize_for_ocr(image: np.ndarray) -> np.ndarray:
-    """Downscale image so its longest edge ≤ _OCR_MAX_DIM (aspect ratio preserved).
-
-    EasyOCR's CRAFT detector is O(W×H); skipping this on a 1080p frame means
-    ~45 s per readtext() call on CPU.  At 1280 px the same call takes ~10–15 s.
-    """
-    h, w = image.shape[:2]
-    max_dim = max(h, w)
-    if max_dim <= _OCR_MAX_DIM:
-        return image
-    scale = _OCR_MAX_DIM / max_dim
-    new_w, new_h = int(w * scale), int(h * scale)
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Core: single OpenAI vision call (Structured Outputs)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -344,7 +329,6 @@ def _call_openai_vision(image: np.ndarray) -> dict:
 def _call_local_ocr(image: np.ndarray) -> dict:
     try:
         reader = _get_easyocr_reader()
-        image = _resize_for_ocr(image)
         variants = _preprocess_for_ocr(image)
         detected: dict = {}
         saw_text = False
@@ -404,7 +388,8 @@ def _call_local_ocr(image: np.ndarray) -> dict:
         }
     except Exception as e:
         log.error("EasyOCR call failed: %s", e)
-        return {"vehicle_detected": False, "plates": [], "plates_detail": []}
+        # OCR failure ≠ no vehicle; the sensor already triggered so assume vehicle present
+        return {"vehicle_detected": True, "plates": [], "plates_detail": []}
 
 
 def _extract_from_image(image: np.ndarray) -> dict:

@@ -1539,9 +1539,8 @@ def get_alerts(limit: int = Query(default=50, le=200), offset: int = Query(defau
         key = (alert.get("slot_id"), alert.get("ts"))
         capture = _camera_captures.get(key)
         if capture:
-            if not capture.get("vehicle_detected", True):
-                continue  # skip false positives
             entry["image_path"] = capture["image_path"]
+            entry["vehicle_detected"] = capture.get("vehicle_detected", True)
             entry["license_plate"] = capture["license_plate"]
             entry["license_plates"] = capture.get("license_plates", [])
         else:
