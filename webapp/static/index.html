@@ -129,7 +129,7 @@
       </div>
 
       <div class="analytics-grid">
-        <!-- Hourly Incidents Chart - full width -->
+        <!-- Row 1: Hourly Incidents — full width -->
         <div class="chart-card chart-card-wide">
           <div class="chart-header">
             <div class="chart-title">📈 Hourly Unauthorized Parking Incidents</div>
@@ -137,6 +137,38 @@
           </div>
           <div class="chart-container chart-container-lg">
             <canvas id="hourlyIncidentsChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Row 2: Dwell Distribution (left) -->
+        <div class="chart-card">
+          <div class="chart-header">
+            <div class="chart-title">⏳ Dwell Time Distribution</div>
+            <div class="chart-badge" id="dwellChartBadge">All Zones</div>
+          </div>
+          <div class="chart-container">
+            <canvas id="dwellDistributionChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Row 2: Challan Split (right) -->
+        <div class="chart-card">
+          <div class="chart-header">
+            <div class="chart-title">📋 Challan Outcome</div>
+          </div>
+          <div class="chart-container">
+            <canvas id="challanDonutChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Row 3: Per-Zone Comparison — full width -->
+        <div class="chart-card chart-card-wide">
+          <div class="chart-header">
+            <div class="chart-title">🗂 Zone Comparison</div>
+            <div class="chart-badge" id="zoneChartBadge">Incidents vs Challans</div>
+          </div>
+          <div class="chart-container">
+            <canvas id="zoneComparisonChart"></canvas>
           </div>
         </div>
       </div>
