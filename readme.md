@@ -1,6 +1,6 @@
 # 🅿️ Unauthorized Parking Detection System
 
-Real-time unauthorized parking detection using **LoRaWAN magnetometer sensors** with PTZ camera integration, **OpenAI Vision license plate recognition**, and automated **challan (violation) tracking**.
+Real-time unauthorized parking detection using **LoRaWAN magnetometer sensors** with PTZ camera integration, selectable **OpenAI Vision / EasyOCR license plate recognition**, and automated **challan (violation) tracking**.
 
 ---
 
@@ -10,7 +10,7 @@ Real-time unauthorized parking detection using **LoRaWAN magnetometer sensors** 
 - **Simple Status Decoding** — Payload-based occupancy: `00` (Free), `01` (Occupied), `cd` (Calibration Done)
 - **Device Calibration & Threshold** — Send calibration/threshold commands via ChirpStack gRPC (MQTT fallback)
 - **PTZ Camera Control** — Automatic camera positioning and image capture on state changes
-- **OpenAI Vision LPR** — GPT-5.2-powered license plate recognition with structured output
+- **Dual LPR Backends** — GPT-5.2 OpenAI Vision or local EasyOCR (cost-saving backup)
 - **Challan Tracking** — Automated violation detection with timed rechecks and deduplication
 - **Fuzzy Plate Matching** — Handles OCR misreads with configurable similarity threshold
 - **Live Dashboard** — Real-time visualization with Server-Sent Events and 4 tabs
@@ -27,7 +27,7 @@ Real-time unauthorized parking detection using **LoRaWAN magnetometer sensors** 
 - MQTT Broker (Mosquitto, ChirpStack, etc.)
 - LoRaWAN sensors with 3-axis magnetometer (sending via ChirpStack)
 - PTZ Camera with preset support (optional)
-- OpenAI API key (for license plate recognition)
+- OpenAI API key (optional, only when using OpenAI LPR backend)
 
 ### Installation
 
@@ -73,6 +73,16 @@ CHIRPSTACK_APP_ID=your_application_uuid
 OPENAI_API_KEY=your_openai_api_key
 OPENAI_LPR_MODEL=gpt-5.2
 OPENAI_LPR_MAX_TOKENS=300
+
+# LPR backend selection
+# auto      -> use OpenAI when OPENAI_API_KEY is set, else EasyOCR
+# openai    -> force OpenAI Vision
+# easyocr   -> force local EasyOCR
+LPR_BACKEND=auto
+LPR_EASYOCR_LANGS=en
+LPR_EASYOCR_DOWNLOAD=0
+LPR_PREPROCESS=1
+
 PLATE_MIN_CONFIDENCE=0.65
 PLATE_REGEX_PATTERN=^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{1,4}$
 
@@ -113,7 +123,7 @@ Edit `config/slot_meta.yaml` to define parking slots:
 2. **ChirpStack** forwards data to MQTT broker on topic `application/+/device/+/event/up`
 3. **Server** subscribes to MQTT, decodes base64 payload hex, maps device name to slot ID
 4. **State Changes** trigger event logging and camera capture (if enabled)
-5. **Camera captures** are analyzed by OpenAI Vision for license plate detection
+5. **Camera captures** are analyzed by the configured LPR backend (OpenAI Vision or EasyOCR)
 6. **Challan rechecks** are scheduled — if the same plate is detected again after the interval, a violation is confirmed
 7. **Dashboard** receives real-time updates via Server-Sent Events
 

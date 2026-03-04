@@ -1,12 +1,5 @@
 """
-License plate extraction module using OpenAI vision (GPT-5.2).
-
-Pipeline (single API call per image):
-  1. Load image & encode to base64 JPEG
-  2. Send to OpenAI vision — detect vehicles + read all plates in one call
-  3. Post-process (normalisation + regex validation)
-
-No local ML models (YOLO) or heavy OpenCV preprocessing required.
+License plate extraction module with selectable OpenAI and EasyOCR backends.
 """
 
 import base64
@@ -38,6 +31,14 @@ _INDIAN_STATE_CODES = {
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_LPR_MODEL", "gpt-5.2")
 OPENAI_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_LPR_MAX_TOKENS", "300"))
+LPR_BACKEND = os.getenv("LPR_BACKEND", "auto").strip().lower()
+LPR_EASYOCR_LANGS = [
+    lang.strip().lower()
+    for lang in os.getenv("LPR_EASYOCR_LANGS", "en").split(",")
+    if lang.strip()
+]
+LPR_EASYOCR_DOWNLOAD = os.getenv("LPR_EASYOCR_DOWNLOAD", "0").strip().lower() in {"1", "true", "yes"}
+LPR_PREPROCESS = os.getenv("LPR_PREPROCESS", "1").strip().lower() not in {"0", "false", "no"}
 
 # Minimum confidence to keep a plate (high=1.0, medium=0.7, low=0.3)
 PLATE_MIN_CONFIDENCE = float(os.getenv("PLATE_MIN_CONFIDENCE", "0.65"))
@@ -45,6 +46,8 @@ _CONFIDENCE_SCORES: dict = {"high": 1.0, "medium": 0.7, "low": 0.3}
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
 _openai_client = None  # openai.OpenAI
+_easyocr_reader = None
+_active_backend_logged = False
 
 # ── System prompt for OpenAI vision ──────────────────────────────────────────
 _SYSTEM_PROMPT = (
@@ -111,12 +114,67 @@ def _get_openai_client():
     return _openai_client
 
 
+def _resolve_backend() -> str:
+    backend = LPR_BACKEND
+    if backend not in {"auto", "openai", "easyocr"}:
+        log.warning("Invalid LPR_BACKEND=%s; falling back to auto", backend)
+        backend = "auto"
+    if backend == "auto":
+        return "openai" if OPENAI_API_KEY else "easyocr"
+    return backend
+
+
+def _get_easyocr_reader():
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        import easyocr
+
+        langs = LPR_EASYOCR_LANGS or ["en"]
+        _easyocr_reader = easyocr.Reader(
+            langs,
+            gpu=False,
+            verbose=False,
+            download_enabled=LPR_EASYOCR_DOWNLOAD,
+        )
+        log.info(
+            "EasyOCR initialised (langs: %s, download_enabled: %s)",
+            ",".join(langs),
+            LPR_EASYOCR_DOWNLOAD,
+        )
+    return _easyocr_reader
+
+
 def _encode_image_to_base64(image: np.ndarray) -> str:
     """Encode an OpenCV image (BGR numpy array) to a base64 JPEG string."""
     success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not success:
         raise ValueError("Failed to encode image to JPEG")
     return base64.b64encode(buffer).decode("utf-8")
+
+
+def _preprocess_for_ocr(image: np.ndarray) -> list:
+    variants = [image]
+    if not LPR_PREPROCESS:
+        return variants
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
+    variants.append(cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR))
+
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        7,
+    )
+    variants.append(cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR))
+
+    return variants
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -226,6 +284,74 @@ def _call_openai_vision(image: np.ndarray) -> dict:
         return {"vehicle_detected": False, "plates": [], "plates_detail": []}
 
 
+def _call_local_ocr(image: np.ndarray) -> dict:
+    try:
+        reader = _get_easyocr_reader()
+        variants = _preprocess_for_ocr(image)
+        detected: dict = {}
+        saw_text = False
+
+        for variant in variants:
+            output = reader.readtext(variant, detail=1, paragraph=False)
+            if not output:
+                continue
+
+            for line in output:
+                if not isinstance(line, (list, tuple)) or len(line) < 3:
+                    continue
+
+                raw_text = str(line[1]).strip()
+                if not raw_text:
+                    continue
+                saw_text = True
+
+                try:
+                    confidence = float(line[2])
+                except Exception:
+                    confidence = 0.0
+
+                normalised = _normalise(raw_text)
+                if not normalised or not normalised.isalnum() or len(normalised) < 5 or len(normalised) > 15:
+                    continue
+
+                adjusted_confidence = confidence * 0.85
+                state_prefix_ok = len(normalised) >= 2 and normalised[:2] in _INDIAN_STATE_CODES
+                regex_ok = bool(PLATE_REGEX_PATTERN and re.match(PLATE_REGEX_PATTERN, normalised))
+                if not state_prefix_ok and not regex_ok:
+                    adjusted_confidence *= 0.5
+
+                if adjusted_confidence < PLATE_MIN_CONFIDENCE:
+                    continue
+
+                existing = detected.get(normalised)
+                if (existing is None) or (adjusted_confidence > existing["confidence"]):
+                    detected[normalised] = {
+                        "plate_text": normalised,
+                        "confidence": adjusted_confidence,
+                    }
+
+        plates_detail = sorted(detected.values(), key=lambda item: item["confidence"], reverse=True)
+        return {
+            "vehicle_detected": bool(plates_detail) or saw_text,
+            "plates": [item["plate_text"] for item in plates_detail],
+            "plates_detail": plates_detail,
+        }
+    except Exception as e:
+        log.error("EasyOCR call failed: %s", e)
+        return {"vehicle_detected": False, "plates": [], "plates_detail": []}
+
+
+def _extract_from_image(image: np.ndarray) -> dict:
+    global _active_backend_logged
+    backend = _resolve_backend()
+    if not _active_backend_logged:
+        log.info("License plate backend selected: %s", backend)
+        _active_backend_logged = True
+    if backend == "openai":
+        return _call_openai_vision(image)
+    return _call_local_ocr(image)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Post-processing
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -329,7 +455,7 @@ def extract_license_plate(image_path) -> dict:
             log.warning("Failed to load image: %s", image_path)
             return _empty_result()
 
-        vision = _call_openai_vision(image)
+        vision = _extract_from_image(image)
         result = _empty_result()
         result["vehicle_detected"] = vision["vehicle_detected"]
 
@@ -369,7 +495,7 @@ def extract_all_license_plates(image_path) -> dict:
             log.warning("Failed to load image: %s", image_path)
             return {"plates": [], "vehicle_detected": False}
 
-        vision = _call_openai_vision(image)
+        vision = _extract_from_image(image)
 
         plates = []
         for detail in vision["plates_detail"]:
