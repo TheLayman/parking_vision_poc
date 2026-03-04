@@ -191,6 +191,9 @@ async function loadAnalytics() {
 
     renderIncidentStats(data);
     renderHourlyIncidentsChart(data.hourly_incidents, zone);
+    renderDwellDistributionChart(data.dwell_distribution, zone);
+    renderChallanDonutChart(data.challan_summary);
+    renderZoneComparisonChart(data.zone_stats, data.zones);
 
   } catch (err) {
     console.error('Failed to load analytics:', err);
