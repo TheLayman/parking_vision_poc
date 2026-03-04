@@ -249,11 +249,14 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
     const zoneList = Array.from(allZones).sort();
 
     if (zoneList.length <= 1) {
-      // Single zone or "all" total — show a single series
+      const counts = (hourlyData || []).map(e => e.all || 0);
+      const peakVal = Math.max(...counts, 0);
       datasets = [{
         label: 'Incidents',
-        data: (hourlyData || []).map(e => e.all || 0),
-        backgroundColor: 'rgba(239, 68, 68, 0.6)',
+        data: counts,
+        backgroundColor: counts.map(v => v === peakVal && peakVal > 0
+          ? 'rgba(239, 68, 68, 0.95)'
+          : 'rgba(239, 68, 68, 0.45)'),
         borderColor: '#ef4444',
         borderWidth: 2,
         borderRadius: 6,
@@ -275,10 +278,14 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
   } else {
     // Specific zone selected
     const color = getZoneColor(selectedZone);
+    const counts = (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0);
+    const peakVal = Math.max(...counts, 0);
     datasets = [{
       label: `Zone ${selectedZone}`,
-      data: (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0),
-      backgroundColor: color.border + 'AA',
+      data: counts,
+      backgroundColor: counts.map(v => v === peakVal && peakVal > 0
+        ? color.border + 'F0'
+        : color.border + '55'),
       borderColor: color.border,
       borderWidth: 2,
       borderRadius: 6,
