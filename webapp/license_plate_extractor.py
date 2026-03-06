@@ -329,12 +329,13 @@ def _call_openai_vision(image: np.ndarray) -> dict:
 def _call_local_ocr(image: np.ndarray) -> dict:
     try:
         reader = _get_easyocr_reader()
+        log.info("EasyOCR reader acquired, running OCR on %d variant(s)", 2 if LPR_PREPROCESS else 1)
         variants = _preprocess_for_ocr(image)
         detected: dict = {}
         saw_text = False
 
         _allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        for variant in variants:
+        for v_idx, variant in enumerate(variants):
             output = reader.readtext(
                 variant,
                 detail=1,
@@ -343,6 +344,7 @@ def _call_local_ocr(image: np.ndarray) -> dict:
                 allowlist=_allowlist,      # skip non-plate characters
                 batch_size=8,             # batch text-recognition crops
             )
+            log.info("EasyOCR variant %d raw output: %s", v_idx, output)
             if not output:
                 continue
 
@@ -370,7 +372,12 @@ def _call_local_ocr(image: np.ndarray) -> dict:
                 if not state_prefix_ok and not regex_ok:
                     adjusted_confidence *= 0.5
 
+                log.info(
+                    "OCR candidate: %r raw_conf=%.3f adj_conf=%.3f state_ok=%s regex_ok=%s threshold=%.2f",
+                    normalised, confidence, adjusted_confidence, state_prefix_ok, regex_ok, PLATE_MIN_CONFIDENCE,
+                )
                 if adjusted_confidence < PLATE_MIN_CONFIDENCE:
+                    log.info("  → dropped (below threshold)")
                     continue
 
                 existing = detected.get(normalised)
