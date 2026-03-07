@@ -834,8 +834,8 @@ def _detect_state_changes(current_states: dict, previous_states: dict, meta_by_i
                 "new_state": state
             })
 
-            # Enqueue camera task if enabled
-            if ENABLE_CAMERA_CONTROL and _camera_queue is not None and prev_state == "FREE" and state == "OCCUPIED":
+            # Enqueue camera task if enabled (both FREE→OCCUPIED and OCCUPIED→FREE)
+            if ENABLE_CAMERA_CONTROL and _camera_queue is not None and ((prev_state == "FREE" and state == "OCCUPIED") or (prev_state == "OCCUPIED" and state == "FREE")):
                 preset = meta.get("preset")
                 if preset:
                     try:
