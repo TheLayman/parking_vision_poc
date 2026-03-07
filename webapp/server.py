@@ -137,6 +137,11 @@ _inference_queue = _queue.Queue(maxsize=INFERENCE_QUEUE_MAXSIZE)
 _inference_worker_thread = None
 _inference_shutdown_event = threading.Event()
 
+# MQTT message processing (decoupled from paho-mqtt network thread)
+_mqtt_message_queue: _queue.Queue = _queue.Queue(maxsize=500)
+_mqtt_worker_thread = None
+_mqtt_worker_shutdown_event = threading.Event()
+
 # Basic runtime metrics
 _metrics_lock = threading.Lock()
 _pipeline_metrics = {
@@ -1032,49 +1037,65 @@ def _flush_snapshot_to_disk():
         _slots_snapshot_dirty = False
 
 
+def _mqtt_worker():
+    """Background worker that processes MQTT messages off the paho network thread."""
+    log.info("MQTT worker thread started")
+    while not _mqtt_worker_shutdown_event.is_set():
+        try:
+            payload = _mqtt_message_queue.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+
+        try:
+            device_name = payload.get('deviceInfo', {}).get('deviceName', 'Unknown')
+
+            raw_data = payload.get('data')
+            if not raw_data:
+                log.debug("Device %s: No data in payload", device_name)
+                continue
+
+            decoded = decode_uplink(raw_data)
+            status = decoded['status']
+            timestamp_str = decoded['timestamp']
+
+            log.info("MQTT Device: %s | status: %s | ts: %s", device_name, status, timestamp_str)
+
+            meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+            slot_id = get_slot_id_by_device_name(device_name, meta_by_id)
+
+            if slot_id is None:
+                log.warning("Device '%s' not mapped to any slot", device_name)
+                continue
+
+            app_id = payload.get('deviceInfo', {}).get('applicationId')
+            dev_eui = payload.get('deviceInfo', {}).get('devEui')
+
+            if app_id and dev_eui:
+                new_info = {"applicationId": app_id, "devEui": dev_eui}
+                if _device_map.get(slot_id) != new_info:
+                    _device_map[slot_id] = new_info
+                    _save_device_map()
+
+            _process_mqtt_sensor_data(slot_id, status, timestamp_str, meta_by_id)
+
+        except Exception as e:
+            log.error("Error processing MQTT message: %s", e)
+
+    log.info("MQTT worker thread stopped")
+
+
 def on_mqtt_message(client, userdata, msg):
     """
-    Handle incoming MQTT messages from ChirpStack/LoRaWAN.
-    Decodes the payload and processes sensor status.
+    Handle incoming MQTT messages — non-blocking.
+    Just parses and enqueues the payload; heavy work is done in _mqtt_worker.
     """
     try:
         payload = json.loads(msg.payload)
-        device_name = payload.get('deviceInfo', {}).get('deviceName', 'Unknown')
-        
-        raw_data = payload.get('data')
-        if not raw_data:
-            log.debug("Device %s: No data in payload", device_name)
-            return
-        
-        decoded = decode_uplink(raw_data)
-        status = decoded['status']
-        timestamp_str = decoded['timestamp']
-        
-        log.info("MQTT Device: %s | status: %s | ts: %s", device_name, status, timestamp_str)
-        
-        # Single meta load for the entire message processing
-        meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
-        slot_id = get_slot_id_by_device_name(device_name, meta_by_id)
-        
-        if slot_id is None:
-            log.warning("Device '%s' not mapped to any slot", device_name)
-            return
-        
-        # Update device map only when info changes
-        app_id = payload.get('deviceInfo', {}).get('applicationId')
-        dev_eui = payload.get('deviceInfo', {}).get('devEui')
-        
-        if app_id and dev_eui:
-            new_info = {"applicationId": app_id, "devEui": dev_eui}
-            if _device_map.get(slot_id) != new_info:
-                _device_map[slot_id] = new_info
-                _save_device_map()
-
-        # Process the sensor data (meta_by_id passed to avoid re-loading)
-        _process_mqtt_sensor_data(slot_id, status, timestamp_str, meta_by_id)
-        
+        _mqtt_message_queue.put_nowait(payload)
+    except _queue.Full:
+        log.warning("MQTT message queue full — dropping message")
     except Exception as e:
-        log.error("Error processing MQTT message: %s", e)
+        log.error("Error queuing MQTT message: %s", e)
 
 
 def on_mqtt_connect(client, userdata, flags, rc):
@@ -1113,10 +1134,11 @@ def stop_mqtt_listener():
         _mqtt_client = None
 
 def _startup():
-    global _camera_queue, _camera_controller, _camera_worker_thread, _slots_snapshot, _inference_worker_thread
+    global _camera_queue, _camera_controller, _camera_worker_thread, _slots_snapshot, _inference_worker_thread, _mqtt_worker_thread
 
     _shutdown_event.clear()
     _inference_shutdown_event.clear()
+    _mqtt_worker_shutdown_event.clear()
 
     # Load snapshot into memory
     data = load_snapshot_data()
@@ -1163,6 +1185,13 @@ def _startup():
     )
     _inference_worker_thread.start()
 
+    _mqtt_worker_thread = threading.Thread(
+        target=_mqtt_worker,
+        daemon=True,
+        name="MQTTWorker",
+    )
+    _mqtt_worker_thread.start()
+
     if ENABLE_MQTT:
         log.info("MQTT enabled. Starting listener for %s:%s...", MQTT_BROKER, MQTT_PORT)
         start_mqtt_listener()
@@ -1177,6 +1206,7 @@ def _shutdown():
     log.info("Shutting down...")
     _shutdown_event.set()
     _inference_shutdown_event.set()
+    _mqtt_worker_shutdown_event.set()
 
     # Flush snapshot to disk
     _flush_snapshot_to_disk()
@@ -1204,12 +1234,20 @@ def _shutdown():
             log.warning("Inference worker did not terminate within 15s")
         else:
             log.info("Inference worker stopped gracefully")
+    if _mqtt_worker_thread is not None and _mqtt_worker_thread.is_alive():
+        log.info("Shutting down MQTT worker...")
+        _mqtt_worker_thread.join(timeout=5)
+        if _mqtt_worker_thread.is_alive():
+            log.warning("MQTT worker did not terminate within 5s")
+        else:
+            log.info("MQTT worker stopped gracefully")
 
 
 def _atexit_handler():
     """Safety net for unclean exits (Ctrl+C, kill) that bypass the FastAPI lifespan."""
     _shutdown_event.set()
     _inference_shutdown_event.set()
+    _mqtt_worker_shutdown_event.set()
     if _camera_queue is not None:
         _camera_queue.shutdown_event.set()
     _flush_snapshot_to_disk()
