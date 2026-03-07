@@ -457,10 +457,14 @@ def _fix_confusables(plate: str) -> Optional[str]:
     return None
 
 
-def _postprocess_plate_text(raw_ocr_text: str) -> Tuple[str, Optional[bool]]:
+def _postprocess_plate_text(raw_ocr_text: str, trusted: bool = False) -> Tuple[str, Optional[bool]]:
     """
     Post-processing: normalise -> regex validation -> confusable fix.
     Returns (cleaned_plate_text, matched_regex).
+
+    When *trusted* is True (e.g. OpenAI output), skip _fix_confusables —
+    the model already performs its own OCR error correction, so applying
+    character substitutions on top risks corrupting correct plates.
     """
     if not raw_ocr_text:
         return "", None
@@ -471,6 +475,10 @@ def _postprocess_plate_text(raw_ocr_text: str) -> Tuple[str, Optional[bool]]:
     if PLATE_REGEX_PATTERN:
         if re.match(PLATE_REGEX_PATTERN, normalised):
             matched = True
+        elif trusted:
+            # Trust the source; just flag it but keep as-is.
+            log.info("OpenAI plate %s does not match regex; keeping as-is", normalised)
+            matched = False
         else:
             # Try fixing OCR-confusable characters (Z↔2, O↔0, B↔8, etc.)
             fixed = _fix_confusables(normalised)
@@ -521,8 +529,9 @@ def extract_license_plate(image_path) -> dict:
             return result
 
         # Take the first (best) plate and post-process
+        trusted = _resolve_backend() == "openai"
         best = vision["plates_detail"][0]
-        plate_text, _matched = _postprocess_plate_text(best["plate_text"])
+        plate_text, _matched = _postprocess_plate_text(best["plate_text"], trusted=trusted)
         result["plate_text"] = plate_text if plate_text else "UNKNOWN"
         result["confidence"] = best["confidence"] if plate_text else 0.0
 
@@ -555,9 +564,10 @@ def extract_all_license_plates(image_path) -> dict:
 
         vision = _extract_from_image(image)
 
+        trusted = _resolve_backend() == "openai"
         plates = []
         for detail in vision["plates_detail"]:
-            plate_text, _matched = _postprocess_plate_text(detail["plate_text"])
+            plate_text, _matched = _postprocess_plate_text(detail["plate_text"], trusted=trusted)
             if not plate_text:
                 continue
             plates.append({
