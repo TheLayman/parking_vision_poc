@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart Parking Inference Worker %i
+After=network.target redis-server.service postgresql.service
+Requires=redis-server.service postgresql.service
+
+[Service]
+Type=simple
+User=parking
+Group=parking
+WorkingDirectory=/opt/parking
+EnvironmentFile=/opt/parking/.env.production
+Environment=WORKER_ID=inference-worker-%i
+ExecStart=/opt/parking/venv/bin/python -m workers.inference_worker
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=parking-inference-worker@%i
+
+[Install]
+WantedBy=multi-user.target

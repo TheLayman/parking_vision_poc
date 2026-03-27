@@ -1,0 +1,21 @@
+[Unit]
+Description=Smart Parking MQTT Worker %i
+After=network.target redis-server.service postgresql.service
+Requires=redis-server.service postgresql.service
+
+[Service]
+Type=simple
+User=parking
+Group=parking
+WorkingDirectory=/opt/parking
+EnvironmentFile=/opt/parking/.env.production
+Environment=WORKER_ID=mqtt-worker-%i
+ExecStart=/opt/parking/venv/bin/python -m workers.mqtt_worker
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=parking-mqtt-worker@%i
+
+[Install]
+WantedBy=multi-user.target

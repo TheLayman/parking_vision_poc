@@ -1,0 +1,20 @@
+[Unit]
+Description=Smart Parking Camera Worker %i
+After=network.target redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=parking
+Group=parking
+WorkingDirectory=/opt/parking
+EnvironmentFile=/opt/parking/.env.production
+ExecStart=/opt/parking/venv/bin/python -m workers.camera_worker %i
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=parking-camera-worker@%i
+
+[Install]
+WantedBy=multi-user.target
