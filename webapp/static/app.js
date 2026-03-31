@@ -1,3 +1,9 @@
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
 function fmtTs(ts) {
   try {
     const d = new Date(ts);
@@ -134,11 +140,13 @@ let alertsLoadedOnce = false;
 
 // Zone colors for charts
 const zoneColors = {
-  'A': { bg: 'rgba(99, 102, 241, 0.2)', border: '#6366f1' },
-  'B': { bg: 'rgba(16, 185, 129, 0.2)', border: '#10b981' },
+  'A': { bg: 'rgba(59, 130, 246, 0.2)', border: '#3b82f6' },
+  'B': { bg: 'rgba(34, 197, 94, 0.2)', border: '#22c55e' },
   'C': { bg: 'rgba(245, 158, 11, 0.2)', border: '#f59e0b' },
   'D': { bg: 'rgba(239, 68, 68, 0.2)', border: '#ef4444' },
-  'E': { bg: 'rgba(168, 85, 247, 0.2)', border: '#a855f7' }
+  'E': { bg: 'rgba(139, 92, 246, 0.2)', border: '#8b5cf6' },
+  'F': { bg: 'rgba(6, 182, 212, 0.2)', border: '#06b6d4' },
+  'G': { bg: 'rgba(244, 114, 182, 0.2)', border: '#f472b6' }
 };
 
 function getZoneColor(zone) {
@@ -151,17 +159,17 @@ const chartDefaults = {
   maintainAspectRatio: false,
   plugins: {
     legend: {
-      labels: { color: '#c5cee0', font: { family: 'Inter' } }
+      labels: { color: '#475569', font: { family: 'Inter' } }
     }
   },
   scales: {
     x: {
-      ticks: { color: '#8b96b0', font: { family: 'Inter' } },
-      grid: { color: 'rgba(42, 51, 80, 0.5)' }
+      ticks: { color: '#64748b', font: { family: 'Inter' } },
+      grid: { color: 'rgba(0, 0, 0, 0.06)' }
     },
     y: {
-      ticks: { color: '#8b96b0', font: { family: 'Inter' } },
-      grid: { color: 'rgba(42, 51, 80, 0.5)' }
+      ticks: { color: '#64748b', font: { family: 'Inter' } },
+      grid: { color: 'rgba(0, 0, 0, 0.06)' }
     }
   }
 };
@@ -330,7 +338,6 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
           beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
-            stepSize: 1,
             callback: v => Number.isInteger(v) ? v : '',
           }
         }
@@ -385,7 +392,6 @@ function renderDwellDistributionChart(dist, selectedZone) {
           beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.x.ticks,
-            stepSize: 1,
             callback: v => Number.isInteger(v) ? v : '',
           }
         },
@@ -429,7 +435,7 @@ function renderChallanDonutChart(challanSummary) {
       plugins: {
         legend: {
           position: 'bottom',
-          labels: { color: '#c5cee0', font: { family: 'Inter' }, padding: 16 }
+          labels: { color: '#475569', font: { family: 'Inter' }, padding: 16 }
         },
         tooltip: {
           callbacks: {
@@ -451,11 +457,11 @@ function renderChallanDonutChart(challanSummary) {
         c.textBaseline = 'middle';
         const cx = left + width / 2;
         const cy = top + height / 2;
-        c.fillStyle = '#c5cee0';
+        c.fillStyle = '#1e293b';
         c.font = 'bold 22px Inter';
         c.fillText(noData ? '—' : total, cx, cy - 8);
         c.font = '11px Inter';
-        c.fillStyle = '#8b96b0';
+        c.fillStyle = '#94a3b8';
         c.fillText('total', cx, cy + 12);
         c.restore();
       }
@@ -518,7 +524,6 @@ function renderZoneComparisonChart(zoneStats, zones) {
           beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
-            stepSize: 1,
             callback: v => Number.isInteger(v) ? v : '',
           }
         }
@@ -531,7 +536,7 @@ let slots = [];
 let stateById = {};
 let sinceById = {};
 let serverZoneStats = null; // use server-provided zone stats when available
-let collapsedZones = new Set();
+let collapsedZones = new Set(); // populated after init if slot count > threshold
 let calibratingSlots = new Set(); // Track slots currently being calibrated
 let failedSlots = new Map(); // Track slots that failed calibration with error message
 let slotPlates = {}; // slot_id -> [plate1, plate2, ...] from camera_capture SSE events
@@ -577,9 +582,44 @@ function renderZones(zones) {
   const keys = Object.keys(zones || {}).sort();
   for (const k of keys) {
     const z = zones[k];
+    const pct = z.total > 0 ? (z.occupied / z.total * 100) : 0;
+
     const chip = document.createElement("div");
     chip.className = "zoneChip";
-    chip.textContent = `Zone ${k}: Occupancy (${z.occupied}/${z.total})`;
+    chip.setAttribute("data-zone", k);
+
+    // Top row: zone name + counts
+    const label = document.createElement("div");
+    label.className = "zoneChip-label";
+    label.innerHTML = `<strong>Zone ${escapeHtml(k)}</strong> <span style="color:var(--muted)">${z.occupied}/${z.total}</span>`;
+
+    // Progress bar
+    const barEl = document.createElement("div");
+    barEl.className = "zoneChip-bar";
+    const fill = document.createElement("div");
+    fill.className = "zoneChip-bar-fill";
+    fill.style.width = pct + "%";
+    // Color: green < 50%, yellow 50-80%, red > 80%
+    if (pct > 80) fill.style.background = "var(--occupied)";
+    else if (pct > 50) fill.style.background = "#f59e0b";
+    else fill.style.background = "var(--free)";
+    barEl.appendChild(fill);
+
+    chip.appendChild(label);
+    chip.appendChild(barEl);
+
+    // Click to scroll to zone section and expand it
+    chip.addEventListener("click", () => {
+      const section = document.getElementById("zone-section-" + k);
+      if (section) {
+        collapsedZones.delete(k);
+        refreshLayout();
+        setTimeout(() => {
+          section.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 50);
+      }
+    });
+
     bar.appendChild(chip);
   }
 }
@@ -655,6 +695,23 @@ function renderZoneSections(zones) {
     section.querySelector(".zoneTitle").textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
     section.querySelector(".zoneSubtitle").textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
 
+    // Occupancy bar
+    let occBar = section.querySelector(".zone-occupancy-bar");
+    if (!occBar) {
+      occBar = document.createElement("div");
+      occBar.className = "zone-occupancy-bar";
+      const occFill = document.createElement("div");
+      occFill.className = "zone-occupancy-bar-fill";
+      occBar.appendChild(occFill);
+      section.querySelector(".zoneHeader").appendChild(occBar);
+    }
+    const occPct = z.total > 0 ? (z.occupied / z.total * 100) : 0;
+    const occFill = occBar.querySelector(".zone-occupancy-bar-fill");
+    occFill.style.width = occPct + "%";
+    if (occPct > 80) occFill.style.background = "var(--occupied)";
+    else if (occPct > 50) occFill.style.background = "#f59e0b";
+    else occFill.style.background = "var(--free)";
+
     if (isCollapsed) {
       // Clear grid when collapsed
       const grid = section.querySelector(".zoneSlotGrid");
@@ -714,7 +771,7 @@ function renderZoneSections(zones) {
       const plates = slotPlates[s.id];
       if (plates && plates.length > 0 && status === "OCCUPIED") {
         metaHtml += '<div class="slot-plates">' +
-          plates.map(p => `<span class="plate-badge-sm">${p}</span>`).join(' ') +
+          plates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ') +
           '</div>';
       }
       const pending = pendingRechecks[s.id];
@@ -802,12 +859,42 @@ function _updateCalibrateBtnState(btn, slotId) {
   }
 }
 
+function updateKPIs() {
+  const zones = computeZoneStats();
+  const totals = computeTotals(zones);
+
+  const totalEl = document.getElementById('kpiTotalSlots');
+  const occEl = document.getElementById('kpiOccupancy');
+  const zonesEl = document.getElementById('kpiZones');
+
+  if (totalEl) totalEl.textContent = totals.total.toLocaleString();
+  if (zonesEl) zonesEl.textContent = Object.keys(zones).length;
+
+  if (occEl) {
+    const pct = totals.total > 0 ? ((totals.total - totals.free) / totals.total * 100) : 0;
+    occEl.textContent = pct.toFixed(1) + '%';
+    occEl.className = 'kpi-value';
+    if (pct > 80) occEl.classList.add('kpi-value--high');
+    else if (pct < 30) occEl.classList.add('kpi-value--low');
+  }
+}
+
+async function fetchKPIChallans() {
+  try {
+    const res = await fetch('/analytics/summary?range=24h');
+    const data = await res.json();
+    const el = document.getElementById('kpiChallans');
+    if (el) el.textContent = (data.challans_generated || 0).toLocaleString();
+  } catch {}
+}
+
 function refreshLayout() {
   const zones = computeZoneStats();
   const totals = computeTotals(zones);
   renderSummary(totals.free, totals.total);
   renderZones(zones);
   renderZoneSections(zones);
+  updateKPIs();
 }
 
 function prependLog(obj) {
@@ -856,77 +943,35 @@ function renderAlerts(alerts) {
     return;
   }
 
-  container.style.display = 'grid';
+  container.style.display = 'flex';
   emptyState.style.display = 'none';
 
   const html = alerts.map((alert, index) => {
     const ts = new Date(alert.ts);
-    const timeStr = ts.toLocaleString();
+    const timeStr = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = ts.toLocaleDateString([], { month: 'short', day: 'numeric' });
     const stateClass = alert.new_state === 'OCCUPIED' ? 'occupied' : 'free';
     const stateIcon = alert.new_state === 'OCCUPIED' ? '🚗' : '✅';
 
-    // Handle image
-    let imageHtml = '';
-    if (alert.image_path) {
-      const filename = filenameFromPath(alert.image_path);
-      imageHtml = `
-        <div class="alert-image">
-          <img src="/snapshots/${filename}" alt="Slot ${alert.slot_name}" loading="lazy" />
-        </div>
-      `;
-    } else {
-      imageHtml = `
-        <div class="alert-no-image">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-            <circle cx="8.5" cy="8.5" r="1.5"/>
-            <polyline points="21 15 16 10 5 21"/>
-          </svg>
-          <span>No image</span>
-        </div>
-      `;
-    }
-
-    // Handle license plates (support array)
     const licensePlates = alert.license_plates && alert.license_plates.length > 0
       ? alert.license_plates
       : (alert.license_plate && alert.license_plate !== 'UNKNOWN' ? [alert.license_plate] : []);
-    const hasPlate = licensePlates.length > 0;
-    const plateClass = hasPlate ? 'has-plate' : 'no-plate';
-    const platesHtml = hasPlate
-      ? licensePlates.map(p => `<span class="plate-badge-sm">${p}</span>`).join(' ')
-      : 'UNKNOWN';
+    const platesHtml = licensePlates.length > 0
+      ? licensePlates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ')
+      : '';
 
     return `
-      <div class="alert-card ${stateClass}" style="--index: ${index}">
-        ${imageHtml}
+      <div class="alert-card ${stateClass}">
+        <div class="alert-icon-compact">${stateIcon}</div>
         <div class="alert-content">
           <div class="alert-header">
-            <span class="alert-icon">${stateIcon}</span>
-            <span class="alert-slot">${alert.slot_name}</span>
-            <span class="alert-zone">Zone ${alert.zone}</span>
-            <span class="alert-state-badge ${stateClass}">${alert.new_state}</span>
-          </div>
-          <div class="alert-details">
-            <div class="alert-transition">
-              <span class="prev-state">${alert.prev_state}</span>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="5" y1="12" x2="19" y2="12"/>
-                <polyline points="12 5 19 12 12 19"/>
-              </svg>
-              <span class="new-state">${alert.new_state}</span>
-            </div>
-            <div class="alert-license-plate ${plateClass}">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="7" width="20" height="10" rx="2" ry="2"/>
-                <line x1="6" y1="11" x2="6" y2="13"/>
-                <line x1="18" y1="11" x2="18" y2="13"/>
-              </svg>
-              <span class="plate-text">${platesHtml}</span>
-            </div>
-            <div class="alert-time">${timeStr}</div>
+            <span class="alert-slot">${escapeHtml(alert.slot_name)}</span>
+            <span class="alert-zone">Zone ${escapeHtml(alert.zone)}</span>
+            <span class="alert-state-badge ${stateClass}">${escapeHtml(alert.new_state)}</span>
+            ${platesHtml ? `<span class="alert-plates-inline">${platesHtml}</span>` : ''}
           </div>
         </div>
+        <div class="alert-time-compact">${dateStr} ${timeStr}</div>
       </div>
     `;
   }).join('');
@@ -943,7 +988,19 @@ async function init() {
   sinceById = data.since_by_id || {};
   serverZoneStats = data.zones || null;
 
+  // Collapse all zones by default when slot count is large
+  if (slots.length > 200) {
+    const zoneKeys = new Set(slots.map(s => s.zone || "A"));
+    for (const z of zoneKeys) collapsedZones.add(z);
+  }
+
   refreshLayout();
+
+  // Initialize challans KPI as pending, then fetch async
+  const kpiChallansEl = document.getElementById('kpiChallans');
+  if (kpiChallansEl) kpiChallansEl.textContent = '--';
+  fetchKPIChallans();
+  setInterval(fetchKPIChallans, 30000);
 
   const recent = (data.recent_events || []).slice();
   for (const e of recent) {

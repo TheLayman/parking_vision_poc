@@ -2,75 +2,80 @@
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-def parse_events_from_log(event_log_path: Path,
-                          cutoff: datetime | None) -> dict:
-    """Parse event log into categorised lists.
+# ── Event parsing (Postgres-backed, replaces JSONL) ──────────────────────────
 
-    Returns a dict with keys ``"snapshots"``, ``"state_changes"``,
-    ``"challans"`` — each a list of dicts filtered to events after *cutoff*.
+def parse_events_from_log(event_log_path: Path, cutoff: datetime | None) -> dict:
+    """Return categorised event lists by querying PostgreSQL.
+
+    The *event_log_path* parameter is ignored in production — all events are
+    stored in Postgres (occupancy_events and challan_events tables).
+
+    Returns the same shape as the legacy JSONL parser so all callers above
+    (build_occupancy_series, calculate_dwell_times, etc.) are unchanged:
+        {"snapshots": [], "state_changes": [...], "challans": [...]}
     """
-    snapshots: list[dict] = []
+    try:
+        from db.client import query_occupancy_events, query_challan_events
+    except ImportError:
+        return {"snapshots": [], "state_changes": [], "challans": []}
+
     state_changes: list[dict] = []
+    try:
+        occ_rows = query_occupancy_events(cutoff=cutoff)
+        for row in occ_rows:
+            if row["event_type"] not in ("OCCUPIED", "FREE"):
+                continue
+            payload = row.get("payload") or {}
+            ts = row["ts"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            state_changes.append({
+                "ts": ts,
+                "slot_id": row["slot_id"],
+                "slot_name": payload.get("slot_name", str(row["slot_id"])),
+                "zone": payload.get("zone", "A"),
+                "prev_state": "FREE" if row["event_type"] == "OCCUPIED" else "OCCUPIED",
+                "new_state": row["event_type"],
+            })
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("query_occupancy_events failed: %s", e)
+
     challans: list[dict] = []
+    try:
+        ch_rows = query_challan_events(cutoff=cutoff)
+        for row in ch_rows:
+            meta = row.get("metadata") or {}
+            ts = row["ts"]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
 
-    if not event_log_path.exists():
-        return {"snapshots": snapshots, "state_changes": state_changes, "challans": challans}
+            challans.append({
+                "ts": ts,
+                "plate_text": row.get("license_plate") or "",
+                "slot_id": row["slot_id"],
+                "slot_name": meta.get("slot_name", str(row["slot_id"])),
+                "zone": meta.get("zone", "A"),
+                "challan": row.get("status") == "confirmed",
+            })
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("query_challan_events failed: %s", e)
 
-    with open(event_log_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                ts_str = obj.get("ts")
-                if not ts_str:
-                    continue
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+    return {"snapshots": [], "state_changes": state_changes, "challans": challans}
 
-                if cutoff and ts < cutoff:
-                    continue
 
-                event_type = obj.get("event")
-                if event_type == "snapshot":
-                    snapshots.append({
-                        "ts": ts,
-                        "zone_stats": obj.get("zones", obj.get("zone_stats", {})),
-                        "occupied_ids": obj.get("occupied_ids", []),
-                        "free_count": obj.get("free_count", 0),
-                        "total_count": obj.get("total_count", 0),
-                    })
-                elif event_type == "slot_state_changed":
-                    state_changes.append({
-                        "ts": ts,
-                        "slot_id": obj.get("slot_id"),
-                        "slot_name": obj.get("slot_name"),
-                        "zone": obj.get("zone", "A"),
-                        "prev_state": obj.get("prev_state"),
-                        "new_state": obj.get("new_state"),
-                    })
-                elif event_type == "challan_completed":
-                    challans.append({
-                        "ts": ts,
-                        "plate_text": obj.get("plate_text"),
-                        "slot_id": obj.get("slot_id"),
-                        "slot_name": obj.get("slot_name"),
-                        "zone": obj.get("zone", "A"),
-                        "challan": obj.get("challan", False),
-                    })
-            except Exception:
-                continue
-
-    return {"snapshots": snapshots, "state_changes": state_changes, "challans": challans}
-
+# ── Analytics functions (unchanged) ─────────────────────────────────────────
 
 def build_occupancy_series(snapshots: list) -> list:
     """Convert snapshots to a time-series of zone occupancy percentages."""
@@ -91,7 +96,7 @@ def calculate_dwell_times(state_changes: list) -> dict:
 
     Returns ``{"avg": {"B": 12.3}, "all_dwells": [{"zone": "B", "minutes": 5.2}, ...]}``.
     """
-    slot_occupied_at: dict[int, tuple[datetime, str]] = {}  # slot_id -> (ts, zone)
+    slot_occupied_at: dict[int, tuple[datetime, str]] = {}
     all_dwells: list[dict] = []
 
     for change in sorted(state_changes, key=lambda x: x["ts"]):
@@ -103,10 +108,9 @@ def calculate_dwell_times(state_changes: list) -> dict:
         elif change["new_state"] == "FREE" and slot_id in slot_occupied_at:
             occupied_ts, occ_zone = slot_occupied_at.pop(slot_id)
             dwell_minutes = (change["ts"] - occupied_ts).total_seconds() / 60
-            if 0 < dwell_minutes < 1440:  # Cap at 24 hours
+            if 0 < dwell_minutes < 1440:
                 all_dwells.append({"zone": occ_zone, "minutes": round(dwell_minutes, 2)})
 
-    # Compute averages per zone
     by_zone: dict[str, list[float]] = defaultdict(list)
     for d in all_dwells:
         by_zone[d["zone"]].append(d["minutes"])
@@ -121,15 +125,7 @@ def calculate_dwell_times(state_changes: list) -> dict:
 
 
 def build_dwell_distribution(all_dwells: list[dict], zone: str | None = None) -> dict:
-    """Count vehicles parked longer than 15, 30, 45, and 60 minutes.
-
-    Args:
-        all_dwells: list of ``{"zone": str, "minutes": float}`` dicts.
-        zone: optional zone filter; ``None`` means all zones.
-
-    Returns ``{"gt_15m": int, "gt_30m": int, "gt_45m": int, "gt_1h": int}``.
-    Buckets are cumulative (a 50-min stay counts in gt_15m, gt_30m, gt_45m).
-    """
+    """Count vehicles parked longer than 15, 30, 45, and 60 minutes."""
     filtered = all_dwells if zone is None else [d for d in all_dwells if d["zone"] == zone]
     gt_15 = gt_30 = gt_45 = gt_60 = 0
     for d in filtered:
@@ -144,13 +140,7 @@ def build_dwell_distribution(all_dwells: list[dict], zone: str | None = None) ->
 def build_hourly_incidents(state_changes: list,
                            start: datetime | None = None,
                            end: datetime | None = None) -> list[dict]:
-    """Group FREE→OCCUPIED transitions by hour for charting.
-
-    If ``start`` and ``end`` are provided, includes empty hourly buckets in
-    that range so charts can render continuous windows up to "now".
-
-    Returns a sorted list of ``{"hour": "2026-03-02T11:00", "all": int, "zones": {"B": int}}``.
-    """
+    """Group FREE→OCCUPIED transitions by hour for charting."""
     hourly: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     for change in state_changes:
@@ -180,21 +170,13 @@ def build_hourly_incidents(state_changes: list,
 
 
 def build_challan_summary(challans: list, zone: str | None = None) -> dict:
-    """Summarise challan events.
-
-    Args:
-        challans: list of parsed challan_completed events.
-        zone: optional zone filter.
-
-    Returns ``{"total": int, "confirmed": int, "cleared": int,
-               "by_zone": {"B": {"confirmed": int, "cleared": int}}}``.
-    """
+    """Summarise challan events."""
     filtered = challans if zone is None else [c for c in challans if c.get("zone") == zone]
     confirmed = sum(1 for c in filtered if c.get("challan"))
     cleared = sum(1 for c in filtered if not c.get("challan"))
 
     by_zone: dict[str, dict[str, int]] = defaultdict(lambda: {"confirmed": 0, "cleared": 0})
-    for c in challans:  # always build full zone breakdown
+    for c in challans:
         z = c.get("zone", "A")
         if c.get("challan"):
             by_zone[z]["confirmed"] += 1

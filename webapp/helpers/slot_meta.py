@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 from pathlib import Path
 
 from webapp.helpers.data_io import load_yaml
@@ -26,13 +26,12 @@ def load_slot_meta_by_id(meta_path: Path) -> dict[int, dict]:
     if not meta_path.exists():
         return {}
 
-    # Check if cache is still valid based on file modification time
     try:
         current_mtime = meta_path.stat().st_mtime
         if _meta_cache is not None and _meta_cache_mtime == current_mtime:
             return _meta_cache
     except Exception:
-        pass  # If stat fails, proceed to reload
+        pass
 
     data = load_yaml(meta_path)
     if not data:
@@ -58,9 +57,11 @@ def load_slot_meta_by_id(meta_path: Path) -> dict[int, dict]:
                 continue
             meta[slot_id] = item
 
-    # Update cache
     _meta_cache = meta
-    _meta_cache_mtime = current_mtime
+    try:
+        _meta_cache_mtime = meta_path.stat().st_mtime
+    except Exception:
+        pass
     return meta
 
 
@@ -78,7 +79,6 @@ def get_slot_id_by_device_name(device_name: str, meta_by_id: dict[int, dict]) ->
 
 
 def _rebuild_device_name_map_if_needed(meta_by_id: dict[int, dict]):
-    """Rebuild the reverse device-name -> slot_id map when metadata changes."""
     global _device_name_to_slot, _device_name_map_mtime
     if _device_name_map_mtime == _meta_cache_mtime and _device_name_to_slot:
         return
@@ -121,41 +121,46 @@ def calculate_zone_stats(slot_ids: list[int], occupied_ids: set,
     return zones_stats, free_count, total_count
 
 
-# ── State reconstruction from event log ──────────────────────────────────────
+# ── State from Redis (replaces JSONL replay) ─────────────────────────────────
 
-def build_state_from_log(event_log_path: Path, slot_ids: list[int],
+def build_state_from_log(event_log_path, slot_ids: list[int],
                          meta_by_id: dict[int, dict],
-                         max_events: int = 200) -> dict:
-    """Rebuild current slot state by replaying the event log."""
-    state_by_id: dict[int, str] = {sid: "FREE" for sid in slot_ids}
-    since_by_id: dict[int, str] = {sid: "" for sid in slot_ids}
-    last_events: list[dict] = []
+                         max_events: int = 200,
+                         redis_client=None) -> dict:
+    """Read current slot state from Redis Hash parking:slot:state.
 
-    if event_log_path.exists():
-        with open(event_log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not (line := line.strip()):
-                    continue
-                try:
-                    obj = json.loads(line)
-                    event_type = obj.get("event")
-                    ts = obj.get("ts", "")
+    The *event_log_path* parameter is ignored (no JSONL in production).
+    State is the authoritative source of truth from Redis.
+    Pass *redis_client* to reuse an existing connection (avoids per-call churn).
+    """
+    try:
+        if redis_client is not None:
+            r = redis_client
+        else:
+            import redis as _redis
+            r = _redis.Redis.from_url(
+                os.environ.get("REDIS_URL", "redis://localhost:6379"),
+                decode_responses=False, socket_timeout=2,
+            )
+        state_raw = r.hgetall("parking:slot:state")   # {b"1": b"OCCUPIED", ...}
+        since_raw = r.hgetall("parking:slot:since")   # {b"1": b"ts_str", ...}
+        if redis_client is None:
+            r.close()
+    except Exception as e:
+        log.error("Redis read failed in build_state_from_log: %s — returning all FREE", e)
+        state_raw = {}
+        since_raw = {}
 
-                    if event_type == "snapshot":
-                        occupied_ids = set(obj.get("occupied_ids") or [])
-                        for sid in slot_ids:
-                            new_state = "OCCUPIED" if sid in occupied_ids else "FREE"
-                            if state_by_id[sid] != new_state:
-                                since_by_id[sid] = ts
-                            state_by_id[sid] = new_state
-                    elif event_type == "slot_state_changed":
-                        sid = int(obj.get("slot_id"))
-                        if sid in state_by_id and obj.get("new_state") in ("FREE", "OCCUPIED"):
-                            state_by_id[sid] = obj["new_state"]
-                            since_by_id[sid] = ts
-                        last_events.append(obj)
-                except Exception:
-                    continue
+    state_by_id: dict[int, str] = {}
+    since_by_id: dict[int, str] = {}
+    for sid in slot_ids:
+        raw_state = state_raw.get(str(sid).encode(), b"FREE")
+        state_by_id[sid] = raw_state.decode() if isinstance(raw_state, bytes) else str(raw_state)
+        raw_since = since_raw.get(str(sid).encode(), b"")
+        since_by_id[sid] = raw_since.decode() if isinstance(raw_since, bytes) else str(raw_since)
+
+    occupied_ids = {sid for sid, st in state_by_id.items() if st == "OCCUPIED"}
+    zones, free_count, total_count = calculate_zone_stats(slot_ids, occupied_ids, meta_by_id)
 
     slots = [
         {
@@ -165,8 +170,6 @@ def build_state_from_log(event_log_path: Path, slot_ids: list[int],
         }
         for sid in slot_ids
     ]
-    occupied_ids = {sid for sid, st in state_by_id.items() if st == "OCCUPIED"}
-    zones, free_count, total_count = calculate_zone_stats(slot_ids, occupied_ids, meta_by_id)
 
     return {
         "slots": slots,
@@ -175,5 +178,5 @@ def build_state_from_log(event_log_path: Path, slot_ids: list[int],
         "zones": zones,
         "free_count": free_count,
         "total_count": total_count,
-        "recent_events": last_events[-max_events:],
+        "recent_events": [],
     }

@@ -273,6 +273,10 @@ def _process_challan_recheck(
              slot_name, first_plates, second_plates)
 
     for plate_text in first_plates:
+        if len(plate_text) > 13:
+            log.warning("Plate text too long (%d chars), truncating: %s", len(plate_text), plate_text)
+            plate_text = plate_text[:13]
+
         is_match = _any_plate_matches(plate_text, second_plates)
         status = "confirmed" if is_match else "cleared"
         challan_id = f"{slot_id}_{capture_session_id}_{plate_text}"
@@ -302,28 +306,28 @@ def _process_challan_recheck(
             )
             db_conn.commit()
             log.info("Challan %s: plate=%s slot=%s", status.upper(), plate_text, slot_name)
+
+            # Publish only after successful commit
+            live_event = {
+                "event": "challan_completed",
+                "ts": second_time,
+                "plate_text": plate_text,
+                "slot_id": slot_id,
+                "slot_name": slot_name,
+                "zone": zone,
+                "challan": is_match,
+                "capture_session_id": capture_session_id,
+            }
+            try:
+                r.publish("parking:events:live", json.dumps(live_event))
+            except Exception as e:
+                log.error("Failed to publish challan_completed event: %s", e)
         except Exception as e:
             log.error("Failed to insert challan_event for %s: %s", plate_text, e)
             try:
                 db_conn.rollback()
             except Exception:
                 pass
-
-        # Publish live challan_completed event
-        live_event = {
-            "event": "challan_completed",
-            "ts": second_time,
-            "plate_text": plate_text,
-            "slot_id": slot_id,
-            "slot_name": slot_name,
-            "zone": zone,
-            "challan": is_match,
-            "capture_session_id": capture_session_id,
-        }
-        try:
-            r.publish("parking:events:live", json.dumps(live_event))
-        except Exception as e:
-            log.error("Failed to publish challan_completed event: %s", e)
 
     # Clear pending state
     try:
@@ -380,6 +384,22 @@ def _send_to_deadletter(r: redis.Redis, fields: dict, reason: str):
         log.error("Failed to write to deadletter: %s", e)
 
 
+# ── DB reconnect helper ───────────────────────────────────────────────────────
+
+def _ensure_db_conn(db_conn):
+    """Return a live DB connection, reconnecting if the current one is broken."""
+    try:
+        db_conn.execute("SELECT 1")
+        return db_conn
+    except Exception:
+        log.warning("DB connection lost — reconnecting")
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+        return get_connection()
+
+
 # ── Worker loop ───────────────────────────────────────────────────────────────
 
 def run():
@@ -425,6 +445,7 @@ def run():
             if claimed_messages:
                 log.info("Reclaimed %d idle inference job(s)", len(claimed_messages))
                 for msg_id, fields in claimed_messages:
+                    db_conn = _ensure_db_conn(db_conn)
                     ok = process_inference_job(r, db_conn, msg_id, fields)
                     if ok:
                         r.xack(STREAM_KEY, GROUP_NAME, msg_id)
@@ -459,6 +480,7 @@ def run():
 
         for stream_name, messages in results:
             for msg_id, fields in messages:
+                db_conn = _ensure_db_conn(db_conn)
                 ok = process_inference_job(r, db_conn, msg_id, fields)
                 if ok:
                     r.xack(STREAM_KEY, GROUP_NAME, msg_id)

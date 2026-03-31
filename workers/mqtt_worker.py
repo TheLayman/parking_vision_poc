@@ -191,21 +191,36 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
         # CAS won — record state change time
         r.hset("parking:slot:since", str(slot_id), ts_str)
 
-        # Insert into Postgres
-        insert_occupancy_event(
-            slot_id=slot_id,
-            event_type=event_type,
-            device_eui=device_eui,
-            ts=ts,
-            payload={
-                "slot_name": slot_name,
-                "zone": zone,
-                "prev_state": expected_state,
-                "new_state": new_state,
-            },
-            conn=db_conn,
-        )
-        db_conn.commit()
+        # Insert into Postgres — revert Redis CAS on failure
+        try:
+            insert_occupancy_event(
+                slot_id=slot_id,
+                event_type=event_type,
+                device_eui=device_eui,
+                ts=ts,
+                payload={
+                    "slot_name": slot_name,
+                    "zone": zone,
+                    "prev_state": expected_state,
+                    "new_state": new_state,
+                },
+                conn=db_conn,
+            )
+            db_conn.commit()
+        except Exception as db_err:
+            log.error("Postgres INSERT failed after CAS win for slot %s — reverting Redis: %s",
+                       slot_name, db_err)
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+            # Compensating revert: restore Redis to previous state
+            try:
+                r.hset("parking:slot:state", str(slot_id), expected_state)
+                r.hdel("parking:slot:since", str(slot_id))
+            except Exception as redis_err:
+                log.error("Redis revert also failed for slot %s: %s", slot_name, redis_err)
+            return False  # leave in PEL for retry
 
         # Enqueue camera task (only for FREE→OCCUPIED)
         if event_type == "OCCUPIED":
@@ -255,6 +270,22 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
         return False  # leave in PEL for XAUTOCLAIM retry
 
 
+# ── DB reconnect helper ───────────────────────────────────────────────────────
+
+def _ensure_db_conn(db_conn):
+    """Return a live DB connection, reconnecting if the current one is broken."""
+    try:
+        db_conn.execute("SELECT 1")
+        return db_conn
+    except Exception:
+        log.warning("DB connection lost — reconnecting")
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+        return get_connection()
+
+
 # ── Worker loop ───────────────────────────────────────────────────────────────
 
 def run():
@@ -302,6 +333,7 @@ def run():
             if claimed_messages:
                 log.info("Reclaimed %d idle message(s)", len(claimed_messages))
                 for msg_id, fields in claimed_messages:
+                    db_conn = _ensure_db_conn(db_conn)
                     ok = process_mqtt_message(r, db_conn, msg_id, fields)
                     if ok:
                         r.xack(STREAM_KEY, GROUP_NAME, msg_id)
@@ -339,6 +371,7 @@ def run():
 
         for stream_name, messages in results:
             for msg_id, fields in messages:
+                db_conn = _ensure_db_conn(db_conn)
                 ok = process_mqtt_message(r, db_conn, msg_id, fields)
                 if ok:
                     r.xack(STREAM_KEY, GROUP_NAME, msg_id)

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Challan Dashboard — Parking Vision</title>
+    <title>Challan Dashboard — Unauthorized Parking Detection</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -22,19 +22,21 @@
 
       .challan-controls { display: flex; gap: 12px; align-items: center; }
       .challan-filter {
-        padding: 8px 14px; border-radius: 8px;
-        background: var(--panel); border: 1px solid var(--border);
+        padding: 8px 14px; border-radius: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0;
         color: var(--text); font-family: inherit; font-size: 0.8125rem; cursor: pointer;
+        box-shadow: var(--neu-raised-xs);
       }
-      .challan-filter:hover { border-color: var(--accent); }
+      .challan-filter:hover { border-color: var(--accent); box-shadow: 0 1px 3px rgba(99, 102, 241, 0.15); }
       .refresh-btn {
         display: flex; align-items: center; gap: 6px;
-        padding: 8px 14px; border-radius: 8px;
-        background: var(--panel); border: 1px solid var(--border);
+        padding: 8px 14px; border-radius: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0;
         color: var(--text-secondary); font-size: 0.8125rem;
         cursor: pointer; transition: all 0.2s;
+        box-shadow: var(--neu-raised-xs);
       }
-      .refresh-btn:hover { border-color: var(--accent); color: var(--text); }
+      .refresh-btn:hover { border-color: var(--accent); box-shadow: 0 1px 3px rgba(99, 102, 241, 0.15); color: var(--text); }
 
       .back-link {
         display: inline-flex; align-items: center; gap: 6px;
@@ -49,8 +51,9 @@
         gap: 16px; margin-bottom: 24px;
       }
       .challan-stat {
-        background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px;
         padding: 16px 20px; display: flex; align-items: center; gap: 14px;
+        box-shadow: var(--neu-raised);
       }
       .challan-stat-icon { font-size: 1.5rem; }
       .challan-stat-value { font-size: 1.25rem; font-weight: 700; color: var(--text); }
@@ -58,8 +61,9 @@
 
       /* Table */
       .challan-table-wrap {
-        background: var(--panel); border: 1px solid var(--border);
-        border-radius: 12px; overflow: hidden;
+        background: #ffffff; border: 1px solid #e2e8f0;
+        border-radius: 14px; overflow: hidden;
+        box-shadow: var(--neu-raised);
       }
       .challan-table {
         width: 100%; border-collapse: collapse; font-size: 0.8125rem;
@@ -67,7 +71,7 @@
       .challan-table th {
         text-align: left; padding: 14px 16px; font-weight: 600; font-size: 0.75rem;
         color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
-        border-bottom: 1px solid var(--border); background: rgba(26, 31, 53, 0.6);
+        border-bottom: 1px solid var(--border); background: #f8fafc;
         position: sticky; top: 0;
       }
       .challan-table td {
@@ -81,8 +85,8 @@
         display: inline-block; padding: 4px 10px; border-radius: 6px;
         font-weight: 600; font-family: 'Courier New', monospace; font-size: 0.875rem;
         letter-spacing: 0.08em;
-        background: rgba(99, 102, 241, 0.15); color: var(--accent-bright);
-        border: 1px solid rgba(99, 102, 241, 0.3);
+        background: rgba(99, 102, 241, 0.08); color: #6366f1;
+        border: 1px solid rgba(99, 102, 241, 0.2);
       }
 
       .challan-badge {
@@ -90,12 +94,12 @@
         padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.75rem;
       }
       .challan-badge.yes {
-        background: rgba(239, 68, 68, 0.15); color: #f87171;
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(239, 68, 68, 0.08); color: #dc2626;
+        border: 1px solid rgba(239, 68, 68, 0.2);
       }
       .challan-badge.no {
-        background: rgba(16, 185, 129, 0.15); color: #34d399;
-        border: 1px solid rgba(16, 185, 129, 0.3);
+        background: rgba(34, 197, 94, 0.08); color: #16a34a;
+        border: 1px solid rgba(34, 197, 94, 0.2);
       }
 
       .thumb {
@@ -107,7 +111,7 @@
 
       .no-thumb {
         width: 80px; height: 56px; border-radius: 6px;
-        background: rgba(42, 51, 80, 0.6); border: 1px solid var(--border);
+        background: #f1f5f9; border: 1px solid var(--border);
         display: flex; align-items: center; justify-content: center;
         color: var(--muted); font-size: 0.65rem;
       }
@@ -115,7 +119,7 @@
       .thumb-load-btn {
         width: 80px; height: 56px; border-radius: 6px;
         border: 1px dashed var(--border);
-        background: rgba(42, 51, 80, 0.45);
+        background: #f1f5f9;
         color: var(--muted);
         font-size: 0.68rem;
         cursor: pointer;
@@ -137,7 +141,7 @@
       /* Lightbox */
       .lightbox {
         display: none; position: fixed; inset: 0; z-index: 1000;
-        background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(8px);
+        background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(8px);
         align-items: center; justify-content: center; cursor: pointer;
       }
       .lightbox.active { display: flex; }
@@ -169,7 +173,7 @@
             <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
             <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
           </svg>
-          Unauthorized Parking POC
+          Unauthorized Parking Detection
         </div>
         <div class="tab-bar">
           <a class="tab-btn" href="/" data-tab="dashboard" style="text-decoration:none;">Dashboard</a>
@@ -299,6 +303,12 @@
     </div>
 
     <script>
+      function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+      }
+
       function fmtTime(ts) {
         try {
           const d = new Date(ts);
@@ -395,11 +405,12 @@
       function thumbHtml(path, alt, shouldLoad) {
         const f = filenameFromPath(path);
         if (!f) return '<div class="no-thumb">No image</div>';
-        const src = `/snapshots/${f}`;
+        const src = `/snapshots/${escapeHtml(f)}`;
+        const safeAlt = escapeHtml(alt);
         if (shouldLoad) {
-          return `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${alt}" loading="lazy" /></a>`;
+          return `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${safeAlt}" loading="lazy" /></a>`;
         }
-        return `<button class="thumb-load-btn" type="button" data-src="${src}" data-alt="${alt}" onclick="loadThumb(this)">Load image</button>`;
+        return `<button class="thumb-load-btn" type="button" data-src="${src}" data-alt="${safeAlt}" onclick="loadThumb(this)">Load image</button>`;
       }
 
       function loadThumb(btn) {
@@ -413,7 +424,7 @@
       function platesChips(plates) {
         if (!plates || plates.length === 0) return '';
         return '<div class="second-plates-detail">' +
-          plates.map(p => `<span class="plate-badge-sm">${p}</span>`).join('') +
+          plates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join('') +
           '</div>';
       }
 
@@ -490,7 +501,7 @@
             : '<span class="challan-badge no">✅ NO</span>';
 
           html += `<tr>
-            <td><span class="plate-badge">${g.plate}</span></td>
+            <td><span class="plate-badge">${escapeHtml(g.plate)}</span></td>
             <td>${fmtTime(g.first_time)}</td>
             <td>${thumbHtml(g.first_image, '1st detection', shouldLoadImages)}</td>
             <td>${fmtTime(g.second_time)}</td>

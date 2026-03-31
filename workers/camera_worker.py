@@ -88,7 +88,8 @@ def process_camera_task(
         trigger_ts = _field("trigger_ts", datetime.now(timezone.utc).isoformat())
         task_type = _field("task_type", "camera_capture")
 
-        # Scheduled tasks (challan rechecks): check if due yet
+        # Scheduled tasks (challan rechecks): skip if not yet due
+        # XAUTOCLAIM will re-deliver when the idle timeout expires
         scheduled_at_str = _field("scheduled_at", "")
         if scheduled_at_str:
             try:
@@ -96,21 +97,10 @@ def process_camera_task(
                     scheduled_at_str.replace("Z", "+00:00")
                 )
                 if scheduled_at > datetime.now(timezone.utc):
-                    # Put back by NOT acking — let XAUTOCLAIM reclaim when due
-                    # Instead, sleep until due and re-enqueue
                     wait_s = (scheduled_at - datetime.now(timezone.utc)).total_seconds()
-                    if wait_s > 0:
-                        log.info("Challan recheck for slot %s due in %.0fs — deferring",
-                                 slot_name, wait_s)
-                        time.sleep(min(wait_s, 60))
-                    # Re-add to stream with no scheduled_at so it processes next time
-                    fields_copy = {k: v for k, v in fields.items()}
-                    if b"scheduled_at" in fields_copy:
-                        del fields_copy[b"scheduled_at"]
-                    if "scheduled_at" in fields_copy:
-                        del fields_copy["scheduled_at"]
-                    r.xadd(stream_key, fields_copy, maxlen=500, approximate=True)
-                    return True  # ack the original
+                    log.debug("Challan recheck for slot %s due in %.0fs — skipping (XAUTOCLAIM will retry)",
+                              slot_name, wait_s)
+                    return False  # do NOT ack — leave in PEL for XAUTOCLAIM to reclaim later
             except Exception:
                 pass
 

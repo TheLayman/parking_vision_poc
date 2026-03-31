@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS occupancy_events (
     id          BIGSERIAL PRIMARY KEY,
     slot_id     INT NOT NULL,
-    event_type  VARCHAR(32) NOT NULL,
+    event_type  VARCHAR(32) NOT NULL CHECK (event_type IN ('FREE', 'OCCUPIED', 'calibration')),
     device_eui  VARCHAR(32),
     ts          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     payload     JSONB
@@ -18,12 +18,13 @@ CREATE TABLE IF NOT EXISTS challan_events (
     slot_id       INT NOT NULL,
     license_plate VARCHAR(32),
     confidence    FLOAT,
-    status        VARCHAR(32),
+    status        VARCHAR(32) CHECK (status IN ('confirmed', 'cleared', 'pending')),
     ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata      JSONB
 );
 CREATE INDEX IF NOT EXISTS challan_events_slot_ts ON challan_events (slot_id, ts DESC);
 CREATE INDEX IF NOT EXISTS challan_events_status ON challan_events (status);
+CREATE INDEX IF NOT EXISTS challan_events_plate ON challan_events (license_plate);
 
 CREATE TABLE IF NOT EXISTS camera_captures (
     id          BIGSERIAL PRIMARY KEY,
@@ -35,3 +36,4 @@ CREATE TABLE IF NOT EXISTS camera_captures (
     backend     VARCHAR(32)
 );
 CREATE INDEX IF NOT EXISTS camera_captures_slot_ts ON camera_captures (slot_id, ts DESC);
+CREATE INDEX IF NOT EXISTS camera_captures_ts ON camera_captures (ts DESC);

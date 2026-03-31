@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -22,21 +23,24 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://parking:parking@loca
 # ── Connection pool (API server only) ────────────────────────────────────────
 
 _pool = None
+_pool_lock = threading.Lock()
 
 
 def get_pool():
     """Return a thread-safe connection pool (lazy-init). Use in the API server."""
     global _pool
     if _pool is None:
-        from psycopg_pool import ConnectionPool
-        _pool = ConnectionPool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            kwargs={"row_factory": dict_row},
-            open=True,
-        )
-        log.info("Postgres connection pool opened")
+        with _pool_lock:
+            if _pool is None:  # double-checked locking
+                from psycopg_pool import ConnectionPool
+                _pool = ConnectionPool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=5,
+                    kwargs={"row_factory": dict_row},
+                    open=True,
+                )
+                log.info("Postgres connection pool opened")
     return _pool
 
 
@@ -95,7 +99,8 @@ def insert_challan_event(
     sql = (
         "INSERT INTO challan_events "
         "(challan_id, slot_id, license_plate, confidence, status, ts, metadata) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (challan_id) DO NOTHING"
     )
     args = (challan_id, slot_id, license_plate, confidence, status, ts, _meta)
     if conn:
@@ -187,7 +192,8 @@ def query_challan_events(
         conditions.append("ts >= %s")
         params.append(since)
     if challan_only:
-        conditions.append("status = 'confirmed'")
+        conditions.append("status = %s")
+        params.append("confirmed")
     if zone:
         conditions.append("metadata->>'zone' = %s")
         params.append(zone)

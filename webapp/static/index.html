@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Unauthorized Parking POC</title>
+    <title>Unauthorized Parking Detection</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,7 +20,7 @@
             <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
             <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
           </svg>
-          Unauthorized Parking POC
+          Unauthorized Parking Detection
         </div>
         <div class="tab-bar">
           <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
@@ -61,11 +61,58 @@
 
     <!-- Dashboard Tab -->
     <main class="layout tab-content active" id="dashboard-tab">
+      <!-- KPI Summary Row -->
+      <div class="kpi-row" id="kpiRow">
+        <div class="kpi-card kpi-card--slots">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8h2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-2"/><path d="M6 21v-2"/><path d="M12 21v-2"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiTotalSlots">--</div>
+            <div class="kpi-label">Total Slots</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--occupancy">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiOccupancy">--%</div>
+            <div class="kpi-label">Occupancy Rate</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--challans">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiChallans">--</div>
+            <div class="kpi-label">Active Challans</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--zones">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiZones">--</div>
+            <div class="kpi-label">Zones Online</div>
+          </div>
+        </div>
+      </div>
+      <!-- Main content grid -->
       <section class="gridPane">
         <div class="zoneBar" id="zoneBar"></div>
         <div class="zoneSections" id="zoneSections"></div>
       </section>
-
       <aside class="sidePane">
         <div class="sideHeader">
           <div class="sideTitle">Change Log</div>
