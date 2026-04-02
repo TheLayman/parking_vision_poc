@@ -165,7 +165,7 @@ def process_camera_task(
         }
         # Pass through challan recheck context
         for extra_key in ("first_plates", "first_image", "first_time",
-                          "recheck_count", "capture_session_id"):
+                          "recheck_count", "capture_session_id", "lat", "lng"):
             val = _field(extra_key, "")
             if val:
                 job_fields[extra_key] = val

@@ -39,6 +39,7 @@ APP_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = APP_ROOT.parent
 
 SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
+SNAPSHOTS_DIR = Path(os.environ.get("SNAPSHOTS_DIR", "/data/snapshots"))
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -668,6 +669,8 @@ def get_challans(
                 "first_plates": meta.get("first_plates", []),
                 "second_plates": meta.get("second_plates", []),
                 "capture_session_id": meta.get("capture_session_id"),
+                "lat": meta.get("lat"),
+                "lng": meta.get("lng"),
             })
         return {"challans": challans, "total": len(challans),
                 "limit": limit, "offset": offset}
@@ -758,14 +761,9 @@ def challan_dashboard():
     return FileResponse(str(APP_ROOT / "static" / "challan.html"))
 
 
-@app.get("/snapshots/{date_or_file}/{filename}")
-def get_snapshot_image(date_or_file: str, filename: str):
-    """Serve camera snapshots from /data/snapshots/{date}/{filename}."""
-    snapshots_dir = Path(os.environ.get("SNAPSHOTS_DIR", "/data/snapshots"))
-    image_path = snapshots_dir / date_or_file / filename
-
-    # Resolve to absolute paths and assert the result is still under SNAPSHOTS_DIR.
-    # This blocks ../, URL-encoded traversal (%2e%2e), and symlink escapes.
+def _serve_snapshot(snapshots_dir: Path, *parts: str):
+    """Resolve and serve a snapshot image safely."""
+    image_path = snapshots_dir.joinpath(*parts)
     try:
         resolved = image_path.resolve()
         if not resolved.is_relative_to(snapshots_dir.resolve()):
@@ -781,3 +779,26 @@ def get_snapshot_image(date_or_file: str, filename: str):
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=31536000"},
     )
+
+
+@app.get("/snapshots/{date_or_file}/{filename}")
+def get_snapshot_image(date_or_file: str, filename: str):
+    """Serve camera snapshots from /data/snapshots/{date}/{filename}."""
+    return _serve_snapshot(SNAPSHOTS_DIR, date_or_file, filename)
+
+
+@app.get("/snapshots/{filename}")
+def get_snapshot_image_flat(filename: str):
+    """Serve snapshots by filename, searching subdirectories.
+
+    The emulator stores images as /data/snapshots/emu/{session}_1.jpg.
+    The frontend extracts only the filename and requests /snapshots/{filename}.
+    This route searches known subdirectories to locate the file.
+    """
+    # Check emu/ first (most common for emulator), then date-based dirs
+    for subdir in sorted(SNAPSHOTS_DIR.iterdir(), reverse=True) if SNAPSHOTS_DIR.exists() else []:
+        if subdir.is_dir():
+            candidate = subdir / filename
+            if candidate.exists() and candidate.is_file():
+                return _serve_snapshot(SNAPSHOTS_DIR, subdir.name, filename)
+    raise HTTPException(status_code=404, detail="Snapshot not found")

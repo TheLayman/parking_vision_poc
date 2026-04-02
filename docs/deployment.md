@@ -1,13 +1,78 @@
 # Production Deployment Guide
 
-Target: Ubuntu 24.04 LTS, single server (64GB RAM, 24 cores, 1TB SSD)
+## Server Architecture
+
+The system runs on two physical servers for resilience:
+
+| | Application Server | Management Server |
+|---|---|---|
+| **Role** | Processing (API, workers, Redis, PostgreSQL) | Ingestion (ChirpStack, MQTT broker), backups, monitoring |
+| **CPU** | Dual Intel Xeon Gold (48 cores) | Single Intel Xeon Gold (24 cores) |
+| **RAM** | 128GB (64GB × 2, DDR4/5 5600MT/s) | 128GB (64GB × 2, DDR4/5 5600MT/s) |
+| **OS Disk** | 960GB NVMe SSD × 2 (RAID 1) | 960GB NVMe SSD × 2 (RAID 1) |
+| **Data Disk** | 10TB HDD × 2 (RAID 1) | 20TB HDD × 2 (RAID 1) |
+| **Network** | 1Gb × 4 port + 10Gb × 2 port | 1Gb × 4 port + 10Gb × 2 port |
+| **PSU** | Dual hot-plug platinum (redundant) | Dual hot-plug platinum (redundant) |
+| **OS** | Ubuntu 24.04 LTS | Ubuntu 24.04 LTS |
+
+### Why Two Servers?
+
+ChirpStack (LoRa network server) and the MQTT broker run on the **management server**,
+separate from the application. This means:
+
+- **If the application server crashes:** ChirpStack stays up, LoRa gateways continue
+  delivering sensor events, and MQTT queues messages. When the app server recovers,
+  workers reconnect and process the backlog. No events are lost.
+- **If the management server crashes:** The application loses its event source but
+  remains operational for dashboard/API queries. LoRa gateways with store-and-forward
+  buffer packets locally and replay them when ChirpStack returns. No events are lost.
+- **Both down simultaneously:** LoRa gateways buffer packets via store-and-forward
+  and replay the full backlog once ChirpStack is reachable again. No events are lost
+  as long as the gateway buffer is not exhausted (typically hours to days of capacity).
+
+> **Zero event loss guarantee:** The LoRa gateways act as the final safety net.
+> Enterprise gateways (Kerlink, Multitech, RAK) support store-and-forward — when
+> the network server (ChirpStack) is unreachable, the gateway stores all received
+> packets in local flash storage and replays them in order once connectivity is
+> restored. This means no server failure combination causes permanent event loss.
+> Ensure store-and-forward is enabled in your gateway configuration.
+
+### Network Topology
+
+```
+LoRa Sensors (3000)
+    | (radio)
+LoRa Gateways
+    | (UDP/TCP, to management server IP)
+Management Server
+    ├── ChirpStack Network Server
+    ├── MQTT Broker (Mosquitto, port 1883)
+    └── ChirpStack PostgreSQL (ChirpStack's own DB)
+         | (MQTT over network, to app server IP)
+Application Server
+    ├── API Server (FastAPI/Gunicorn, port 8000)
+    ├── Redis (port 6379, localhost)
+    ├── PostgreSQL (port 5432, localhost)
+    ├── MQTT Workers (4x)
+    ├── Camera Workers (1 per camera)
+    ├── Inference Workers (6x)
+    └── Nginx (port 80, reverse proxy)
+```
 
 ## Prerequisites
 
+### Application Server
 - Ubuntu 24.04 LTS
 - Root/sudo access
-- Network access to ChirpStack MQTT broker
+- Network access to management server (MQTT port 1883, gRPC port 8080)
 - OpenAI API key (for license plate recognition)
+
+### Management Server
+- Ubuntu 24.04 LTS
+- Root/sudo access
+- ChirpStack v4 installed and configured
+- MQTT broker (ChirpStack built-in or Mosquitto)
+- Network access from LoRa gateways
 
 ## 1. System Setup
 
@@ -83,8 +148,10 @@ Edit `/opt/parking/.env.production`:
 # Required
 DATABASE_URL=postgresql://parking:YOUR_DB_PASSWORD@localhost/parking
 REDIS_URL=redis://:YOUR_REDIS_PASSWORD@localhost:6379
-MQTT_BROKER=YOUR_CHIRPSTACK_IP
+MQTT_BROKER=MANAGEMENT_SERVER_IP    # Points to management server, NOT localhost
 MQTT_PORT=1883
+CHIRPSTACK_HOST=MANAGEMENT_SERVER_IP  # Points to management server
+CHIRPSTACK_GRPC_PORT=8080
 CHIRPSTACK_API_TOKEN=YOUR_TOKEN
 CHIRPSTACK_APP_ID=YOUR_APP_UUID
 OPENAI_API_KEY=sk-...
@@ -94,6 +161,10 @@ ENABLE_MQTT=1
 ENABLE_CAMERA_CONTROL=true
 SNAPSHOTS_DIR=/data/snapshots
 ```
+
+> **Note:** `MQTT_BROKER` and `CHIRPSTACK_HOST` point to the management server IP,
+> not localhost. ChirpStack and the MQTT broker run on the management server for
+> resilience — see [Server Architecture](#server-architecture).
 
 ## 5. Systemd Services
 
@@ -181,17 +252,54 @@ pg_dump -U parking parking | gzip > "$BACKUP_DIR/pg_$(date +%F).sql.gz"
 find "$BACKUP_DIR" -name "pg_*.sql.gz" -mtime +30 -delete
 EOF
 chmod +x /etc/cron.daily/parking-pg-backup
+
+# Nightly image snapshot sync to management server (rsync over 10Gb link)
+cat > /etc/cron.daily/parking-snapshot-sync << 'EOF'
+#!/bin/bash
+# Syncs camera snapshots to management server for backup.
+# Uses 10Gb link for fast transfer. Management server has 20TB RAID 1 storage.
+# Only syncs new/changed files (incremental). Deletes from remote when local
+# cleanup removes files older than 90 days.
+rsync -az --delete \
+    /data/snapshots/ \
+    parking@MANAGEMENT_SERVER_IP:/data/snapshots-mirror/
+EOF
+chmod +x /etc/cron.daily/parking-snapshot-sync
+
+# Daily PostgreSQL backup sync to management server
+cat > /etc/cron.daily/parking-backup-sync << 'EOF'
+#!/bin/bash
+rsync -az /data/backups/ parking@MANAGEMENT_SERVER_IP:/data/backups-mirror/
+EOF
+chmod +x /etc/cron.daily/parking-backup-sync
 ```
+
+> **Setup:** Configure passwordless SSH from the application server to the management
+> server for the `parking` user: `ssh-keygen && ssh-copy-id parking@MANAGEMENT_SERVER_IP`.
+> Create `/data/snapshots-mirror` and `/data/backups-mirror` on the management server.
 
 ## 8. Firewall
 
+### Application Server
+
 ```bash
-sudo ufw allow 80/tcp    # HTTP
+sudo ufw allow 80/tcp    # HTTP (Nginx)
 sudo ufw allow 443/tcp   # HTTPS (if adding TLS later)
 sudo ufw enable
 ```
 
 Redis (6379), PostgreSQL (5432), and the API (8000) are bound to localhost only.
+
+### Management Server
+
+```bash
+sudo ufw allow 1883/tcp                        # MQTT broker (from app server + ChirpStack)
+sudo ufw allow 8080/tcp                        # ChirpStack gRPC API
+sudo ufw allow from APP_SERVER_IP to any port 22  # SSH for rsync backups
+sudo ufw enable
+```
+
+Restrict MQTT and gRPC ports to the application server IP if possible.
 
 ## 9. Health Check
 
@@ -240,12 +348,43 @@ psql -U parking -d parking -c "SELECT COUNT(*) FROM occupancy_events WHERE ts > 
 psql -U parking -d parking -c "SELECT status, COUNT(*) FROM challan_events GROUP BY status;"
 ```
 
+## Failure Scenarios & Recovery
+
+| Failure | Impact | Recovery | Data Loss? |
+|---------|--------|----------|------------|
+| **App server crash** | Processing stops; dashboard down | systemd auto-restarts services in ~30-60s. Workers XAUTOCLAIM in-flight messages. | No — ChirpStack (on mgmt server) queues MQTT messages until workers reconnect |
+| **Mgmt server crash** | No new sensor events ingested | App server stays operational for queries. LoRa gateways buffer packets via store-and-forward and replay on reconnect. Manual restart needed. | No — gateways hold all events until ChirpStack is back |
+| **Both servers down** | Full outage | LoRa gateways buffer via store-and-forward. Boot mgmt server first (ChirpStack), then app server. Gateways replay buffered packets automatically. | No — gateways replay all buffered events on reconnect |
+| **App server HDD failure (1 of 2)** | RAID 1 degrades, keeps running | Hot-swap failed drive, RAID rebuilds (~10-24hrs) | No |
+| **App server both HDDs fail** | Snapshots lost on app server | Restore from mgmt server mirror (`/data/snapshots-mirror/`) | Only images since last nightly rsync |
+| **Redis crash** | Workers stall, live state lost | Auto-restart + AOF replay (~30-60s). Max 1 sec data loss (appendfsync everysec). Slot state reconstructable from PostgreSQL. | Minimal |
+| **PostgreSQL crash** | Events not persisted, API errors | Auto-restart + WAL recovery (~30-60s) | No (WAL ensures crash consistency) |
+| **OpenAI API outage** | OCR pipeline stalls | Jobs dead-lettered after 3 retries. Process automatically when API returns. | No — jobs held in Redis stream |
+| **Power failure** | Everything down | UPS-dependent. Full cold boot recovery: ~30-60s after power. | Redis: up to 1s. PG: none. |
+
+## Backup Strategy
+
+| What | Where | Schedule | Retention |
+|------|-------|----------|-----------|
+| PostgreSQL dump | App server `/data/backups/` | Daily | 30 days |
+| PostgreSQL dump (mirror) | Mgmt server `/data/backups-mirror/` | Daily (rsync) | 30 days |
+| Camera snapshots | App server `/data/snapshots/` | Real-time | 90 days |
+| Camera snapshots (mirror) | Mgmt server `/data/snapshots-mirror/` | Daily (rsync) | 90 days |
+| Redis AOF | App server (alongside Redis) | Continuous | Current state |
+
+> **RAID is not backup.** RAID 1 protects against disk failure but not accidental
+> deletion, corruption, or ransomware. The rsync mirrors on the management server
+> provide an independent copy. For full disaster recovery, consider periodic offsite
+> backup (cloud storage) of PostgreSQL dumps.
+
 ## Troubleshooting
 
 | Symptom | Check | Fix |
 |---------|-------|-----|
 | API 503 | `curl localhost/health` | Restart redis/postgres, check `.env.production` |
-| No MQTT events | `journalctl -u parking-api \| grep MQTT` | Verify `MQTT_BROKER` IP, check ChirpStack is running |
+| No MQTT events | `journalctl -u parking-api \| grep MQTT` | Verify `MQTT_BROKER` points to mgmt server IP, check ChirpStack is running on mgmt server |
 | Camera timeouts | `journalctl -u parking-camera-worker@CAM_01` | Verify camera IP in `cameras.yaml`, test RTSP manually |
 | OCR failures | `redis-cli XLEN parking:inference:deadletter` | Check `OPENAI_API_KEY`, review dead-letter messages |
 | Slots stuck | `redis-cli HGETALL parking:slot:state` | Check mqtt-worker logs, verify CAS script |
+| Rsync backup failing | `journalctl \| grep rsync` | Check SSH key auth to mgmt server, verify disk space on mgmt server |
+| Mgmt server unreachable | `ping MANAGEMENT_SERVER_IP` | Check network, verify mgmt server is running, check firewall rules |

@@ -33,6 +33,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import cv2
+import numpy as np
 import psycopg
 import redis
 import yaml
@@ -44,6 +46,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/parking")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SLOT_META_PATH = REPO_ROOT / "config" / "slot_meta.yaml"
+SNAPSHOTS_DIR = os.environ.get("SNAPSHOTS_DIR", "/data/snapshots")
 
 # Zone layout: name → target slot count (scaled proportionally)
 ZONE_LAYOUT = {
@@ -60,6 +63,11 @@ ZONE_LAYOUT = {
 PLATE_STATES = ["KA", "MH", "DL", "TN", "AP", "TS", "GJ", "RJ", "UP", "WB"]
 PLATE_SERIES = ["01", "02", "03", "04", "05", "10", "11", "12", "19", "20", "51", "53"]
 
+# GPS center point for the parking facility (default: Hyderabad)
+GPS_CENTER_LAT = 17.385044
+GPS_CENTER_LNG = 78.486671
+GPS_SPREAD = 0.003  # ~300m spread across the facility
+
 # Simulation parameters
 OCCUPANCY_RATE = 0.55          # ~55% occupied at any time
 TURNOVER_PER_MINUTE = 0.02     # fraction of slots that change state per minute
@@ -70,6 +78,7 @@ HISTORY_EVENT_RATE = 0.01      # events per slot per minute for history
 # Live simulation
 LIVE_TICK_SECONDS = 2          # seconds between simulation ticks
 EVENTS_PER_TICK_RANGE = (5, 30)  # random events per tick at 3000-slot scale
+CHALLAN_RECHECK_MINUTES = 3    # minimum minutes between 1st and 2nd capture
 
 
 def generate_plate() -> str:
@@ -78,6 +87,102 @@ def generate_plate() -> str:
     alpha = random.choice(string.ascii_uppercase) + random.choice(string.ascii_uppercase)
     num = f"{random.randint(1, 9999):04d}"
     return f"{state}{series}{alpha}{num}"
+
+
+def generate_dummy_image(
+    path: str,
+    slot_name: str,
+    plate: str,
+    ts: str,
+    lat: float = None,
+    lng: float = None,
+    is_second: bool = False,
+    is_challan: bool = False,
+):
+    """Generate a dummy parking snapshot image with overlaid text.
+
+    For confirmed challans on the 2nd image, GPS coordinates are embedded.
+    """
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    # Dark gray background with some noise for realism
+    img[:] = (40, 40, 40)
+    noise = np.random.randint(0, 15, img.shape, dtype=np.uint8)
+    img = cv2.add(img, noise)
+
+    # Draw a car-shaped rectangle in the center
+    cv2.rectangle(img, (180, 140), (460, 340), (80, 80, 80), -1)
+    cv2.rectangle(img, (180, 140), (460, 340), (120, 120, 120), 2)
+
+    # License plate area
+    cv2.rectangle(img, (230, 260), (410, 310), (255, 255, 255), -1)
+    cv2.putText(img, plate, (240, 298), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+
+    # Slot name top-left
+    cv2.putText(img, f"Slot: {slot_name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # Timestamp top-right
+    short_ts = ts[:19] if len(ts) > 19 else ts
+    cv2.putText(img, short_ts, (320, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    # Capture label
+    label = "2nd Capture (Recheck)" if is_second else "1st Capture"
+    cv2.putText(img, label, (10, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    # Embed GPS on the 2nd image of confirmed challans
+    if is_second and is_challan and lat is not None and lng is not None:
+        gps_text = f"GPS: {lat:.6f}, {lng:.6f}"
+        # Red background strip for GPS
+        cv2.rectangle(img, (0, 60), (640, 95), (0, 0, 180), -1)
+        cv2.putText(img, gps_text, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(path, img)
+
+
+def _build_challan_data(
+    meta: dict, sid: int, ts: datetime, recheck_minutes: int,
+) -> dict:
+    """Build challan record data shared by seed and live phases.
+
+    Returns a dict with all fields needed to insert capture + challan rows.
+    """
+    plate = generate_plate()
+    recheck_secs = recheck_minutes * 60 + random.randint(0, 120)
+    challan_ts = ts + timedelta(seconds=recheck_secs)
+    session_id = str(uuid.uuid4())
+    challan_id = f"{sid}_{session_id}_{plate}"[:64]
+    is_match = random.random() < 0.6
+    status = "confirmed" if is_match else "cleared"
+    first_img = f"{SNAPSHOTS_DIR}/emu/{session_id}_1.jpg"
+    second_img = f"{SNAPSHOTS_DIR}/emu/{session_id}_2.jpg"
+    camera_id = f"CAM_{meta['zone']}_01"
+
+    return {
+        "plate": plate,
+        "challan_ts": challan_ts,
+        "session_id": session_id,
+        "challan_id": challan_id,
+        "is_match": is_match,
+        "status": status,
+        "first_img": first_img,
+        "second_img": second_img,
+        "camera_id": camera_id,
+        "second_plates": [plate] if is_match else [generate_plate()],
+        "metadata": {
+            "slot_name": meta["name"],
+            "zone": meta["zone"],
+            "first_image": first_img,
+            "first_time": ts.isoformat(),
+            "second_image": second_img,
+            "second_time": challan_ts.isoformat(),
+            "first_plates": [plate],
+            "second_plates": [plate] if is_match else [generate_plate()],
+            "capture_session_id": session_id,
+            "camera_id": camera_id,
+            "lat": meta.get("lat"),
+            "lng": meta.get("lng"),
+        },
+    }
 
 
 # ── Phase 1: Generate slot_meta.yaml ─────────────────────────────────────────
@@ -100,6 +205,10 @@ def generate_slot_meta(total_slots: int, num_zones: int) -> list[dict]:
         slots_per_cam = 80  # ~80 slots per camera
         cam_presets = {}
 
+        # Each zone gets a different GPS sub-area within the facility
+        zone_lat_offset = (i / max(len(zones) - 1, 1) - 0.5) * GPS_SPREAD
+        zone_lng_base = GPS_CENTER_LNG - GPS_SPREAD / 2
+
         for j in range(zone_count):
             cam_idx = j // slots_per_cam
             cam_key = f"CAM_{zone}_{cam_idx + 1:02d}"
@@ -108,11 +217,19 @@ def generate_slot_meta(total_slots: int, num_zones: int) -> list[dict]:
             if cam_key not in cam_presets:
                 cam_presets[cam_key] = []
 
+            # Distribute slots in a grid-like pattern within the zone
+            row = j // 20
+            col = j % 20
+            lat = GPS_CENTER_LAT + zone_lat_offset + row * 0.00005
+            lng = zone_lng_base + col * 0.00008
+
             slots.append({
                 "id": slot_id,
                 "name": f"{zone}{slot_id}",
                 "zone": zone,
                 "preset": preset,
+                "lat": round(lat, 6),
+                "lng": round(lng, 6),
             })
             slot_id += 1
 
@@ -168,7 +285,9 @@ def seed_redis(r: redis.Redis, slots: list[dict]):
 
 # ── Phase 3: Seed Postgres ───────────────────────────────────────────────────
 
-def seed_postgres(conn: psycopg.Connection, slots: list[dict], history_hours: int = HISTORY_HOURS):
+def seed_postgres(conn: psycopg.Connection, slots: list[dict],
+                  history_hours: int = HISTORY_HOURS,
+                  recheck_minutes: int = CHALLAN_RECHECK_MINUTES):
     print("\n[3/5] Seeding Postgres with historical data...")
 
     now = datetime.now(timezone.utc)
@@ -234,37 +353,18 @@ def seed_postgres(conn: psycopg.Connection, slots: list[dict], history_hours: in
 
             # Simulate challan for some OCCUPIED events
             if new == "OCCUPIED" and random.random() < CHALLAN_PROBABILITY:
-                plate = generate_plate()
-                challan_ts = ts + timedelta(seconds=random.randint(70, 180))
-                session_id = str(uuid.uuid4())
-                challan_id = f"{sid}_{session_id}_{plate}"[:64]
-                is_match = random.random() < 0.6  # 60% confirmed
-                status = "confirmed" if is_match else "cleared"
+                ch = _build_challan_data(meta, sid, ts, recheck_minutes)
 
-                # Camera capture
                 capture_rows.append((
-                    sid, f"CAM_{meta['zone']}_01", ts,
-                    f"/data/snapshots/emu/{session_id}_1.jpg",
-                    json.dumps({"plates": [plate], "confidence": round(random.uniform(0.7, 0.99), 2)}),
+                    sid, ch["camera_id"], ts, ch["first_img"],
+                    json.dumps({"plates": [ch["plate"]], "confidence": round(random.uniform(0.7, 0.99), 2)}),
                     "emulated",
                 ))
-
                 challan_rows.append((
-                    challan_id, sid, plate,
-                    0.9 if is_match else 0.0,
-                    status, challan_ts,
-                    json.dumps({
-                        "slot_name": meta["name"],
-                        "zone": meta["zone"],
-                        "first_image": f"/data/snapshots/emu/{session_id}_1.jpg",
-                        "first_time": ts.isoformat(),
-                        "second_image": f"/data/snapshots/emu/{session_id}_2.jpg",
-                        "second_time": challan_ts.isoformat(),
-                        "first_plates": [plate],
-                        "second_plates": [plate] if is_match else [generate_plate()],
-                        "capture_session_id": session_id,
-                        "camera_id": f"CAM_{meta['zone']}_01",
-                    }),
+                    ch["challan_id"], sid, ch["plate"],
+                    0.9 if ch["is_match"] else 0.0,
+                    ch["status"], ch["challan_ts"],
+                    json.dumps(ch["metadata"]),
                 ))
                 challans_generated += 1
 
@@ -294,12 +394,24 @@ def seed_postgres(conn: psycopg.Connection, slots: list[dict], history_hours: in
         )
 
     conn.commit()
+
+    # Generate a single shared placeholder image for seeded challans.
+    # The seed phase uses one image instead of generating thousands individually.
+    emu_dir = Path(SNAPSHOTS_DIR) / "emu"
+    emu_dir.mkdir(parents=True, exist_ok=True)
+    placeholder = str(emu_dir / "_seed_placeholder.jpg")
+    if not Path(placeholder).exists():
+        generate_dummy_image(placeholder, "SEED", "XX00XX0000",
+                             now.isoformat(), is_second=False)
+        print(f"  Created seed placeholder image: {placeholder}")
+
     print(f"  Done: {events_generated} occupancy + {len(capture_rows)} captures + {challans_generated} challans")
 
 
 # ── Phase 4: Live simulation ────────────────────────────────────────────────
 
-def run_live_simulation(r: redis.Redis, conn: psycopg.Connection, slots: list[dict]):
+def run_live_simulation(r: redis.Redis, conn: psycopg.Connection, slots: list[dict],
+                        recheck_minutes: int = CHALLAN_RECHECK_MINUTES):
     print("\n[5/5] Starting live simulation (Ctrl+C to stop)...")
     print(f"  {EVENTS_PER_TICK_RANGE[0]}-{EVENTS_PER_TICK_RANGE[1]} events every {LIVE_TICK_SECONDS}s")
     print(f"  Dashboard: http://localhost:8000")
@@ -399,51 +511,48 @@ def run_live_simulation(r: redis.Redis, conn: psycopg.Connection, slots: list[di
 
                 # Occasional challan
                 if new == "OCCUPIED" and random.random() < CHALLAN_PROBABILITY:
-                    plate = generate_plate()
-                    session_id = str(uuid.uuid4())
-                    challan_id = f"{sid}_{session_id}_{plate}"[:64]
-                    is_match = random.random() < 0.6
-                    status = "confirmed" if is_match else "cleared"
+                    ch = _build_challan_data(meta, sid, now, recheck_minutes)
+                    slot_lat = meta.get("lat")
+                    slot_lng = meta.get("lng")
+
+                    # Generate dummy images (use now for overlay, not future second_time)
+                    generate_dummy_image(
+                        ch["first_img"], meta["name"], ch["plate"], now.isoformat(),
+                        lat=slot_lat, lng=slot_lng, is_second=False,
+                    )
+                    generate_dummy_image(
+                        ch["second_img"], meta["name"], ch["plate"], now.isoformat(),
+                        lat=slot_lat, lng=slot_lng, is_second=True,
+                        is_challan=(ch["status"] == "confirmed"),
+                    )
 
                     with conn.cursor() as cur:
                         cur.execute(
                             "INSERT INTO camera_captures (slot_id, camera_id, ts, image_path, ocr_result, backend) "
                             "VALUES (%s, %s, %s, %s, %s, %s)",
-                            (sid, f"CAM_{meta['zone']}_01", now,
-                             f"/data/snapshots/emu/{session_id}_1.jpg",
-                             json.dumps({"plates": [plate]}), "emulated"),
+                            (sid, ch["camera_id"], now, ch["first_img"],
+                             json.dumps({"plates": [ch["plate"]]}), "emulated"),
                         )
                         cur.execute(
                             "INSERT INTO challan_events "
                             "(challan_id, slot_id, license_plate, confidence, status, ts, metadata) "
                             "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                            (challan_id, sid, plate, 0.9 if is_match else 0.0, status, now,
-                             json.dumps({
-                                 "slot_name": meta["name"],
-                                 "zone": meta["zone"],
-                                 "first_image": f"/data/snapshots/emu/{session_id}_1.jpg",
-                                 "first_time": ts_str,
-                                 "second_image": f"/data/snapshots/emu/{session_id}_2.jpg",
-                                 "second_time": ts_str,
-                                 "first_plates": [plate],
-                                 "second_plates": [plate] if is_match else [generate_plate()],
-                                 "capture_session_id": session_id,
-                                 "camera_id": f"CAM_{meta['zone']}_01",
-                             })),
+                            (ch["challan_id"], sid, ch["plate"],
+                             0.9 if ch["is_match"] else 0.0,
+                             ch["status"], ch["challan_ts"],
+                             json.dumps(ch["metadata"])),
                         )
 
-                    # Publish challan SSE
-                    challan_event = {
+                    r.publish("parking:events:live", json.dumps({
                         "event": "challan_completed",
-                        "ts": ts_str,
-                        "plate_text": plate,
+                        "ts": ch["challan_ts"].isoformat(),
+                        "plate_text": ch["plate"],
                         "slot_id": sid,
                         "slot_name": meta["name"],
                         "zone": meta["zone"],
-                        "challan": is_match,
-                        "capture_session_id": session_id,
-                    }
-                    r.publish("parking:events:live", json.dumps(challan_event))
+                        "challan": ch["is_match"],
+                        "capture_session_id": ch["session_id"],
+                    }))
                     new_challans += 1
 
             conn.commit()
@@ -475,8 +584,11 @@ def main():
     parser.add_argument("--live-only", action="store_true", help="Skip seeding, run live loop only")
     parser.add_argument("--history-hours", type=int, default=HISTORY_HOURS,
                         help=f"Hours of historical data to seed (default: {HISTORY_HOURS})")
+    parser.add_argument("--recheck-minutes", type=int, default=CHALLAN_RECHECK_MINUTES,
+                        help=f"Min minutes between 1st and 2nd capture (default: {CHALLAN_RECHECK_MINUTES})")
     args = parser.parse_args()
 
+    recheck_minutes = args.recheck_minutes
     num_zones = min(args.zones, len(ZONE_LAYOUT))
 
     print(f"Parking Emulator — {args.slots} slots, {num_zones} zones")
@@ -511,7 +623,8 @@ def main():
         seed_redis(r, slots)
 
         # Phase 3: Seed Postgres
-        seed_postgres(conn, slots, history_hours=args.history_hours)
+        seed_postgres(conn, slots, history_hours=args.history_hours,
+                      recheck_minutes=recheck_minutes)
 
         print(f"\n[4/5] Seed complete.")
     else:
@@ -525,7 +638,7 @@ def main():
         print(f"  Start the server:  python3 -m uvicorn webapp.server:app --reload --port 8000")
         print(f"  Dashboard:         http://localhost:8000")
     else:
-        run_live_simulation(r, conn, slots)
+        run_live_simulation(r, conn, slots, recheck_minutes=recheck_minutes)
 
     conn.close()
     r.close()

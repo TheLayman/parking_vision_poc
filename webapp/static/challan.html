@@ -102,6 +102,11 @@
         border: 1px solid rgba(34, 197, 94, 0.2);
       }
 
+      .location-link {
+        color: var(--accent); text-decoration: none; font-size: 0.82em;
+      }
+      .location-link:hover { text-decoration: underline; }
+
       .thumb {
         width: 80px; height: 56px; object-fit: cover; border-radius: 6px;
         border: 1px solid var(--border); cursor: pointer;
@@ -279,11 +284,12 @@
               <th>Photo</th>
               <th>2nd Detection (Latest)</th>
               <th>Photo</th>
+              <th>Location</th>
               <th>Challan</th>
             </tr>
           </thead>
           <tbody id="challanBody">
-            <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
+            <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -449,6 +455,8 @@
               second_time: r.second_time,
               second_image: r.second_image,
               challan: !!r.challan,
+              lat: r.lat,
+              lng: r.lng,
               slots: new Set([r.slot_name || '—']),
             });
           } else {
@@ -500,12 +508,17 @@
             ? '<span class="challan-badge yes">🚨 YES</span>'
             : '<span class="challan-badge no">✅ NO</span>';
 
+          const locationHtml = (g.lat != null && g.lng != null)
+            ? `<a href="https://www.google.com/maps?q=${g.lat},${g.lng}" target="_blank" rel="noopener noreferrer" class="location-link" title="Open in Google Maps">${g.lat.toFixed(5)}, ${g.lng.toFixed(5)}</a>`
+            : '—';
+
           html += `<tr>
             <td><span class="plate-badge">${escapeHtml(g.plate)}</span></td>
             <td>${fmtTime(g.first_time)}</td>
             <td>${thumbHtml(g.first_image, '1st detection', shouldLoadImages)}</td>
             <td>${fmtTime(g.second_time)}</td>
             <td>${thumbHtml(g.second_image, '2nd detection', shouldLoadImages)}</td>
+            <td>${locationHtml}</td>
             <td>${challanBadge}</td>
           </tr>`;
         });

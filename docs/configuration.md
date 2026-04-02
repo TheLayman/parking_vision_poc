@@ -10,15 +10,15 @@
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
 | `SNAPSHOTS_DIR` | `/data/snapshots` | Camera capture storage directory |
 
-### MQTT / ChirpStack
+### MQTT / ChirpStack (on Management Server)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENABLE_MQTT` | `1` | Enable MQTT listener (`0` to disable) |
-| `MQTT_BROKER` | `localhost` | MQTT broker hostname |
+| `MQTT_BROKER` | `localhost` | MQTT broker hostname — **set to management server IP in production** |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_TOPIC` | `application/+/device/+/event/up` | Subscription topic pattern |
-| `CHIRPSTACK_HOST` | `localhost` | ChirpStack gRPC server |
+| `CHIRPSTACK_HOST` | `localhost` | ChirpStack gRPC server — **set to management server IP in production** |
 | `CHIRPSTACK_GRPC_PORT` | `8080` | ChirpStack gRPC port |
 | `CHIRPSTACK_API_TOKEN` | _(required)_ | API token from ChirpStack UI |
 | `CHIRPSTACK_APP_ID` | _(required)_ | Application UUID |
@@ -47,7 +47,7 @@
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORKER_ID` | _(set by systemd)_ | Consumer group member ID |
-| `CHALLAN_RECHECK_INTERVAL` | `70` | Seconds between challan re-checks |
+| `CHALLAN_RECHECK_INTERVAL` | `70` | Seconds between 1st and 2nd capture for challan verification. Minimum recommended: 180 (3 minutes) for production. |
 
 ## Camera Configuration
 
@@ -84,11 +84,19 @@ cameras:
   name: B7        # Must match ChirpStack device name
   zone: B
   preset: 1       # PTZ preset for this slot's camera
+  lat: 17.385044  # GPS latitude (WGS84)
+  lng: 78.486671  # GPS longitude (WGS84)
 - id: 2
   name: B60
   zone: B
   preset: 1
+  lat: 17.385094
+  lng: 78.486751
 ```
+
+GPS coordinates (`lat`, `lng`) are included in challan records and embedded on
+the 2nd capture image for confirmed violations. They appear as a clickable
+Google Maps link in the challan dashboard.
 
 ## Redis Streams
 
@@ -138,11 +146,19 @@ See `db/schema.sql` for full DDL with indexes and constraints.
 
 ## Port Reference
 
+### Application Server
+
 | Port | Service | Bind | External |
 |------|---------|------|----------|
 | 80 | nginx | 0.0.0.0 | Yes |
 | 8000 | API (gunicorn) | 127.0.0.1 | No |
 | 6379 | Redis | 127.0.0.1 | No |
 | 5432 | PostgreSQL | 127.0.0.1 | No |
-| 1883 | MQTT (ChirpStack) | External | Yes |
-| 8080 | ChirpStack gRPC | External | Yes |
+
+### Management Server
+
+| Port | Service | Bind | External |
+|------|---------|------|----------|
+| 1883 | MQTT Broker (ChirpStack) | 0.0.0.0 | Yes (app server + gateways) |
+| 8080 | ChirpStack gRPC API | 0.0.0.0 | Yes (app server) |
+| 22 | SSH (rsync backups) | 0.0.0.0 | Yes (app server only) |

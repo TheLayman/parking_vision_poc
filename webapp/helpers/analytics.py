@@ -67,6 +67,8 @@ def parse_events_from_log(event_log_path: Path, cutoff: datetime | None) -> dict
                 "slot_name": meta.get("slot_name", str(row["slot_id"])),
                 "zone": meta.get("zone", "A"),
                 "challan": row.get("status") == "confirmed",
+                "lat": meta.get("lat"),
+                "lng": meta.get("lng"),
             })
     except Exception as e:
         import logging

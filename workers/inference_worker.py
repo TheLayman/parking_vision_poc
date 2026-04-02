@@ -130,6 +130,12 @@ def process_inference_job(r: redis.Redis, db_conn, msg_id: bytes, fields: dict) 
         recheck_count = 0
     capture_session_id = _field("capture_session_id", "") or str(uuid.uuid4())
 
+    # GPS coordinates (forwarded through the stream from slot metadata)
+    _lat_str = _field("lat", "")
+    _lng_str = _field("lng", "")
+    slot_lat = float(_lat_str) if _lat_str else None
+    slot_lng = float(_lng_str) if _lng_str else None
+
     log.info("Inference job: slot=%s type=%s image=%s", slot_name, task_type, image_path)
 
     if not image_path or not Path(image_path).exists():
@@ -196,6 +202,8 @@ def process_inference_job(r: redis.Redis, db_conn, msg_id: bytes, fields: dict) 
             first_time=first_time,
             capture_session_id=capture_session_id,
             trigger_ts=trigger_ts,
+            slot_lat=slot_lat,
+            slot_lng=slot_lng,
         )
         return True
 
@@ -230,9 +238,7 @@ def process_inference_job(r: redis.Redis, db_conn, msg_id: bytes, fields: dict) 
             slot_presets = _get_slot_presets(cam_assignment)
             preset = slot_presets.get(slot_id) or slot_presets.get(str(slot_id), "")
 
-            r.xadd(
-                f"parking:camera:tasks:{cam_assignment}",
-                {
+            task_fields = {
                     "slot_id": str(slot_id),
                     "slot_name": slot_name,
                     "zone": zone,
@@ -245,7 +251,14 @@ def process_inference_job(r: redis.Redis, db_conn, msg_id: bytes, fields: dict) 
                     "first_time": capture_ts_str,
                     "recheck_count": "0",
                     "capture_session_id": capture_session_id,
-                },
+                }
+            if slot_lat is not None:
+                task_fields["lat"] = str(slot_lat)
+            if slot_lng is not None:
+                task_fields["lng"] = str(slot_lng)
+            r.xadd(
+                f"parking:camera:tasks:{cam_assignment}",
+                task_fields,
                 maxlen=500,
                 approximate=True,
             )
@@ -262,6 +275,7 @@ def _process_challan_recheck(
     camera_id: str, second_image: str, second_time: str, second_plates: list,
     first_plates_raw: str, first_image: str, first_time: str,
     capture_session_id: str, trigger_ts: str,
+    slot_lat: float | None = None, slot_lng: float | None = None,
 ):
     """Compare first and second captures to decide challan."""
     try:
@@ -301,6 +315,8 @@ def _process_challan_recheck(
                     "capture_session_id": capture_session_id,
                     "trigger_ts": trigger_ts,
                     "camera_id": camera_id,
+                    "lat": slot_lat,
+                    "lng": slot_lng,
                 },
                 conn=db_conn,
             )

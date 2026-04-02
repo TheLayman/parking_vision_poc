@@ -162,14 +162,19 @@ def build_state_from_log(event_log_path, slot_ids: list[int],
     occupied_ids = {sid for sid, st in state_by_id.items() if st == "OCCUPIED"}
     zones, free_count, total_count = calculate_zone_stats(slot_ids, occupied_ids, meta_by_id)
 
-    slots = [
-        {
+    slots = []
+    for sid in slot_ids:
+        m = meta_by_id.get(sid, {})
+        slot = {
             "id": sid,
-            "name": meta_by_id.get(sid, {}).get("name") or str(sid),
-            "zone": meta_by_id.get(sid, {}).get("zone") or "A",
+            "name": m.get("name") or str(sid),
+            "zone": m.get("zone") or "A",
         }
-        for sid in slot_ids
-    ]
+        if m.get("lat") is not None:
+            slot["lat"] = m["lat"]
+        if m.get("lng") is not None:
+            slot["lng"] = m["lng"]
+        slots.append(slot)
 
     return {
         "slots": slots,
