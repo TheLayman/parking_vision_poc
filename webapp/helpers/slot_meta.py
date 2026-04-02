@@ -123,14 +123,11 @@ def calculate_zone_stats(slot_ids: list[int], occupied_ids: set,
 
 # ── State from Redis (replaces JSONL replay) ─────────────────────────────────
 
-def build_state_from_log(event_log_path, slot_ids: list[int],
+def build_state_from_log(slot_ids: list[int],
                          meta_by_id: dict[int, dict],
-                         max_events: int = 200,
                          redis_client=None) -> dict:
     """Read current slot state from Redis Hash parking:slot:state.
 
-    The *event_log_path* parameter is ignored (no JSONL in production).
-    State is the authoritative source of truth from Redis.
     Pass *redis_client* to reuse an existing connection (avoids per-call churn).
     """
     try:

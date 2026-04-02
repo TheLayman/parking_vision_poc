@@ -5,12 +5,12 @@ Run 6 instances via systemd:
 
 Each instance:
   1. Reads image from disk
-  2. Calls OpenAI Vision API (retry 3× on 429 with exponential backoff)
+  2. Calls OpenAI Vision API (retry 3x on 429 with exponential backoff)
   3. Stores parking:challan:pending:{slot_id} in Redis with 5-min TTL
   4. INSERTs into camera_captures and challan_events Postgres tables
   5. For challan rechecks: compares plates and records final challan decision
   6. PUBLISHes challan_completed event to parking:events:live
-  7. On 3× failure: sends to parking:inference:deadletter
+  7. On 3x failure: sends to parking:inference:deadletter
 """
 
 from __future__ import annotations
@@ -18,11 +18,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -31,8 +30,11 @@ import redis
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-from db.client import get_connection, insert_camera_capture, insert_challan_event
+from db.client import insert_camera_capture, insert_challan_event
 from webapp.license_plate_extractor import extract_all_license_plates
+from workers.base import (
+    stream_field, run_stream_worker, get_cam_for_slot, get_slot_presets,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +44,6 @@ log = logging.getLogger("inference_worker")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 WORKER_ID = os.environ.get("WORKER_ID", f"worker-{os.getpid()}")
 
 STREAM_KEY = "parking:inference:jobs"
@@ -50,16 +51,10 @@ GROUP_NAME = "inference-workers"
 DEADLETTER_KEY = "parking:inference:deadletter"
 CHALLAN_PENDING_TTL = 300  # 5 minutes
 CHALLAN_RECHECK_DELAY = int(os.environ.get("CHALLAN_RECHECK_INTERVAL", "70"))
-BLOCK_MS = 2000
-AUTOCLAIM_IDLE_MS = 90_000  # reclaim inference jobs idle >90s
 
 MAX_RETRIES = 3
-_RETRY_DELAYS = [2, 8, 30]  # seconds between retries
-
-# Plate match threshold (same as server.py POC)
+_RETRY_DELAYS = [2, 8, 30]
 _PLATE_MATCH_THRESHOLD = 0.85
-
-SNAPSHOTS_DIR = Path(os.environ.get("SNAPSHOTS_DIR", "/data/snapshots"))
 
 
 # ── Plate matching ────────────────────────────────────────────────────────────
@@ -79,12 +74,10 @@ def _any_plate_matches(plate: str, plate_list: list[str]) -> bool:
 # ── OpenAI call with retry ────────────────────────────────────────────────────
 
 def _extract_plates_with_retry(image_path: str) -> dict:
-    """Call extract_all_license_plates with exponential backoff on 429."""
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
-            result = extract_all_license_plates(image_path)
-            return result
+            return extract_all_license_plates(image_path)
         except Exception as e:
             last_exc = e
             err_str = str(e).lower()
@@ -105,166 +98,111 @@ def _extract_plates_with_retry(image_path: str) -> dict:
 # ── Core processing ───────────────────────────────────────────────────────────
 
 def process_inference_job(r: redis.Redis, db_conn, msg_id: bytes, fields: dict) -> bool:
-    """Process one inference job. Returns True to XACK, False on retryable error."""
+    """Process one inference job. Returns True to XACK."""
+    _f = lambda key, default="": stream_field(fields, key, default)
 
-    def _field(key: str, default="") -> str:
-        v = fields.get(key.encode()) or fields.get(key, default)
-        return v.decode() if isinstance(v, bytes) else str(v or default)
-
-    slot_id = int(_field("slot_id", "0"))
-    slot_name = _field("slot_name", str(slot_id))
-    zone = _field("zone", "A")
-    camera_id = _field("camera_id", "CAM_01")
-    image_path = _field("image_path", "")
-    capture_ts_str = _field("capture_ts", datetime.now(timezone.utc).isoformat())
-    trigger_ts = _field("trigger_ts", "")
-    task_type = _field("task_type", "camera_capture")
+    slot_id = int(_f("slot_id", "0"))
+    slot_name = _f("slot_name", str(slot_id))
+    zone = _f("zone", "A")
+    camera_id = _f("camera_id", "CAM_01")
+    image_path = _f("image_path", "")
+    capture_ts_str = _f("capture_ts", datetime.now(timezone.utc).isoformat())
+    trigger_ts = _f("trigger_ts", "")
+    task_type = _f("task_type", "camera_capture")
 
     # Challan recheck context
-    first_plates_raw = _field("first_plates", "")
-    first_image = _field("first_image", "")
-    first_time = _field("first_time", "")
-    try:
-        recheck_count = int(_field("recheck_count", "0"))
-    except ValueError:
-        recheck_count = 0
-    capture_session_id = _field("capture_session_id", "") or str(uuid.uuid4())
+    first_plates_raw = _f("first_plates", "")
+    first_image = _f("first_image", "")
+    first_time = _f("first_time", "")
+    capture_session_id = _f("capture_session_id", "") or str(uuid.uuid4())
 
-    # GPS coordinates (forwarded through the stream from slot metadata)
-    _lat_str = _field("lat", "")
-    _lng_str = _field("lng", "")
-    slot_lat = float(_lat_str) if _lat_str else None
-    slot_lng = float(_lng_str) if _lng_str else None
+    # GPS coordinates (forwarded through the stream)
+    lat_str = _f("lat", "")
+    lng_str = _f("lng", "")
+    slot_lat = float(lat_str) if lat_str else None
+    slot_lng = float(lng_str) if lng_str else None
 
     log.info("Inference job: slot=%s type=%s image=%s", slot_name, task_type, image_path)
 
     if not image_path or not Path(image_path).exists():
         log.error("Image not found: %s — sending to deadletter", image_path)
         _send_to_deadletter(r, fields, "image_not_found")
-        return True  # ack — can't retry without the image
+        return True
 
-    # Call OpenAI Vision with retry
     try:
         vision_result = _extract_plates_with_retry(image_path)
     except RuntimeError as e:
-        log.error("OpenAI failed for slot %s: %s — sending to deadletter", slot_name, e)
+        log.error("OpenAI failed for slot %s: %s — deadlettering", slot_name, e)
         _send_to_deadletter(r, fields, str(e))
-        return True  # ack — already dead-lettered
+        return True
 
     license_plates = [
         p.get("plate_text", "") for p in vision_result.get("plates", [])
         if p.get("plate_text") and p["plate_text"] != "UNKNOWN"
     ]
     vehicle_detected = vision_result.get("vehicle_detected", True)
-    best_plate = license_plates[0] if license_plates else None
-    best_conf = vision_result.get("plates", [{}])[0].get("confidence", 0.0) if license_plates else 0.0
-
     capture_ts = datetime.fromisoformat(capture_ts_str.replace("Z", "+00:00"))
 
-    # INSERT camera_capture — challan scheduling is contingent on this succeeding
-    capture_recorded = False
+    # INSERT camera_capture
     try:
         insert_camera_capture(
-            slot_id=slot_id,
-            camera_id=camera_id,
-            ts=capture_ts,
+            slot_id=slot_id, camera_id=camera_id, ts=capture_ts,
             image_path=image_path,
-            ocr_result={
-                "plates": license_plates,
-                "vehicle_detected": vehicle_detected,
-                "raw": vision_result,
-            },
-            backend="openai",
-            conn=db_conn,
+            ocr_result={"plates": license_plates, "vehicle_detected": vehicle_detected, "raw": vision_result},
+            backend="openai", conn=db_conn,
         )
         db_conn.commit()
-        capture_recorded = True
     except Exception as e:
-        log.error("Failed to insert camera_capture: %s — skipping challan scheduling", e)
+        log.error("Failed to insert camera_capture: %s — skipping challan", e)
         db_conn.rollback()
-
-    if not capture_recorded:
-        return True  # ack — no point scheduling recheck with no first-capture record
+        return True
 
     if task_type == "challan_recheck":
         _process_challan_recheck(
-            r=r,
-            db_conn=db_conn,
-            slot_id=slot_id,
-            slot_name=slot_name,
-            zone=zone,
-            camera_id=camera_id,
-            second_image=image_path,
-            second_time=capture_ts_str,
-            second_plates=license_plates,
-            first_plates_raw=first_plates_raw,
-            first_image=first_image,
-            first_time=first_time,
-            capture_session_id=capture_session_id,
-            trigger_ts=trigger_ts,
-            slot_lat=slot_lat,
-            slot_lng=slot_lng,
+            r, db_conn, slot_id, slot_name, zone, camera_id,
+            second_image=image_path, second_time=capture_ts_str,
+            second_plates=license_plates, first_plates_raw=first_plates_raw,
+            first_image=first_image, first_time=first_time,
+            capture_session_id=capture_session_id, trigger_ts=trigger_ts,
+            slot_lat=slot_lat, slot_lng=slot_lng,
         )
         return True
 
-    # Standard camera_capture: store pending state + schedule recheck
+    # Standard capture: store pending state + schedule recheck
     if license_plates:
         pending_data = {
-            "plates": license_plates,
-            "slot_name": slot_name,
-            "zone": zone,
-            "first_image": image_path,
-            "first_time": capture_ts_str,
-            "recheck_count": 0,
-            "capture_session_id": capture_session_id,
-            "trigger_ts": trigger_ts,
+            "plates": license_plates, "slot_name": slot_name, "zone": zone,
+            "first_image": image_path, "first_time": capture_ts_str,
+            "capture_session_id": capture_session_id, "trigger_ts": trigger_ts,
         }
-        r.set(
-            f"parking:challan:pending:{slot_id}",
-            json.dumps(pending_data),
-            ex=CHALLAN_PENDING_TTL,
-        )
+        r.set(f"parking:challan:pending:{slot_id}", json.dumps(pending_data),
+              ex=CHALLAN_PENDING_TTL)
 
-        # Schedule camera recheck task
-        cam_assignment = _get_cam_id_for_slot(slot_id, camera_id)
+        cam_assignment = get_cam_for_slot(slot_id, camera_id)
         if cam_assignment:
-            scheduled_at = datetime.now(timezone.utc)
-            # We encode the delay in the stream message; camera_worker handles it
-            from datetime import timedelta
             scheduled_ts = (
                 datetime.now(timezone.utc) + timedelta(seconds=CHALLAN_RECHECK_DELAY)
             ).isoformat()
 
-            slot_presets = _get_slot_presets(cam_assignment)
-            preset = slot_presets.get(slot_id) or slot_presets.get(str(slot_id), "")
+            presets = get_slot_presets(cam_assignment)
+            preset = presets.get(slot_id) or presets.get(str(slot_id), "")
 
             task_fields = {
-                    "slot_id": str(slot_id),
-                    "slot_name": slot_name,
-                    "zone": zone,
-                    "preset": str(preset) if preset else "",
-                    "trigger_ts": trigger_ts,
-                    "task_type": "challan_recheck",
-                    "scheduled_at": scheduled_ts,
-                    "first_plates": json.dumps(license_plates),
-                    "first_image": image_path,
-                    "first_time": capture_ts_str,
-                    "recheck_count": "0",
-                    "capture_session_id": capture_session_id,
-                }
+                "slot_id": str(slot_id), "slot_name": slot_name,
+                "zone": zone, "preset": str(preset) if preset else "",
+                "trigger_ts": trigger_ts, "task_type": "challan_recheck",
+                "scheduled_at": scheduled_ts,
+                "first_plates": json.dumps(license_plates),
+                "first_image": image_path, "first_time": capture_ts_str,
+                "capture_session_id": capture_session_id,
+            }
             if slot_lat is not None:
                 task_fields["lat"] = str(slot_lat)
             if slot_lng is not None:
                 task_fields["lng"] = str(slot_lng)
-            r.xadd(
-                f"parking:camera:tasks:{cam_assignment}",
-                task_fields,
-                maxlen=500,
-                approximate=True,
-            )
+            r.xadd(f"parking:camera:tasks:{cam_assignment}", task_fields,
+                    maxlen=500, approximate=True)
             log.info("Challan recheck scheduled for slot %s in %ds", slot_name, CHALLAN_RECHECK_DELAY)
-        else:
-            log.warning("Cannot schedule challan recheck for slot %d — camera not found", slot_id)
 
     log.info("Inference complete: slot=%s plates=%s", slot_name, license_plates)
     return True
@@ -283,12 +221,10 @@ def _process_challan_recheck(
     except Exception:
         first_plates = [first_plates_raw] if first_plates_raw else []
 
-    log.info("Challan recheck: slot=%s first=%s second=%s",
-             slot_name, first_plates, second_plates)
+    log.info("Challan recheck: slot=%s first=%s second=%s", slot_name, first_plates, second_plates)
 
     for plate_text in first_plates:
         if len(plate_text) > 13:
-            log.warning("Plate text too long (%d chars), truncating: %s", len(plate_text), plate_text)
             plate_text = plate_text[:13]
 
         is_match = _any_plate_matches(plate_text, second_plates)
@@ -297,47 +233,33 @@ def _process_challan_recheck(
 
         try:
             insert_challan_event(
-                challan_id=challan_id,
-                slot_id=slot_id,
+                challan_id=challan_id, slot_id=slot_id,
                 license_plate=plate_text,
                 confidence=0.9 if is_match else 0.0,
-                status=status,
-                ts=datetime.now(timezone.utc),
+                status=status, ts=datetime.now(timezone.utc),
                 metadata={
-                    "slot_name": slot_name,
-                    "zone": zone,
-                    "first_image": first_image,
-                    "first_time": first_time,
-                    "second_image": second_image,
-                    "second_time": second_time,
-                    "first_plates": first_plates,
-                    "second_plates": second_plates,
+                    "slot_name": slot_name, "zone": zone,
+                    "first_image": first_image, "first_time": first_time,
+                    "second_image": second_image, "second_time": second_time,
+                    "first_plates": first_plates, "second_plates": second_plates,
                     "capture_session_id": capture_session_id,
-                    "trigger_ts": trigger_ts,
-                    "camera_id": camera_id,
-                    "lat": slot_lat,
-                    "lng": slot_lng,
+                    "trigger_ts": trigger_ts, "camera_id": camera_id,
+                    "lat": slot_lat, "lng": slot_lng,
                 },
                 conn=db_conn,
             )
             db_conn.commit()
             log.info("Challan %s: plate=%s slot=%s", status.upper(), plate_text, slot_name)
 
-            # Publish only after successful commit
-            live_event = {
-                "event": "challan_completed",
-                "ts": second_time,
-                "plate_text": plate_text,
-                "slot_id": slot_id,
-                "slot_name": slot_name,
-                "zone": zone,
-                "challan": is_match,
-                "capture_session_id": capture_session_id,
-            }
             try:
-                r.publish("parking:events:live", json.dumps(live_event))
+                r.publish("parking:events:live", json.dumps({
+                    "event": "challan_completed", "ts": second_time,
+                    "plate_text": plate_text, "slot_id": slot_id,
+                    "slot_name": slot_name, "zone": zone,
+                    "challan": is_match, "capture_session_id": capture_session_id,
+                }))
             except Exception as e:
-                log.error("Failed to publish challan_completed event: %s", e)
+                log.error("Failed to publish challan_completed: %s", e)
         except Exception as e:
             log.error("Failed to insert challan_event for %s: %s", plate_text, e)
             try:
@@ -345,52 +267,14 @@ def _process_challan_recheck(
             except Exception:
                 pass
 
-    # Clear pending state
     try:
         r.delete(f"parking:challan:pending:{slot_id}")
     except Exception:
         pass
 
 
-_cameras_yaml_cache: dict = {}
-_cameras_yaml_mtime: float | None = None
-
-
-def _get_cam_id_for_slot(slot_id: int, fallback_cam: str) -> str | None:
-    """Look up which camera covers slot_id from cameras.yaml."""
-    _refresh_cameras_cache()
-    for cam_id, cfg in _cameras_yaml_cache.items():
-        slot_presets = cfg.get("slot_presets", {})
-        if slot_id in slot_presets or str(slot_id) in slot_presets:
-            return cam_id
-    return fallback_cam  # assume same camera as the capture
-
-
-def _get_slot_presets(cam_id: str) -> dict:
-    _refresh_cameras_cache()
-    return _cameras_yaml_cache.get(cam_id, {}).get("slot_presets", {})
-
-
-def _refresh_cameras_cache():
-    global _cameras_yaml_cache, _cameras_yaml_mtime
-    cameras_path = _REPO_ROOT / "config" / "cameras.yaml"
-    if not cameras_path.exists():
-        return
-    try:
-        mtime = cameras_path.stat().st_mtime
-        if mtime == _cameras_yaml_mtime:
-            return
-        from webapp.helpers.data_io import load_yaml
-        data = load_yaml(cameras_path) or {}
-        _cameras_yaml_cache = data.get("cameras", {})
-        _cameras_yaml_mtime = mtime
-    except Exception as e:
-        log.error("Failed to refresh cameras.yaml: %s", e)
-
-
 def _send_to_deadletter(r: redis.Redis, fields: dict, reason: str):
-    """Move a failed job to the dead-letter stream."""
-    dl_fields = {k: v for k, v in fields.items()}
+    dl_fields = dict(fields)
     dl_fields[b"deadletter_reason"] = reason.encode()
     dl_fields[b"deadletter_ts"] = datetime.now(timezone.utc).isoformat().encode()
     try:
@@ -400,112 +284,22 @@ def _send_to_deadletter(r: redis.Redis, fields: dict, reason: str):
         log.error("Failed to write to deadletter: %s", e)
 
 
-# ── DB reconnect helper ───────────────────────────────────────────────────────
-
-def _ensure_db_conn(db_conn):
-    """Return a live DB connection, reconnecting if the current one is broken."""
-    try:
-        db_conn.execute("SELECT 1")
-        return db_conn
-    except Exception:
-        log.warning("DB connection lost — reconnecting")
-        try:
-            db_conn.close()
-        except Exception:
-            pass
-        return get_connection()
-
-
-# ── Worker loop ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 def run():
     log.info("Inference worker starting (consumer: %s)", WORKER_ID)
-
-    r = redis.Redis.from_url(REDIS_URL, decode_responses=False)
-
-    try:
-        r.xgroup_create(STREAM_KEY, GROUP_NAME, id="0", mkstream=True)
-        log.info("Created consumer group %s on %s", GROUP_NAME, STREAM_KEY)
-    except redis.exceptions.ResponseError as e:
-        if "BUSYGROUP" in str(e):
-            log.debug("Consumer group %s already exists", GROUP_NAME)
-        else:
-            raise
-
-    db_conn = get_connection()
-    log.info("Postgres connection established")
-
-    _running = True
-
-    def _handle_signal(sig, frame):
-        nonlocal _running
-        log.info("Signal %s — shutting down inference worker", sig)
-        _running = False
-
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
-    autoclaim_cursor = "0-0"
-
-    while _running:
-        # XAUTOCLAIM: reclaim jobs idle >90s
-        try:
-            claimed = r.xautoclaim(
-                STREAM_KEY, GROUP_NAME, WORKER_ID,
-                min_idle_time=AUTOCLAIM_IDLE_MS,
-                start_id=autoclaim_cursor,
-                count=5,
-            )
-            autoclaim_cursor_new = claimed[0]
-            claimed_messages = claimed[1]
-            if claimed_messages:
-                log.info("Reclaimed %d idle inference job(s)", len(claimed_messages))
-                for msg_id, fields in claimed_messages:
-                    db_conn = _ensure_db_conn(db_conn)
-                    ok = process_inference_job(r, db_conn, msg_id, fields)
-                    if ok:
-                        r.xack(STREAM_KEY, GROUP_NAME, msg_id)
-            autoclaim_cursor = autoclaim_cursor_new if claimed_messages else "0-0"
-        except Exception as e:
-            log.error("XAUTOCLAIM error: %s", e)
-            autoclaim_cursor = "0-0"
-
-        # XREADGROUP: read new jobs
-        try:
-            results = r.xreadgroup(
-                GROUP_NAME, WORKER_ID,
-                {STREAM_KEY: ">"},
-                count=1,
-                block=BLOCK_MS,
-            )
-        except redis.exceptions.ConnectionError as e:
-            log.error("Redis connection error: %s — retrying", e)
-            time.sleep(2)
-            try:
-                r = redis.Redis.from_url(REDIS_URL, decode_responses=False)
-            except Exception:
-                pass
-            continue
-        except Exception as e:
-            log.error("XREADGROUP error: %s", e)
-            time.sleep(1)
-            continue
-
-        if not results:
-            continue
-
-        for stream_name, messages in results:
-            for msg_id, fields in messages:
-                db_conn = _ensure_db_conn(db_conn)
-                ok = process_inference_job(r, db_conn, msg_id, fields)
-                if ok:
-                    r.xack(STREAM_KEY, GROUP_NAME, msg_id)
-
-    log.info("Inference worker stopped")
-    try:
-        db_conn.close()
-    except Exception:
-        pass
+    run_stream_worker(
+        stream_key=STREAM_KEY,
+        group_name=GROUP_NAME,
+        worker_id=WORKER_ID,
+        process_fn=process_inference_job,
+        autoclaim_idle_ms=90_000,
+        autoclaim_count=5,
+        xread_count=1,
+        block_ms=2000,
+        needs_db=True,
+        worker_label="Inference worker",
+    )
 
 
 if __name__ == "__main__":

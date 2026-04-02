@@ -90,10 +90,10 @@ class TestFullFlow:
         with (
             patch("workers.mqtt_worker.load_slot_meta_by_id", return_value=_SLOT_META),
             patch("workers.mqtt_worker.get_slot_id_by_device_name", return_value=1),
-            patch("workers.mqtt_worker._load_camera_assignment", return_value=_CAM_ASSIGNMENT),
+            patch("workers.mqtt_worker.get_slot_to_camera_map", return_value=_CAM_ASSIGNMENT),
             patch("workers.inference_worker.extract_all_license_plates", return_value=_PLATE_RESULT),
-            patch("workers.inference_worker._get_cam_id_for_slot", return_value="CAM_01"),
-            patch("workers.inference_worker._get_slot_presets", return_value={1: 2}),
+            patch("workers.inference_worker.get_cam_for_slot", return_value="CAM_01"),
+            patch("workers.inference_worker.get_slot_presets", return_value={1: 2}),
         ):
             return self._run_full_flow(r, db, tmp_path)
 
@@ -174,7 +174,7 @@ class TestNoDuplicateCameraTask:
 
     @patch("workers.mqtt_worker.load_slot_meta_by_id", return_value=_SLOT_META)
     @patch("workers.mqtt_worker.get_slot_id_by_device_name", return_value=1)
-    @patch("workers.mqtt_worker._load_camera_assignment", return_value=_CAM_ASSIGNMENT)
+    @patch("workers.mqtt_worker.get_slot_to_camera_map", return_value=_CAM_ASSIGNMENT)
     def test_22_rapid_events_produce_exactly_one_camera_task(self, *_mocks):
         """NO DUPLICATE: rapid FREE→OCCUPIED→FREE processed by two parallel workers.
 
@@ -237,7 +237,7 @@ class TestCrashRecovery:
 
     @patch("workers.mqtt_worker.load_slot_meta_by_id", return_value=_SLOT_META)
     @patch("workers.mqtt_worker.get_slot_id_by_device_name", return_value=1)
-    @patch("workers.mqtt_worker._load_camera_assignment", return_value=_CAM_ASSIGNMENT)
+    @patch("workers.mqtt_worker.get_slot_to_camera_map", return_value=_CAM_ASSIGNMENT)
     def test_23_xautoclaim_recovers_unacked_message(self, *_mocks):
         """CRASH RECOVERY: worker-A dies mid-message, worker-B reclaims via XAUTOCLAIM.
 

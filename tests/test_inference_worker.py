@@ -66,8 +66,8 @@ def db(mock_db):
 def _patch_cameras():
     """Stub out cameras.yaml reads so tests don't need the config file."""
     with (
-        patch("workers.inference_worker._get_cam_id_for_slot", return_value="CAM_01"),
-        patch("workers.inference_worker._get_slot_presets", return_value={1: 2}),
+        patch("workers.inference_worker.get_cam_for_slot", return_value="CAM_01"),
+        patch("workers.inference_worker.get_slot_presets", return_value={1: 2}),
     ):
         yield
 

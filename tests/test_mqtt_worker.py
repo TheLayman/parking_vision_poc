@@ -57,7 +57,7 @@ def _patch_meta():
     with (
         patch("workers.mqtt_worker.load_slot_meta_by_id", return_value=_SLOT_META),
         patch("workers.mqtt_worker.get_slot_id_by_device_name", return_value=1),
-        patch("workers.mqtt_worker._load_camera_assignment", return_value=_CAM_ASSIGNMENT),
+        patch("workers.mqtt_worker.get_slot_to_camera_map", return_value=_CAM_ASSIGNMENT),
     ):
         yield
 

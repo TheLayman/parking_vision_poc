@@ -11,12 +11,18 @@ import logging
 import os
 import threading
 from datetime import datetime, timezone
-from typing import Optional
-
 import psycopg
 from psycopg.rows import dict_row
 
 log = logging.getLogger(__name__)
+
+
+def _json_col(val) -> dict:
+    """Deserialize a JSONB column that may arrive as dict, str, or None."""
+    if isinstance(val, dict):
+        return val
+    return json.loads(val) if val else {}
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://parking:parking@localhost/parking")
 
@@ -162,9 +168,7 @@ def query_occupancy_events(
         rows = c.execute(sql, params).fetchall()
     result = []
     for row in rows:
-        payload = row["payload"] if isinstance(row["payload"], dict) else (
-            json.loads(row["payload"]) if row["payload"] else {}
-        )
+        payload = _json_col(row["payload"])
         result.append({
             "slot_id": row["slot_id"],
             "event_type": row["event_type"],
@@ -207,9 +211,7 @@ def query_challan_events(
         rows = c.execute(sql, params).fetchall()
     result = []
     for row in rows:
-        meta = row["metadata"] if isinstance(row["metadata"], dict) else (
-            json.loads(row["metadata"]) if row["metadata"] else {}
-        )
+        meta = _json_col(row["metadata"])
         result.append({
             "challan_id": row["challan_id"],
             "slot_id": row["slot_id"],
@@ -242,9 +244,7 @@ def query_camera_captures(
         rows = c.execute(sql, params).fetchall()
     result = []
     for row in rows:
-        ocr = row["ocr_result"] if isinstance(row["ocr_result"], dict) else (
-            json.loads(row["ocr_result"]) if row["ocr_result"] else {}
-        )
+        ocr = _json_col(row["ocr_result"])
         result.append({
             "slot_id": row["slot_id"],
             "camera_id": row["camera_id"],

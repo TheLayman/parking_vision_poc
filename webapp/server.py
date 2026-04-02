@@ -5,7 +5,6 @@ import base64
 import logging
 import struct
 import time as _time
-import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,10 +19,10 @@ from fastapi import FastAPI, Query, Request, HTTPException, Response
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from webapp.helpers.data_io import load_yaml, save_yaml
+from webapp.helpers.data_io import load_yaml
 from webapp.helpers.slot_meta import (
-    load_slot_meta_by_id, load_slot_ids, get_slot_id_by_device_name,
-    calculate_zone_stats, build_state_from_log,
+    load_slot_meta_by_id, get_slot_id_by_device_name,
+    build_state_from_log,
 )
 from webapp.helpers.analytics import (
     parse_events_from_log,
@@ -313,16 +312,6 @@ def queue_command(slot_id: int, data_hex: str, fport: int = 2) -> bool:
         return False
 
 
-# ── Uplink decoder ────────────────────────────────────────────────────────────
-
-def decode_uplink(payload_base64: str) -> dict:
-    try:
-        status = base64.b64decode(payload_base64).hex().lower()
-    except Exception:
-        status = "unknown"
-    return {"status": status, "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
 # ── MQTT: forward raw messages to Redis Stream ────────────────────────────────
 
 def on_mqtt_message(client, userdata, msg):
@@ -462,7 +451,7 @@ def state():
 
     meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
     slot_ids = sorted(meta_by_id.keys())
-    result = build_state_from_log(None, slot_ids=slot_ids, meta_by_id=meta_by_id,
+    result = build_state_from_log(slot_ids=slot_ids, meta_by_id=meta_by_id,
                                      redis_client=get_redis())
 
     with _state_cache_lock:
