@@ -726,8 +726,6 @@ function renderZoneSections(zones) {
       .slice()
       .sort((a, b) => a.id - b.id);
 
-    grid.style.setProperty("--cols", String(computeCols(zoneSlots.length)));
-
     // Build a map of existing tiles by slot id
     const existingTiles = {};
     for (const tile of Array.from(grid.children)) {

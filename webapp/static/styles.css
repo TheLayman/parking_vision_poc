@@ -355,7 +355,8 @@ html, body {
   background: #ffffff;
   backdrop-filter: none;
   border-radius: 18px;
-  overflow: visible;
+  overflow: hidden;
+  min-width: 0;
   box-shadow: var(--neu-raised);
   transition: all 0.3s ease;
 }
@@ -425,7 +426,7 @@ html, body {
 
 .zoneSections {
   padding: 16px;
-  overflow: visible;
+  overflow: hidden;
   display: grid;
   gap: 16px;
   align-content: start;
@@ -537,11 +538,11 @@ html, body {
 }
 
 .zoneSlotGrid {
-  --cols: 4;
   display: grid;
-  grid-template-columns: repeat(var(--cols), minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 12px;
   padding: 16px;
+  overflow: hidden;
 }
 
 .slot {
