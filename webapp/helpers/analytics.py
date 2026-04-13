@@ -98,16 +98,29 @@ def calculate_dwell_times(state_changes: list) -> dict:
 
 
 def build_dwell_distribution(all_dwells: list[dict], zone: str | None = None) -> dict:
-    """Count vehicles parked longer than 15, 30, 45, and 60 minutes."""
+    """Count vehicles in dwell-time buckets."""
     filtered = all_dwells if zone is None else [d for d in all_dwells if d["zone"] == zone]
-    gt_15 = gt_30 = gt_45 = gt_60 = 0
+    buckets = {"0_5": 0, "5_15": 0, "15_30": 0, "30_60": 0, "60_120": 0, "120_plus": 0}
+    gt_15 = 0
     for d in filtered:
         m = d["minutes"]
-        if m > 15: gt_15 += 1
-        if m > 30: gt_30 += 1
-        if m > 45: gt_45 += 1
-        if m > 60: gt_60 += 1
-    return {"gt_15m": gt_15, "gt_30m": gt_30, "gt_45m": gt_45, "gt_1h": gt_60}
+        if m <= 5:
+            buckets["0_5"] += 1
+        elif m <= 15:
+            buckets["5_15"] += 1
+        elif m <= 30:
+            buckets["15_30"] += 1
+            gt_15 += 1
+        elif m <= 60:
+            buckets["30_60"] += 1
+            gt_15 += 1
+        elif m <= 120:
+            buckets["60_120"] += 1
+            gt_15 += 1
+        else:
+            buckets["120_plus"] += 1
+            gt_15 += 1
+    return {"buckets": buckets, "gt_15m": gt_15, "total": len(filtered)}
 
 
 def build_hourly_incidents(state_changes: list,
@@ -139,6 +152,84 @@ def build_hourly_incidents(state_changes: list,
             "all": sum(zones.values()),
             "zones": zones,
         })
+    return result
+
+
+def build_turnover_rates(state_changes: list, total_slots_by_zone: dict[str, int] | None = None) -> dict:
+    """Calculate turnover rate per zone.
+
+    Turnover = total OCCUPIED events / total slots in zone.
+    Returns ``{"all": 3.2, "by_zone": {"A": 4.1, "B": 2.8}}``.
+    """
+    occ_by_zone: dict[str, int] = defaultdict(int)
+    for sc in state_changes:
+        if sc.get("new_state") == "OCCUPIED":
+            occ_by_zone[sc["zone"]] += 1
+
+    total_occ = sum(occ_by_zone.values())
+    total_slots = sum((total_slots_by_zone or {}).values()) or 1
+
+    by_zone = {}
+    for zone, count in occ_by_zone.items():
+        zone_slots = (total_slots_by_zone or {}).get(zone, 1) or 1
+        by_zone[zone] = round(count / zone_slots, 1)
+
+    return {
+        "all": round(total_occ / total_slots, 1),
+        "by_zone": by_zone,
+    }
+
+
+def build_peak_occupancy(state_changes: list, total_slots: int) -> dict:
+    """Find peak simultaneous occupancy from state change events.
+
+    Replays state changes chronologically, tracking how many slots are
+    occupied at each moment.
+    Returns ``{"peak_pct": 87.3, "peak_count": 2619, "peak_hour": "2026-04-12T14:00:00"}``.
+    """
+    if not state_changes or total_slots == 0:
+        return {"peak_pct": 0, "peak_count": 0, "peak_hour": None}
+
+    current_occupied = 0
+    peak_count = 0
+    peak_ts = None
+
+    for sc in sorted(state_changes, key=lambda x: x["ts"]):
+        if sc["new_state"] == "OCCUPIED":
+            current_occupied += 1
+        elif sc["new_state"] == "FREE":
+            current_occupied = max(0, current_occupied - 1)
+        if current_occupied > peak_count:
+            peak_count = current_occupied
+            peak_ts = sc["ts"]
+
+    peak_pct = round(peak_count / total_slots * 100, 1) if total_slots else 0
+    peak_hour = None
+    if peak_ts:
+        peak_hour = peak_ts.replace(minute=0, second=0, microsecond=0).isoformat()
+
+    return {"peak_pct": peak_pct, "peak_count": peak_count, "peak_hour": peak_hour}
+
+
+def build_occupancy_heatmap(state_changes: list) -> list[dict]:
+    """Build day-of-week x hour-of-day occupancy heatmap data.
+
+    Returns a list of ``{"day": 0-6 (Mon-Sun), "hour": 0-23, "value": count}``
+    representing how many FREE->OCCUPIED transitions happen at each day/hour.
+    """
+    matrix: dict[tuple[int, int], int] = defaultdict(int)
+
+    for sc in state_changes:
+        if sc.get("new_state") == "OCCUPIED":
+            ts = sc["ts"]
+            day = ts.weekday()  # 0=Mon, 6=Sun
+            hour = ts.hour
+            matrix[(day, hour)] += 1
+
+    result = []
+    for day in range(7):
+        for hour in range(24):
+            result.append({"day": day, "hour": hour, "value": matrix.get((day, hour), 0)})
     return result
 
 

@@ -26,6 +26,7 @@ from webapp.helpers.analytics import (
     parse_events_from_log,
     calculate_dwell_times,
     build_dwell_distribution, build_hourly_incidents,
+    build_turnover_rates, build_peak_occupancy, build_occupancy_heatmap,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -443,19 +444,48 @@ def analytics_summary(range: str = Query(default="24h"),
     try:
         r = get_redis()
         state_raw = r.hgetall("parking:slot:state")
-        total_slots = len(load_slot_meta_by_id(SLOT_META_PATH))
+        meta = load_slot_meta_by_id(SLOT_META_PATH)
+        total_slots = len(meta)
         occupied = sum(1 for v in state_raw.values()
                        if (v.decode() if isinstance(v, bytes) else v) == "OCCUPIED")
         utilization_pct = round(occupied / total_slots * 100, 1) if total_slots else 0
     except Exception:
+        meta = load_slot_meta_by_id(SLOT_META_PATH)
+        total_slots = len(meta)
         utilization_pct = 0
+
+    # Turnover rates
+    slots_by_zone: dict[str, int] = defaultdict(int)
+    for sid, m in meta.items():
+        slots_by_zone[m.get("zone", "A")] += 1
+    turnover = build_turnover_rates(state_changes, dict(slots_by_zone))
+
+    # Peak occupancy
+    peak = build_peak_occupancy(state_changes, total_slots)
+
+    # Heatmap (day-of-week x hour-of-day)
+    heatmap = build_occupancy_heatmap(state_changes)
+
+    # Median dwell
+    sorted_dwells = sorted(d["minutes"] for d in dwells_filtered) if dwells_filtered else []
+    median_parking_minutes = 0
+    if sorted_dwells:
+        mid = len(sorted_dwells) // 2
+        median_parking_minutes = round(
+            sorted_dwells[mid] if len(sorted_dwells) % 2 else
+            (sorted_dwells[mid - 1] + sorted_dwells[mid]) / 2, 1
+        )
 
     return {
         "total_occupancy_events": total_occupancy_events,
         "avg_parking_minutes": avg_parking_minutes,
+        "median_parking_minutes": median_parking_minutes,
         "utilization_pct": utilization_pct,
+        "peak_occupancy": peak,
+        "turnover": turnover,
         "dwell_distribution": dwell_distribution,
         "hourly_occupancy": hourly_occupancy,
+        "heatmap": heatmap,
         "zones": all_zones,
         "zone_stats": zone_stats,
         "time_range": range,

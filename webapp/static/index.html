@@ -9,6 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@2"></script>
   </head>
   <body>
     <header class="topbar">
@@ -32,7 +33,6 @@
 
     <!-- Dashboard Tab -->
     <main class="layout tab-content active" id="dashboard-tab">
-      <!-- KPI Summary Row -->
       <div class="kpi-row" id="kpiRow">
         <div class="kpi-card kpi-card--slots">
           <div class="kpi-icon">
@@ -79,7 +79,6 @@
           </div>
         </div>
       </div>
-      <!-- Main content grid -->
       <section class="gridPane">
         <div class="zoneBar" id="zoneBar"></div>
         <div class="zoneSections" id="zoneSections"></div>
@@ -98,7 +97,7 @@
       <div class="analytics-header">
         <div class="analytics-header-left">
           <h2 class="analytics-title">Parking Analytics</h2>
-          <p class="analytics-subtitle">Occupancy trends, dwell distribution, and zone utilization</p>
+          <p class="analytics-subtitle">Occupancy patterns, turnover, dwell times, and zone utilization</p>
         </div>
         <div class="analytics-controls">
           <select id="zoneFilter" class="time-dropdown" onchange="onAnalyticsFilterChange()">
@@ -115,39 +114,78 @@
       </div>
 
       <!-- Stats Row -->
-      <div class="stats-row" id="statsRow">
+      <div class="stats-row stats-row--5" id="statsRow">
         <div class="stat-card stat-card--events">
-          <div class="stat-icon">&#x1F697;</div>
+          <div class="stat-icon-svg">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7 17m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0"/><path d="M17 17m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0"/><path d="M5 17H3v-6l2-5h9l4 5h1a2 2 0 0 1 2 2v4h-2"/>
+              <path d="M9 17h6"/><path d="M14 7l4 5"/>
+            </svg>
+          </div>
           <div class="stat-info">
             <div class="stat-value" id="statOccupancyEvents">--</div>
             <div class="stat-label">Occupancy Events</div>
           </div>
         </div>
+        <div class="stat-card stat-card--peak">
+          <div class="stat-icon-svg stat-icon-svg--peak">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+            </svg>
+          </div>
+          <div class="stat-info">
+            <div class="stat-value" id="statPeakOcc">--</div>
+            <div class="stat-label">Peak Occupancy</div>
+          </div>
+        </div>
+        <div class="stat-card stat-card--turnover">
+          <div class="stat-icon-svg stat-icon-svg--turnover">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6"/><path d="M2.5 22v-6h6"/><path d="M2 11.5a10 10 0 0 1 18.8-4.3"/><path d="M22 12.5a10 10 0 0 1-18.8 4.2"/>
+            </svg>
+          </div>
+          <div class="stat-info">
+            <div class="stat-value" id="statTurnover">--</div>
+            <div class="stat-label">Turnover Rate</div>
+          </div>
+        </div>
         <div class="stat-card stat-card--duration">
-          <div class="stat-icon">&#x23F1;</div>
+          <div class="stat-icon-svg stat-icon-svg--duration">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </div>
           <div class="stat-info">
             <div class="stat-value" id="statAvgDuration">--</div>
-            <div class="stat-label">Avg Parking Duration</div>
+            <div class="stat-label">Avg / Median Dwell</div>
           </div>
         </div>
         <div class="stat-card stat-card--utilization">
-          <div class="stat-icon">&#x1F4CA;</div>
+          <div class="stat-icon-svg stat-icon-svg--utilization">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+            </svg>
+          </div>
           <div class="stat-info">
             <div class="stat-value" id="statUtilization">--</div>
             <div class="stat-label">Current Utilization</div>
           </div>
         </div>
-        <div class="stat-card stat-card--gt15">
-          <div class="stat-icon">&#x23F3;</div>
-          <div class="stat-info">
-            <div class="stat-value" id="statGt15">--</div>
-            <div class="stat-label">Parked &gt;15 min</div>
-          </div>
-        </div>
       </div>
 
       <div class="analytics-grid">
-        <!-- Row 1: Hourly Occupancy — full width -->
+        <!-- Row 1: Occupancy Heatmap — full width hero -->
+        <div class="chart-card chart-card-wide">
+          <div class="chart-header">
+            <div class="chart-title">Occupancy Heatmap</div>
+            <div class="chart-badge">Day of Week x Hour</div>
+          </div>
+          <div class="chart-container chart-container-lg">
+            <canvas id="occupancyHeatmap"></canvas>
+          </div>
+        </div>
+
+        <!-- Row 2: Hourly Occupancy — full width -->
         <div class="chart-card chart-card-wide">
           <div class="chart-header">
             <div class="chart-title">Hourly Occupancy Events</div>
@@ -158,10 +196,10 @@
           </div>
         </div>
 
-        <!-- Row 2: Dwell Distribution (left) -->
+        <!-- Row 3: Dwell Histogram (left) + Turnover by Zone (right) -->
         <div class="chart-card">
           <div class="chart-header">
-            <div class="chart-title">Dwell Time Distribution</div>
+            <div class="chart-title">Parking Duration Distribution</div>
             <div class="chart-badge" id="dwellChartBadge">All Zones</div>
           </div>
           <div class="chart-container">
@@ -169,21 +207,21 @@
           </div>
         </div>
 
-        <!-- Row 2: Zone Utilization (right) -->
         <div class="chart-card">
           <div class="chart-header">
-            <div class="chart-title">Zone Utilization</div>
+            <div class="chart-title">Turnover Rate by Zone</div>
+            <div class="chart-badge">events / slot</div>
           </div>
           <div class="chart-container">
-            <canvas id="zoneUtilizationChart"></canvas>
+            <canvas id="turnoverChart"></canvas>
           </div>
         </div>
 
-        <!-- Row 3: Per-Zone Comparison — full width -->
+        <!-- Row 4: Zone Comparison — full width -->
         <div class="chart-card chart-card-wide">
           <div class="chart-header">
             <div class="chart-title">Zone Comparison</div>
-            <div class="chart-badge" id="zoneChartBadge">Events &amp; Avg Dwell</div>
+            <div class="chart-badge" id="zoneChartBadge">Events, Dwell &amp; Turnover</div>
           </div>
           <div class="chart-container">
             <canvas id="zoneComparisonChart"></canvas>
@@ -192,7 +230,11 @@
       </div>
 
       <div id="analyticsEmpty" class="analytics-empty" style="display: none;">
-        <div class="empty-icon">&#x1F4CA;</div>
+        <div class="empty-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+          </svg>
+        </div>
         <div class="empty-title">No data for selected range</div>
         <div class="empty-hint">Try selecting a wider time range or wait for more parking events.</div>
       </div>
@@ -216,13 +258,15 @@
           </button>
         </div>
       </div>
-
       <div class="alerts-list" id="stateChangesList">
         <div class="alerts-loading">Loading state changes...</div>
       </div>
-
       <div id="stateChangesEmpty" class="alerts-empty" style="display: none;">
-        <div class="empty-icon">&#x1F504;</div>
+        <div class="empty-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+          </svg>
+        </div>
         <div class="empty-title">No state changes yet</div>
         <div class="empty-hint">Occupancy transitions will appear here as sensors report.</div>
       </div>

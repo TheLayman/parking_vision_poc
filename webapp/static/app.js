@@ -43,9 +43,10 @@ function switchTab(tabId) {
 }
 
 // Chart instances
+let occupancyHeatmapChart = null;
 let hourlyOccupancyChart = null;
 let dwellDistributionChart = null;
-let zoneUtilizationChart = null;
+let turnoverChart = null;
 let zoneComparisonChart = null;
 
 // Zone colors for charts
@@ -105,10 +106,11 @@ async function loadAnalytics() {
     if (!hasData) return;
 
     renderAnalyticsStats(data);
+    renderOccupancyHeatmap(data.heatmap);
     renderHourlyOccupancyChart(data.hourly_occupancy, zone);
     renderDwellDistributionChart(data.dwell_distribution, zone);
-    renderZoneUtilizationChart(data.zone_stats, data.zones);
-    renderZoneComparisonChart(data.zone_stats, data.zones);
+    renderTurnoverChart(data.turnover, data.zones);
+    renderZoneComparisonChart(data.zone_stats, data.zones, data.turnover);
   } catch (err) {
     console.error('Failed to load analytics:', err);
   }
@@ -136,12 +138,22 @@ function populateZoneFilter(zones) {
 }
 
 function renderAnalyticsStats(data) {
-  document.getElementById('statOccupancyEvents').textContent = data.total_occupancy_events || 0;
+  document.getElementById('statOccupancyEvents').textContent = (data.total_occupancy_events || 0).toLocaleString();
+
+  const peak = data.peak_occupancy || {};
+  document.getElementById('statPeakOcc').textContent = peak.peak_pct ? peak.peak_pct + '%' : '--';
+
+  const turnover = data.turnover || {};
+  document.getElementById('statTurnover').textContent = turnover.all != null ? turnover.all + 'x' : '--';
+
   const avgMin = data.avg_parking_minutes;
-  document.getElementById('statAvgDuration').textContent = avgMin > 0 ? `${avgMin} min` : '--';
+  const medMin = data.median_parking_minutes;
+  let durationText = '--';
+  if (avgMin > 0 && medMin > 0) durationText = `${avgMin} / ${medMin} min`;
+  else if (avgMin > 0) durationText = `${avgMin} min`;
+  document.getElementById('statAvgDuration').textContent = durationText;
+
   document.getElementById('statUtilization').textContent = data.utilization_pct != null ? data.utilization_pct + '%' : '--';
-  const dist = data.dwell_distribution || {};
-  document.getElementById('statGt15').textContent = dist.gt_15m || 0;
 }
 
 function renderHourlyOccupancyChart(hourlyData, selectedZone) {
@@ -220,6 +232,80 @@ function renderHourlyOccupancyChart(hourlyData, selectedZone) {
   });
 }
 
+function renderOccupancyHeatmap(heatmapData) {
+  const ctx = document.getElementById('occupancyHeatmap')?.getContext('2d');
+  if (!ctx) return;
+  if (occupancyHeatmapChart) occupancyHeatmapChart.destroy();
+
+  const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const maxVal = Math.max(...(heatmapData || []).map(d => d.value), 1);
+
+  occupancyHeatmapChart = new Chart(ctx, {
+    type: 'matrix',
+    data: {
+      datasets: [{
+        label: 'Occupancy Events',
+        data: (heatmapData || []).map(d => ({ x: d.hour, y: d.day, v: d.value })),
+        backgroundColor(ctx) {
+          const v = ctx.dataset.data[ctx.dataIndex]?.v || 0;
+          const alpha = Math.min(0.1 + (v / maxVal) * 0.85, 0.95);
+          return `rgba(99, 102, 241, ${alpha})`;
+        },
+        borderColor: 'rgba(255, 255, 255, 0.6)',
+        borderWidth: 1,
+        width: ({chart}) => (chart.chartArea || {}).width / 24 - 1,
+        height: ({chart}) => (chart.chartArea || {}).height / 7 - 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => {
+              const d = items[0]?.raw;
+              return d ? `${dayLabels[d.y]} ${String(d.x).padStart(2, '0')}:00` : '';
+            },
+            label: (item) => ` ${item.raw.v} events`,
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          position: 'top',
+          min: -0.5,
+          max: 23.5,
+          offset: false,
+          ticks: {
+            stepSize: 1,
+            callback: v => Number.isInteger(v) && v >= 0 && v <= 23 ? String(v).padStart(2, '0') + ':00' : '',
+            color: '#64748b',
+            font: { family: 'Inter', size: 10 },
+            maxRotation: 0,
+          },
+          grid: { display: false },
+        },
+        y: {
+          type: 'linear',
+          min: -0.5,
+          max: 6.5,
+          offset: false,
+          ticks: {
+            stepSize: 1,
+            callback: v => Number.isInteger(v) && v >= 0 && v <= 6 ? dayLabels[v] : '',
+            color: '#64748b',
+            font: { family: 'Inter', size: 11 },
+          },
+          grid: { display: false },
+        }
+      }
+    }
+  });
+}
+
 function renderDwellDistributionChart(dist, selectedZone) {
   const ctx = document.getElementById('dwellDistributionChart')?.getContext('2d');
   if (!ctx) return;
@@ -228,9 +314,24 @@ function renderDwellDistributionChart(dist, selectedZone) {
   const badge = document.getElementById('dwellChartBadge');
   if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
 
-  const d = dist || {};
-  const data = [d.gt_15m || 0, d.gt_30m || 0, d.gt_45m || 0, d.gt_1h || 0];
-  const labels = ['>15 min', '>30 min', '>45 min', '>1 hour'];
+  const buckets = (dist || {}).buckets || {};
+  const data = [
+    buckets['0_5'] || 0,
+    buckets['5_15'] || 0,
+    buckets['15_30'] || 0,
+    buckets['30_60'] || 0,
+    buckets['60_120'] || 0,
+    buckets['120_plus'] || 0,
+  ];
+  const labels = ['0-5 min', '5-15 min', '15-30 min', '30-60 min', '1-2 hrs', '2+ hrs'];
+  const colors = [
+    'rgba(34, 197, 94, 0.7)',
+    'rgba(59, 130, 246, 0.7)',
+    'rgba(245, 158, 11, 0.7)',
+    'rgba(239, 68, 68, 0.7)',
+    'rgba(139, 92, 246, 0.7)',
+    'rgba(236, 72, 153, 0.7)',
+  ];
 
   dwellDistributionChart = new Chart(ctx, {
     type: 'bar',
@@ -239,73 +340,79 @@ function renderDwellDistributionChart(dist, selectedZone) {
       datasets: [{
         label: 'Vehicles',
         data,
-        backgroundColor: 'rgba(245, 158, 11, 0.7)',
-        borderColor: '#f59e0b',
+        backgroundColor: colors,
+        borderColor: colors.map(c => c.replace('0.7', '1')),
         borderWidth: 1,
         borderRadius: 4,
       }]
     },
     options: {
       ...chartDefaults,
-      indexAxis: 'y',
       plugins: { ...chartDefaults.plugins, legend: { display: false } },
       scales: {
-        x: { ...chartDefaults.scales.x, beginAtZero: true, ticks: { ...chartDefaults.scales.x.ticks, callback: v => Number.isInteger(v) ? v : '' } },
-        y: { ...chartDefaults.scales.y }
+        x: { ...chartDefaults.scales.x },
+        y: {
+          ...chartDefaults.scales.y,
+          beginAtZero: true,
+          ticks: { ...chartDefaults.scales.y.ticks, callback: v => Number.isInteger(v) ? v : '' }
+        }
       }
     }
   });
 }
 
-function renderZoneUtilizationChart(zoneStats, zones) {
-  const ctx = document.getElementById('zoneUtilizationChart')?.getContext('2d');
+function renderTurnoverChart(turnover, zones) {
+  const ctx = document.getElementById('turnoverChart')?.getContext('2d');
   if (!ctx) return;
-  if (zoneUtilizationChart) zoneUtilizationChart.destroy();
+  if (turnoverChart) turnoverChart.destroy();
 
-  const zoneList = zones || Object.keys(zoneStats || {});
-  const avgDwells = zoneList.map(z => zoneStats?.[z]?.avg_parking_minutes || 0);
-  const events = zoneList.map(z => zoneStats?.[z]?.total_occupancy_events || 0);
+  const byZone = (turnover || {}).by_zone || {};
+  const zoneList = zones || Object.keys(byZone);
+  const data = zoneList.map(z => byZone[z] || 0);
 
-  zoneUtilizationChart = new Chart(ctx, {
-    type: 'doughnut',
+  turnoverChart = new Chart(ctx, {
+    type: 'bar',
     data: {
       labels: zoneList.map(z => `Zone ${z}`),
       datasets: [{
-        data: events.some(e => e > 0) ? events : [1],
-        backgroundColor: events.some(e => e > 0)
-          ? zoneList.map(z => getZoneColor(z).border + 'AA')
-          : ['rgba(107, 114, 128, 0.3)'],
-        borderColor: events.some(e => e > 0)
-          ? zoneList.map(z => getZoneColor(z).border)
-          : ['rgba(107, 114, 128, 0.5)'],
-        borderWidth: 2,
+        label: 'Turnover Rate',
+        data,
+        backgroundColor: zoneList.map(z => getZoneColor(z).border + 'AA'),
+        borderColor: zoneList.map(z => getZoneColor(z).border),
+        borderWidth: 1,
+        borderRadius: 6,
       }]
     },
     options: {
       ...chartDefaults,
       plugins: {
-        legend: { position: 'bottom', labels: { color: '#475569', font: { family: 'Inter' }, padding: 12 } },
+        ...chartDefaults.plugins,
+        legend: { display: false },
         tooltip: {
           callbacks: {
-            label: (item) => {
-              const z = zoneList[item.dataIndex];
-              const avg = zoneStats?.[z]?.avg_parking_minutes || 0;
-              return ` ${item.raw} events (avg dwell: ${avg} min)`;
-            }
+            label: (item) => ` ${item.raw}x turnover (events per slot)`,
           }
         }
       },
-      cutout: '60%',
+      scales: {
+        x: { ...chartDefaults.scales.x },
+        y: {
+          ...chartDefaults.scales.y,
+          beginAtZero: true,
+          title: { display: true, text: 'events / slot', color: '#94a3b8', font: { family: 'Inter', size: 11 } },
+        }
+      }
     }
   });
 }
 
-function renderZoneComparisonChart(zoneStats, zones) {
+function renderZoneComparisonChart(zoneStats, zones, turnover) {
   const ctx = document.getElementById('zoneComparisonChart')?.getContext('2d');
   if (!ctx) return;
   if (zoneComparisonChart) zoneComparisonChart.destroy();
 
   const zoneList = zones || Object.keys(zoneStats || {});
+  const byZone = (turnover || {}).by_zone || {};
 
   zoneComparisonChart = new Chart(ctx, {
     type: 'bar',
@@ -325,6 +432,14 @@ function renderZoneComparisonChart(zoneStats, zones) {
           data: zoneList.map(z => zoneStats?.[z]?.avg_parking_minutes || 0),
           backgroundColor: 'rgba(16, 185, 129, 0.7)',
           borderColor: '#10b981',
+          borderWidth: 1,
+          borderRadius: 4,
+        },
+        {
+          label: 'Turnover (x)',
+          data: zoneList.map(z => byZone[z] || 0),
+          backgroundColor: 'rgba(245, 158, 11, 0.7)',
+          borderColor: '#f59e0b',
           borderWidth: 1,
           borderRadius: 4,
         }
