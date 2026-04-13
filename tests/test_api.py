@@ -1,8 +1,8 @@
-"""API tests for webapp/server.py — 4 routes tested with a TestClient.
+"""API tests for webapp/server.py — 3 routes tested with a TestClient.
 
 The startup lifecycle is bypassed; Redis is replaced with FakeRedis;
-heavy helpers (build_state_from_log, parse_events_from_log, query_*) are
-patched to return controlled data.
+heavy helpers (build_state_from_log, parse_events_from_log) are patched
+to return controlled data.
 """
 from __future__ import annotations
 
@@ -83,11 +83,9 @@ class TestStateEndpoint:
 
 class TestAnalyticsEndpoint:
 
-    # parse_events_from_log must return exactly these keys (used directly by the route)
     _PARSED_EVENTS = {
         "snapshots": [],
         "state_changes": [],
-        "challans": [],
     }
 
     def test_18_analytics_summary_returns_expected_shape(self, api_client):
@@ -97,17 +95,14 @@ class TestAnalyticsEndpoint:
             patch("webapp.server.calculate_dwell_times", return_value={"all_dwells": []}),
             patch("webapp.server.build_dwell_distribution", return_value={}),
             patch("webapp.server.build_hourly_incidents", return_value=[]),
-            patch("webapp.server.build_challan_summary", return_value={"confirmed": 0, "cleared": 0}),
         ):
             resp = api_client.get("/analytics/summary?range=24h")
 
         assert resp.status_code == 200
         body = resp.json()
         assert isinstance(body, dict), "response must be a JSON object"
-        # Core keys present in the summary response
-        assert "total_incidents" in body or "incidents" in body or "total_events" in body or True, (
-            "response shape must match API contract"
-        )
+        assert "total_occupancy_events" in body
+        assert "avg_parking_minutes" in body
 
 
 class TestSSEEventsEndpoint:
@@ -158,34 +153,3 @@ class TestSSEEventsEndpoint:
         srv._shutdown_event.clear()  # leave clean for other tests
 
 
-class TestChallansEndpoint:
-
-    _CHALLAN_ROWS = [
-        {
-            "challan_id": "1_sess_MH01AB1234",
-            "slot_id": 1,
-            "license_plate": "MH01AB1234",
-            "confidence": 0.95,
-            "status": "confirmed",
-            "ts": datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-            "metadata": {"zone": "A"},
-        }
-    ]
-
-    def test_20_challans_returns_seeded_records(self, api_client):
-        """GET /challans returns challan_events rows from Postgres.
-
-        The route does a local import of query_challan_events from db.client,
-        so we patch there rather than on the server module.
-        """
-        with patch("db.client.query_challan_events", return_value=self._CHALLAN_ROWS):
-            resp = api_client.get("/challans")
-
-        assert resp.status_code == 200
-        body = resp.json()
-        # Route returns {"challans": [...], "total": N, ...}
-        records = body.get("challans", body if isinstance(body, list) else [])
-        assert any(
-            r.get("plate_text") == "MH01AB1234"
-            for r in records
-        ), f"expected MH01AB1234 (as plate_text) in response, got: {records}"

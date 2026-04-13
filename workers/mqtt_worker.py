@@ -7,7 +7,6 @@ Each instance is a member of the 'mqtt-processors' consumer group.
 Atomically transitions slot state using a Lua CAS script.
 On winning a FREE→OCCUPIED or OCCUPIED→FREE transition:
   - INSERTs occupancy_events into Postgres
-  - XADDs a camera task to parking:camera:tasks:{CAM_ID}
   - PUBLISHes a live event to parking:events:live
 """
 
@@ -28,7 +27,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from db.client import insert_occupancy_event
 from webapp.helpers.slot_meta import load_slot_meta_by_id, get_slot_id_by_device_name
-from workers.base import run_stream_worker, get_slot_to_camera_map
+from workers.base import run_stream_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,6 +106,49 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
 
         log.info("device=%s slot=%s status=%s", device_name, slot_name, status)
 
+        # Track sensor lastseen on every uplink
+        r.hset("parking:sensor:lastseen", str(slot_id), ts_str)
+
+        # Extract RSSI from ChirpStack rxInfo if available
+        rx_info = payload.get("rxInfo", [])
+        if rx_info:
+            best_rssi = max((ri.get("rssi", -999) for ri in rx_info), default=-999)
+            if best_rssi > -999:
+                r.hset("parking:sensor:rssi", str(slot_id), str(best_rssi))
+
+        # Handle device health alerts (not occupancy state changes)
+        if status == "09":
+            log.warning("Battery LOW for slot %s", slot_name)
+            r.hset("parking:sensor:alerts", str(slot_id),
+                    json.dumps({"type": "battery_low", "ts": ts_str}))
+            insert_occupancy_event(
+                slot_id=slot_id, event_type="battery_low", device_eui=device_eui,
+                ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
+            )
+            db_conn.commit()
+            r.publish("parking:events:live", json.dumps({
+                "event": "device_alert", "ts": ts_str,
+                "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
+                "alert_type": "battery_low",
+            }))
+            return True
+
+        if status == "0a":
+            log.warning("Temperature HIGH for slot %s", slot_name)
+            r.hset("parking:sensor:alerts", str(slot_id),
+                    json.dumps({"type": "temperature_high", "ts": ts_str}))
+            insert_occupancy_event(
+                slot_id=slot_id, event_type="temperature_high", device_eui=device_eui,
+                ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
+            )
+            db_conn.commit()
+            r.publish("parking:events:live", json.dumps({
+                "event": "device_alert", "ts": ts_str,
+                "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
+                "alert_type": "temperature_high",
+            }))
+            return True
+
         # Map status to event_type
         if status == "01":
             event_type, expected_state, new_state = "OCCUPIED", "FREE", "OCCUPIED"
@@ -156,23 +198,6 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
             except Exception as redis_err:
                 log.error("Redis revert failed for slot %s: %s", slot_name, redis_err)
             return False
-
-        # Enqueue camera task (only for FREE→OCCUPIED)
-        if event_type == "OCCUPIED":
-            cam_map = get_slot_to_camera_map()
-            cam_id = cam_map.get(slot_id)
-            if cam_id:
-                r.xadd(
-                    f"parking:camera:tasks:{cam_id}",
-                    {
-                        "slot_id": str(slot_id), "slot_name": slot_name,
-                        "zone": zone, "preset": str(slot_meta.get("preset") or ""),
-                        "trigger_ts": ts_str, "event_type": event_type,
-                        "device_eui": device_eui or "",
-                    },
-                    maxlen=500, approximate=True,
-                )
-                log.info("Camera task enqueued for slot %s → %s", slot_name, cam_id)
 
         # Publish live SSE event
         r.publish("parking:events:live", json.dumps({

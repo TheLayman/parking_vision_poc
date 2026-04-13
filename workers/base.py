@@ -1,8 +1,7 @@
 """Shared utilities for Redis Stream workers.
 
 Provides the stream consumer loop, field extraction, signal handling,
-and DB reconnection logic shared across mqtt_worker, camera_worker,
-and inference_worker.
+and DB reconnection logic for the mqtt_worker.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import redis
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-CAMERAS_YAML_PATH = _REPO_ROOT / "config" / "cameras.yaml"
 
 log = logging.getLogger(__name__)
 
@@ -51,59 +49,6 @@ def ensure_db_conn(db_conn):
         except Exception:
             pass
         return get_connection()
-
-
-# ── Cameras YAML cache ───────────────────────────────────────────────────────
-
-_cameras_cache: dict = {}
-_cameras_mtime: float | None = None
-
-
-def _refresh_cameras_cache():
-    global _cameras_cache, _cameras_mtime
-    if not CAMERAS_YAML_PATH.exists():
-        return
-    try:
-        mtime = CAMERAS_YAML_PATH.stat().st_mtime
-        if mtime == _cameras_mtime:
-            return
-        from webapp.helpers.data_io import load_yaml
-        data = load_yaml(CAMERAS_YAML_PATH) or {}
-        _cameras_cache = data.get("cameras", {})
-        _cameras_mtime = mtime
-    except Exception as e:
-        log.error("Failed to refresh cameras.yaml: %s", e)
-
-
-def get_cameras() -> dict:
-    """Return the cameras dict from cameras.yaml (mtime-cached)."""
-    _refresh_cameras_cache()
-    return _cameras_cache
-
-
-def get_cam_for_slot(slot_id: int, fallback: str | None = None) -> str | None:
-    """Look up which camera covers a slot_id."""
-    cams = get_cameras()
-    for cam_id, cfg in cams.items():
-        presets = cfg.get("slot_presets", {})
-        if slot_id in presets or str(slot_id) in presets:
-            return cam_id
-    return fallback
-
-
-def get_slot_presets(cam_id: str) -> dict:
-    """Return the slot_presets dict for a camera."""
-    return get_cameras().get(cam_id, {}).get("slot_presets", {})
-
-
-def get_slot_to_camera_map() -> dict[int, str]:
-    """Build a flat slot_id → cam_id mapping."""
-    cams = get_cameras()
-    mapping: dict[int, str] = {}
-    for cam_id, cfg in cams.items():
-        for slot_id_str in cfg.get("slot_presets", {}):
-            mapping[int(slot_id_str)] = cam_id
-    return mapping
 
 
 # ── Stream consumer loop ─────────────────────────────────────────────────────

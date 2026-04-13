@@ -1,9 +1,7 @@
 """I/O helpers — YAML config reads only.
 
-JSONL functions (append_jsonl, load_jsonl_records, rotate_log_if_needed) have
-been removed. All persistent storage now uses PostgreSQL (events/challans) and
-Redis (slot state). This module keeps only YAML utilities needed by slot_meta
-and camera config loading.
+All persistent storage uses PostgreSQL (occupancy events) and Redis (slot state).
+This module keeps only YAML utilities needed by slot_meta loading.
 """
 
 from __future__ import annotations

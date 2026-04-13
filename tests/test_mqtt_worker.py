@@ -33,8 +33,7 @@ def _make_fields(status_hex: str, device_name: str = "SENSOR_01") -> dict:
     return {b"payload": json.dumps(payload).encode()}
 
 
-_SLOT_META = {1: {"name": "A1", "zone": "A", "preset": 2}}
-_CAM_ASSIGNMENT = {1: "CAM_01"}
+_SLOT_META = {1: {"name": "A1", "zone": "A"}}
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -53,11 +52,10 @@ def db(mock_db):
 
 @pytest.fixture(autouse=True)
 def _patch_meta():
-    """Patch slot-meta lookups and camera assignment for all tests in this module."""
+    """Patch slot-meta lookups for all tests in this module."""
     with (
         patch("workers.mqtt_worker.load_slot_meta_by_id", return_value=_SLOT_META),
         patch("workers.mqtt_worker.get_slot_id_by_device_name", return_value=1),
-        patch("workers.mqtt_worker.get_slot_to_camera_map", return_value=_CAM_ASSIGNMENT),
     ):
         yield
 
@@ -69,7 +67,7 @@ class TestProcessMqttMessage:
     def test_1_happy_path_free_to_occupied(self, r, db):
         """HAPPY PATH: FREE slot receives OCCUPIED uplink.
 
-        Expects: DB INSERT + commit, camera task enqueued in stream.
+        Expects: DB INSERT + commit, SSE published, sensor lastseen updated.
         """
         fields = _make_fields("01")  # 0x01 → OCCUPIED
 
@@ -77,9 +75,9 @@ class TestProcessMqttMessage:
             result = process_mqtt_message(r, db, b"1-0", fields)
 
         assert result is True, "should return True (XACK)"
-        assert r.xlen(b"parking:camera:tasks:CAM_01") == 1, "camera task must be enqueued"
         db.execute.assert_called_once()
         db.commit.assert_called_once()
+        assert r.hget("parking:sensor:lastseen", "1") is not None, "sensor lastseen must be updated"
 
     def test_2_cas_loses_no_camera_task(self, r, db):
         """CAS LOSES: two workers process the same OCCUPIED event simultaneously.
@@ -93,7 +91,6 @@ class TestProcessMqttMessage:
             result = process_mqtt_message(r, db, b"2-0", fields)
 
         assert result is True
-        assert r.xlen(b"parking:camera:tasks:CAM_01") == 0, "no camera task on CAS loss"
         db.execute.assert_not_called()
         db.commit.assert_not_called()
 
@@ -115,7 +112,6 @@ class TestProcessMqttMessage:
             result = process_mqtt_message(r, db_second, b"3-1", fields)
 
         assert result is True
-        assert r.xlen(b"parking:camera:tasks:CAM_01") == 1, "exactly 1 camera task total"
         db_second.execute.assert_not_called()
 
     def test_4_malformed_payload_acked_without_crash(self, r, db):
@@ -126,7 +122,6 @@ class TestProcessMqttMessage:
 
         assert result is True, "malformed message must be ACK'd (not retried forever)"
         db.execute.assert_not_called()
-        assert r.xlen(b"parking:camera:tasks:CAM_01") == 0
 
     def test_5_xautoclaim_reclaims_pending_message(self, r, db):
         """XAUTOCLAIM: message idle >10 s is reclaimed by a second worker.

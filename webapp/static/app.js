@@ -12,131 +12,41 @@ function fmtTs(ts) {
   return String(ts || "");
 }
 
-function filenameFromPath(path) {
-  if (!path) return null;
-  return path.split('/').pop().split('\\').pop();
-}
-
 function parseSlotId(obj) {
   const raw = obj.slot_id;
   return typeof raw === 'number' ? raw : Number(raw);
-}
-
-function computeCols(count) {
-  if (!count || count <= 0) return 1;
-  return Math.max(1, Math.ceil(Math.sqrt(count)));
 }
 
 function humanEvent(e) {
   if (e.event === "calibration") {
     return `${e.slot_name} calibrated`;
   }
+  if (e.event === "device_alert") {
+    const alert = e.alert_type === "battery_low" ? "battery low" : "temperature high";
+    return `${e.slot_name} ${alert}`;
+  }
   const name = e.slot_name || `Slot ${e.slot_id}`;
   const verb = e.new_state === "FREE" ? "vacated" : "occupied";
-  const overlap = typeof e.overlap_ratio === "number" ? e.overlap_ratio : Number(e.overlap_ratio);
-  const overlapText = Number.isFinite(overlap) ? ` (overlap ${overlap.toFixed(2)})` : "";
-  return `${name} ${verb}${overlapText}`;
+  return `${name} ${verb}`;
 }
 
 // Tab switching
 function switchTab(tabId) {
-  // Update tab buttons
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tab === tabId);
   });
-
-  // Update tab content
   document.querySelectorAll('.tab-content').forEach(content => {
     content.classList.toggle('active', content.id === `${tabId}-tab`);
   });
-
-  // Load data when switching tabs
-  if (tabId === 'analytics') {
-    loadAnalytics();
-  } else if (tabId === 'alerts') {
-    loadAlerts();
-  }
+  if (tabId === 'analytics') loadAnalytics();
+  else if (tabId === 'state-changes') loadStateChanges();
 }
-
-// ── Tab visibility settings ─────────────────────────────────────────────────
-const TAB_VIS_KEY = 'parking_tab_visibility';
-
-function _loadTabVisibility() {
-  try {
-    const saved = localStorage.getItem(TAB_VIS_KEY);
-    if (saved) return JSON.parse(saved);
-  } catch {}
-  return { dashboard: true, analytics: true, alerts: true, challans: true };
-}
-
-function _saveTabVisibility(vis) {
-  localStorage.setItem(TAB_VIS_KEY, JSON.stringify(vis));
-}
-
-function toggleTabSettings() {
-  document.getElementById('tabSettingsDropdown').classList.toggle('open');
-}
-
-// Close dropdown when clicking outside
-document.addEventListener('click', function(e) {
-  const wrap = document.querySelector('.tab-settings-wrap');
-  if (wrap && !wrap.contains(e.target)) {
-    document.getElementById('tabSettingsDropdown').classList.remove('open');
-  }
-});
-
-function toggleTabVisibility(tabKey, visible) {
-  const vis = _loadTabVisibility();
-  vis[tabKey] = visible;
-  _saveTabVisibility(vis);
-  _applyTabVisibility(vis);
-}
-
-function _applyTabVisibility(vis) {
-  if (!vis) vis = _loadTabVisibility();
-  // Tab buttons (all tabs now have data-tab, including Challans)
-  document.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
-    const key = btn.dataset.tab;
-    if (key && vis[key] !== undefined) {
-      btn.style.display = vis[key] ? '' : 'none';
-    }
-  });
-  // Sync checkboxes
-  document.querySelectorAll('[data-tab-toggle]').forEach(cb => {
-    const key = cb.getAttribute('data-tab-toggle');
-    if (vis[key] !== undefined) cb.checked = vis[key];
-  });
-  // If the currently active tab is hidden, switch to the first visible one
-  const activeBtn = document.querySelector('.tab-btn.active[data-tab]');
-  if (activeBtn && activeBtn.style.display === 'none') {
-    const firstVisible = document.querySelector('.tab-btn[data-tab]:not([style*="display: none"])');
-    if (firstVisible) switchTab(firstVisible.dataset.tab);
-  }
-}
-
-// Apply on page load
-document.addEventListener('DOMContentLoaded', function() {
-  _applyTabVisibility();
-  // Handle ?tab= query param from cross-page navigation
-  const params = new URLSearchParams(window.location.search);
-  const requestedTab = params.get('tab');
-  if (requestedTab && ['dashboard', 'analytics', 'alerts', 'challans'].includes(requestedTab)) {
-    switchTab(requestedTab);
-  }
-});
 
 // Chart instances
-let hourlyIncidentsChart = null;
+let hourlyOccupancyChart = null;
 let dwellDistributionChart = null;
-let challanDonutChart = null;
+let zoneUtilizationChart = null;
 let zoneComparisonChart = null;
-
-// Analytics data cache (to avoid re-fetching on zone filter change)
-let analyticsDataCache = null;
-
-// Alerts state
-let alertsCache = [];
-let alertsLoadedOnce = false;
 
 // Zone colors for charts
 const zoneColors = {
@@ -153,7 +63,6 @@ function getZoneColor(zone) {
   return zoneColors[zone] || { bg: 'rgba(107, 114, 128, 0.2)', border: '#6b7280' };
 }
 
-// Chart.js default options for dark theme
 const chartDefaults = {
   responsive: true,
   maintainAspectRatio: false,
@@ -174,6 +83,8 @@ const chartDefaults = {
   }
 };
 
+// ── Analytics ────────────────────────────────────────────────────────────────
+
 async function loadAnalytics() {
   const range = document.getElementById('timeRange')?.value || '24h';
   const zone = document.getElementById('zoneFilter')?.value || '';
@@ -183,26 +94,21 @@ async function loadAnalytics() {
     const res = await fetch(url);
     const data = await res.json();
 
-    analyticsDataCache = data;
+    const hasData = data.total_occupancy_events > 0;
 
-    const hasData = data.total_incidents > 0 || data.challans_generated > 0;
-
-    // Show/hide empty state
     document.querySelector('.analytics-grid').style.display = hasData ? 'grid' : 'none';
     document.querySelector('.stats-row').style.display = hasData ? 'grid' : 'none';
     document.getElementById('analyticsEmpty').style.display = hasData ? 'none' : 'flex';
 
-    // Populate zone filter dropdown (preserve selection)
     populateZoneFilter(data.zones || []);
 
     if (!hasData) return;
 
-    renderIncidentStats(data);
-    renderHourlyIncidentsChart(data.hourly_incidents, zone);
+    renderAnalyticsStats(data);
+    renderHourlyOccupancyChart(data.hourly_occupancy, zone);
     renderDwellDistributionChart(data.dwell_distribution, zone);
-    renderChallanDonutChart(data.challan_summary);
+    renderZoneUtilizationChart(data.zone_stats, data.zones);
     renderZoneComparisonChart(data.zone_stats, data.zones);
-
   } catch (err) {
     console.error('Failed to load analytics:', err);
   }
@@ -216,31 +122,33 @@ function populateZoneFilter(zones) {
   const select = document.getElementById('zoneFilter');
   if (!select) return;
   const current = select.value;
-  // Keep "All Zones" as first option
   const options = '<option value="">All Zones</option>' +
     zones.map(z => `<option value="${z}"${z === current ? ' selected' : ''}>Zone ${z}</option>`).join('');
   select.innerHTML = options;
+
+  // Also populate state changes zone filter
+  const scSelect = document.getElementById('stateChangesZoneFilter');
+  if (scSelect) {
+    const scCurrent = scSelect.value;
+    scSelect.innerHTML = '<option value="">All Zones</option>' +
+      zones.map(z => `<option value="${z}"${z === scCurrent ? ' selected' : ''}>Zone ${z}</option>`).join('');
+  }
 }
 
-function renderIncidentStats(data) {
-  document.getElementById('statIncidents').textContent = data.total_incidents || 0;
+function renderAnalyticsStats(data) {
+  document.getElementById('statOccupancyEvents').textContent = data.total_occupancy_events || 0;
   const avgMin = data.avg_parking_minutes;
   document.getElementById('statAvgDuration').textContent = avgMin > 0 ? `${avgMin} min` : '--';
-  document.getElementById('statChallans').textContent = data.challans_generated || 0;
-
+  document.getElementById('statUtilization').textContent = data.utilization_pct != null ? data.utilization_pct + '%' : '--';
   const dist = data.dwell_distribution || {};
   document.getElementById('statGt15').textContent = dist.gt_15m || 0;
 }
 
-function renderHourlyIncidentsChart(hourlyData, selectedZone) {
-  const ctx = document.getElementById('hourlyIncidentsChart')?.getContext('2d');
+function renderHourlyOccupancyChart(hourlyData, selectedZone) {
+  const ctx = document.getElementById('hourlyOccupancyChart')?.getContext('2d');
   if (!ctx) return;
+  if (hourlyOccupancyChart) hourlyOccupancyChart.destroy();
 
-  if (hourlyIncidentsChart) {
-    hourlyIncidentsChart.destroy();
-  }
-
-  // Update badge
   const badge = document.getElementById('hourlyChartBadge');
   if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
 
@@ -250,9 +158,7 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
   });
 
   let datasets;
-
   if (!selectedZone) {
-    // Collect all zones present
     const allZones = new Set();
     (hourlyData || []).forEach(entry => {
       Object.keys(entry.zones || {}).forEach(z => allZones.add(z));
@@ -264,17 +170,14 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
       const peakVal = Math.max(...counts, 0);
       const peakIdx = peakVal > 0 ? counts.indexOf(peakVal) : -1;
       datasets = [{
-        label: 'Incidents',
+        label: 'Occupancy Events',
         data: counts,
-        backgroundColor: counts.map((v, i) => i === peakIdx
-          ? 'rgba(239, 68, 68, 0.95)'
-          : 'rgba(239, 68, 68, 0.45)'),
-        borderColor: '#ef4444',
+        backgroundColor: counts.map((v, i) => i === peakIdx ? 'rgba(59, 130, 246, 0.95)' : 'rgba(59, 130, 246, 0.45)'),
+        borderColor: '#3b82f6',
         borderWidth: 2,
         borderRadius: 6,
       }];
     } else {
-      // Multiple zones — stacked bars
       datasets = zoneList.map(zone => {
         const color = getZoneColor(zone);
         return {
@@ -288,7 +191,6 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
       });
     }
   } else {
-    // Specific zone selected
     const color = getZoneColor(selectedZone);
     const counts = (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0);
     const peakVal = Math.max(...counts, 0);
@@ -296,51 +198,23 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
     datasets = [{
       label: `Zone ${selectedZone}`,
       data: counts,
-      backgroundColor: counts.map((v, i) => i === peakIdx
-        ? color.border + 'F0'
-        : color.border + '55'),
+      backgroundColor: counts.map((v, i) => i === peakIdx ? color.border + 'F0' : color.border + '55'),
       borderColor: color.border,
       borderWidth: 2,
       borderRadius: 6,
     }];
   }
 
-  hourlyIncidentsChart = new Chart(ctx, {
+  hourlyOccupancyChart = new Chart(ctx, {
     type: 'bar',
     data: { labels, datasets },
     options: {
       ...chartDefaults,
-      plugins: {
-        ...chartDefaults.plugins,
-        title: { display: false },
-        tooltip: {
-          callbacks: {
-            title: (items) => items[0]?.label || '',
-            label: (item) => `${item.dataset.label}: ${item.raw} incident${item.raw !== 1 ? 's' : ''}`,
-          }
-        }
-      },
+      plugins: { ...chartDefaults.plugins, title: { display: false } },
       scales: {
         ...chartDefaults.scales,
-        x: {
-          ...chartDefaults.scales.x,
-          stacked: !selectedZone,
-          ticks: {
-            ...chartDefaults.scales.x.ticks,
-            maxRotation: 45,
-            autoSkip: true,
-            maxTicksLimit: 24,
-          }
-        },
-        y: {
-          ...chartDefaults.scales.y,
-          stacked: !selectedZone,
-          beginAtZero: true,
-          ticks: {
-            ...chartDefaults.scales.y.ticks,
-            callback: v => Number.isInteger(v) ? v : '',
-          }
-        }
+        x: { ...chartDefaults.scales.x, stacked: !selectedZone, ticks: { ...chartDefaults.scales.x.ticks, maxRotation: 45, autoSkip: true, maxTicksLimit: 24 } },
+        y: { ...chartDefaults.scales.y, stacked: !selectedZone, beginAtZero: true, ticks: { ...chartDefaults.scales.y.ticks, callback: v => Number.isInteger(v) ? v : '' } }
       }
     }
   });
@@ -349,10 +223,7 @@ function renderHourlyIncidentsChart(hourlyData, selectedZone) {
 function renderDwellDistributionChart(dist, selectedZone) {
   const ctx = document.getElementById('dwellDistributionChart')?.getContext('2d');
   if (!ctx) return;
-
-  if (dwellDistributionChart) {
-    dwellDistributionChart.destroy();
-  }
+  if (dwellDistributionChart) dwellDistributionChart.destroy();
 
   const badge = document.getElementById('dwellChartBadge');
   if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
@@ -377,105 +248,62 @@ function renderDwellDistributionChart(dist, selectedZone) {
     options: {
       ...chartDefaults,
       indexAxis: 'y',
-      plugins: {
-        ...chartDefaults.plugins,
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label: (item) => ` ${item.raw} vehicle${item.raw !== 1 ? 's' : ''}`,
-          }
-        }
-      },
+      plugins: { ...chartDefaults.plugins, legend: { display: false } },
       scales: {
-        x: {
-          ...chartDefaults.scales.x,
-          beginAtZero: true,
-          ticks: {
-            ...chartDefaults.scales.x.ticks,
-            callback: v => Number.isInteger(v) ? v : '',
-          }
-        },
+        x: { ...chartDefaults.scales.x, beginAtZero: true, ticks: { ...chartDefaults.scales.x.ticks, callback: v => Number.isInteger(v) ? v : '' } },
         y: { ...chartDefaults.scales.y }
       }
     }
   });
 }
 
-function renderChallanDonutChart(challanSummary) {
-  const ctx = document.getElementById('challanDonutChart')?.getContext('2d');
+function renderZoneUtilizationChart(zoneStats, zones) {
+  const ctx = document.getElementById('zoneUtilizationChart')?.getContext('2d');
   if (!ctx) return;
+  if (zoneUtilizationChart) zoneUtilizationChart.destroy();
 
-  if (challanDonutChart) {
-    challanDonutChart.destroy();
-  }
+  const zoneList = zones || Object.keys(zoneStats || {});
+  const avgDwells = zoneList.map(z => zoneStats?.[z]?.avg_parking_minutes || 0);
+  const events = zoneList.map(z => zoneStats?.[z]?.total_occupancy_events || 0);
 
-  const confirmed = challanSummary?.confirmed || 0;
-  const cleared = challanSummary?.cleared || 0;
-  const total = confirmed + cleared;
-
-  const noData = total === 0;
-
-  challanDonutChart = new Chart(ctx, {
+  zoneUtilizationChart = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: noData ? ['No data'] : ['Challan Issued', 'Cleared'],
+      labels: zoneList.map(z => `Zone ${z}`),
       datasets: [{
-        data: noData ? [1] : [confirmed, cleared],
-        backgroundColor: noData
-          ? ['rgba(107, 114, 128, 0.3)']
-          : ['rgba(239, 68, 68, 0.7)', 'rgba(16, 185, 129, 0.7)'],
-        borderColor: noData
-          ? ['rgba(107, 114, 128, 0.5)']
-          : ['#ef4444', '#10b981'],
+        data: events.some(e => e > 0) ? events : [1],
+        backgroundColor: events.some(e => e > 0)
+          ? zoneList.map(z => getZoneColor(z).border + 'AA')
+          : ['rgba(107, 114, 128, 0.3)'],
+        borderColor: events.some(e => e > 0)
+          ? zoneList.map(z => getZoneColor(z).border)
+          : ['rgba(107, 114, 128, 0.5)'],
         borderWidth: 2,
       }]
     },
     options: {
       ...chartDefaults,
       plugins: {
-        legend: {
-          position: 'bottom',
-          labels: { color: '#475569', font: { family: 'Inter' }, padding: 16 }
-        },
+        legend: { position: 'bottom', labels: { color: '#475569', font: { family: 'Inter' }, padding: 12 } },
         tooltip: {
           callbacks: {
-            label: (item) => noData
-              ? ' No challan data'
-              : ` ${item.label}: ${item.raw} (${total > 0 ? Math.round(item.raw / total * 100) : 0}%)`,
+            label: (item) => {
+              const z = zoneList[item.dataIndex];
+              const avg = zoneStats?.[z]?.avg_parking_minutes || 0;
+              return ` ${item.raw} events (avg dwell: ${avg} min)`;
+            }
           }
         }
       },
-      cutout: '65%',
-    },
-    plugins: [{
-      id: 'centreLabel',
-      afterDraw(chart) {
-        if (!chart.chartArea) return;
-        const { ctx: c, chartArea: { width, height, left, top } } = chart;
-        c.save();
-        c.textAlign = 'center';
-        c.textBaseline = 'middle';
-        const cx = left + width / 2;
-        const cy = top + height / 2;
-        c.fillStyle = '#1e293b';
-        c.font = 'bold 22px Inter';
-        c.fillText(noData ? '—' : total, cx, cy - 8);
-        c.font = '11px Inter';
-        c.fillStyle = '#94a3b8';
-        c.fillText('total', cx, cy + 12);
-        c.restore();
-      }
-    }]
+      cutout: '60%',
+    }
   });
 }
 
 function renderZoneComparisonChart(zoneStats, zones) {
   const ctx = document.getElementById('zoneComparisonChart')?.getContext('2d');
   if (!ctx) return;
-
-  if (zoneComparisonChart) {
-    zoneComparisonChart.destroy();
-  }
+  if (zoneComparisonChart) zoneComparisonChart.destroy();
 
   const zoneList = zones || Object.keys(zoneStats || {});
 
@@ -485,18 +313,18 @@ function renderZoneComparisonChart(zoneStats, zones) {
       labels: zoneList.map(z => `Zone ${z}`),
       datasets: [
         {
-          label: 'Incidents',
-          data: zoneList.map(z => zoneStats?.[z]?.total_incidents || 0),
+          label: 'Occupancy Events',
+          data: zoneList.map(z => zoneStats?.[z]?.total_occupancy_events || 0),
           backgroundColor: 'rgba(99, 102, 241, 0.7)',
           borderColor: '#6366f1',
           borderWidth: 1,
           borderRadius: 4,
         },
         {
-          label: 'Challans',
-          data: zoneList.map(z => zoneStats?.[z]?.challans_generated || 0),
-          backgroundColor: 'rgba(239, 68, 68, 0.7)',
-          borderColor: '#ef4444',
+          label: 'Avg Dwell (min)',
+          data: zoneList.map(z => zoneStats?.[z]?.avg_parking_minutes || 0),
+          backgroundColor: 'rgba(16, 185, 129, 0.7)',
+          borderColor: '#10b981',
           borderWidth: 1,
           borderRadius: 4,
         }
@@ -504,53 +332,102 @@ function renderZoneComparisonChart(zoneStats, zones) {
     },
     options: {
       ...chartDefaults,
-      plugins: {
-        ...chartDefaults.plugins,
-        tooltip: {
-          callbacks: {
-            afterBody: (items) => {
-              const z = zoneList[items[0]?.dataIndex];
-              const avg = zoneStats?.[z]?.avg_parking_minutes;
-              return avg ? [`Avg dwell: ${avg} min`] : [];
-            }
-          }
-        }
-      },
       scales: {
         ...chartDefaults.scales,
-        x: { ...chartDefaults.scales.x },
-        y: {
-          ...chartDefaults.scales.y,
-          beginAtZero: true,
-          ticks: {
-            ...chartDefaults.scales.y.ticks,
-            callback: v => Number.isInteger(v) ? v : '',
-          }
-        }
+        y: { ...chartDefaults.scales.y, beginAtZero: true, ticks: { ...chartDefaults.scales.y.ticks, callback: v => Number.isInteger(v) ? v : '' } }
       }
     }
   });
 }
 
+// ── State Changes Tab ────────────────────────────────────────────────────────
+
+let stateChangesCache = [];
+
+async function loadStateChanges() {
+  const zone = document.getElementById('stateChangesZoneFilter')?.value || '';
+  try {
+    const url = `/state-changes?limit=100` + (zone ? `&zone=${zone}` : '');
+    const res = await fetch(url);
+    const data = await res.json();
+    stateChangesCache = data.changes || [];
+    renderStateChanges(stateChangesCache);
+  } catch (err) {
+    console.error('Failed to load state changes:', err);
+    document.getElementById('stateChangesEmpty').style.display = 'flex';
+    document.getElementById('stateChangesList').style.display = 'none';
+  }
+}
+
+function renderStateChanges(changes) {
+  const container = document.getElementById('stateChangesList');
+  const emptyState = document.getElementById('stateChangesEmpty');
+
+  if (changes.length === 0) {
+    container.style.display = 'none';
+    emptyState.style.display = 'flex';
+    return;
+  }
+
+  container.style.display = 'flex';
+  emptyState.style.display = 'none';
+
+  const html = changes.map(change => {
+    const ts = new Date(change.ts);
+    const timeStr = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = ts.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const stateClass = change.new_state === 'OCCUPIED' ? 'occupied' : 'free';
+    const stateIcon = change.new_state === 'OCCUPIED' ? '&#x1F697;' : '&#x2705;';
+
+    return `
+      <div class="alert-card ${stateClass}">
+        <div class="alert-icon-compact">${stateIcon}</div>
+        <div class="alert-content">
+          <div class="alert-header">
+            <span class="alert-slot">${escapeHtml(change.slot_name)}</span>
+            <span class="alert-zone">Zone ${escapeHtml(change.zone)}</span>
+            <span class="alert-state-badge ${stateClass}">${escapeHtml(change.new_state)}</span>
+          </div>
+        </div>
+        <div class="alert-time-compact">${dateStr} ${timeStr}</div>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = html;
+}
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+
 let slots = [];
 let stateById = {};
 let sinceById = {};
-let serverZoneStats = null; // use server-provided zone stats when available
-let collapsedZones = new Set(); // populated after init if slot count > threshold
-let calibratingSlots = new Set(); // Track slots currently being calibrated
-let failedSlots = new Map(); // Track slots that failed calibration with error message
-let slotPlates = {}; // slot_id -> [plate1, plate2, ...] from camera_capture SSE events
-let pendingRechecks = {}; // slot_id -> {plates: [...], slot_name, ...}
+let serverZoneStats = null;
+let sensorLastseen = {};
+let sensorAlerts = {};
+let collapsedZones = new Set();
+
+const SENSOR_OFFLINE_THRESHOLD_MS = 6000 * 1000; // ~100 minutes
 
 function getSlotStatus(slotId) {
-  const raw = stateById[slotId] || "FREE";
-  return raw === "OCCUPIED" ? "OCCUPIED" : "FREE";
+  return (stateById[slotId] || "FREE") === "OCCUPIED" ? "OCCUPIED" : "FREE";
+}
+
+function isSensorOffline(slotId) {
+  const ts = sensorLastseen[slotId];
+  if (!ts) return false; // no data yet, don't flag
+  try {
+    const d = new Date(ts);
+    return (Date.now() - d.getTime()) > SENSOR_OFFLINE_THRESHOLD_MS;
+  } catch { return false; }
+}
+
+function getSensorAlert(slotId) {
+  return sensorAlerts[slotId] || null;
 }
 
 function computeZoneStats() {
-  // Prefer server-provided zone stats to avoid duplicate computation
   if (serverZoneStats) return serverZoneStats;
-
   const zones = {};
   for (const s of slots) {
     const zoneKey = s.zone || "A";
@@ -563,17 +440,12 @@ function computeZoneStats() {
 }
 
 function computeTotals(zones) {
-  let total = 0;
-  let free = 0;
+  let total = 0, free = 0;
   for (const k of Object.keys(zones || {})) {
     total += zones[k].total || 0;
     free += zones[k].free || 0;
   }
   return { free, total };
-}
-
-function renderSummary(freeCount, totalCount) {
-  // Summary display removed
 }
 
 function renderZones(zones) {
@@ -588,18 +460,15 @@ function renderZones(zones) {
     chip.className = "zoneChip";
     chip.setAttribute("data-zone", k);
 
-    // Top row: zone name + counts
     const label = document.createElement("div");
     label.className = "zoneChip-label";
     label.innerHTML = `<strong>Zone ${escapeHtml(k)}</strong> <span style="color:var(--muted)">${z.occupied}/${z.total}</span>`;
 
-    // Progress bar
     const barEl = document.createElement("div");
     barEl.className = "zoneChip-bar";
     const fill = document.createElement("div");
     fill.className = "zoneChip-bar-fill";
     fill.style.width = pct + "%";
-    // Color: green < 50%, yellow 50-80%, red > 80%
     if (pct > 80) fill.style.background = "var(--occupied)";
     else if (pct > 50) fill.style.background = "#f59e0b";
     else fill.style.background = "var(--free)";
@@ -608,15 +477,12 @@ function renderZones(zones) {
     chip.appendChild(label);
     chip.appendChild(barEl);
 
-    // Click to scroll to zone section and expand it
     chip.addEventListener("click", () => {
       const section = document.getElementById("zone-section-" + k);
       if (section) {
         collapsedZones.delete(k);
         refreshLayout();
-        setTimeout(() => {
-          section.scrollIntoView({ behavior: "smooth", block: "start" });
-        }, 50);
+        setTimeout(() => section.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
       }
     });
 
@@ -627,11 +493,8 @@ function renderZones(zones) {
 function renderZoneSections(zones) {
   const container = document.getElementById("zoneSections");
   const zoneKeys = Object.keys(zones || {}).sort();
-
-  // Build a set of expected section IDs for cleanup
   const expectedIds = new Set(zoneKeys.map(k => `zone-section-${k}`));
 
-  // Remove sections that no longer exist
   for (const child of Array.from(container.children)) {
     if (!expectedIds.has(child.id)) child.remove();
   }
@@ -642,7 +505,6 @@ function renderZoneSections(zones) {
     const sectionId = `zone-section-${zoneKey}`;
     let section = document.getElementById(sectionId);
 
-    // Create section skeleton if it doesn't exist yet
     if (!section) {
       section = document.createElement("section");
       section.id = sectionId;
@@ -665,7 +527,6 @@ function renderZoneSections(zones) {
 
       const title = document.createElement("div");
       title.className = "zoneTitle";
-
       titleRow.appendChild(toggle);
       titleRow.appendChild(title);
 
@@ -679,21 +540,18 @@ function renderZoneSections(zones) {
       const grid = document.createElement("div");
       grid.className = "zoneSlotGrid";
       section.appendChild(grid);
-
       container.appendChild(section);
     }
 
-    // Update header text
     if (isCollapsed) section.classList.add("collapsed");
     else section.classList.remove("collapsed");
 
     const toggle = section.querySelector(".zoneToggle");
-    toggle.textContent = isCollapsed ? "▸" : "▾";
-    toggle.setAttribute("aria-label", isCollapsed ? `Expand Zone ${zoneKey}` : `Collapse Zone ${zoneKey}`);
-    toggle.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+    toggle.textContent = isCollapsed ? "\u25B8" : "\u25BE";
+    toggle.setAttribute("aria-expanded", !isCollapsed);
 
     section.querySelector(".zoneTitle").textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
-    section.querySelector(".zoneSubtitle").textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
+    section.querySelector(".zoneSubtitle").textContent = `Free ${z.free} \u2022 Occupied ${z.occupied} \u2022 Total ${z.total}`;
 
     // Occupancy bar
     let occBar = section.querySelector(".zone-occupancy-bar");
@@ -713,89 +571,74 @@ function renderZoneSections(zones) {
     else occFill.style.background = "var(--free)";
 
     if (isCollapsed) {
-      // Clear grid when collapsed
       const grid = section.querySelector(".zoneSlotGrid");
       if (grid) grid.innerHTML = "";
       continue;
     }
 
-    // Diff-update slot tiles
+    // Slot tiles
     const grid = section.querySelector(".zoneSlotGrid");
-    const zoneSlots = slots
-      .filter(s => (s.zone || "A") === zoneKey)
-      .slice()
-      .sort((a, b) => a.id - b.id);
-
-    // Build a map of existing tiles by slot id
+    const zoneSlots = slots.filter(s => (s.zone || "A") === zoneKey).sort((a, b) => a.id - b.id);
     const existingTiles = {};
     for (const tile of Array.from(grid.children)) {
       const sid = tile.dataset.slotId;
       if (sid) existingTiles[sid] = tile;
     }
-
     const expectedSlotIds = new Set(zoneSlots.map(s => String(s.id)));
-
-    // Remove tiles for slots no longer in this zone
     for (const [sid, tile] of Object.entries(existingTiles)) {
       if (!expectedSlotIds.has(sid)) tile.remove();
     }
 
     for (const s of zoneSlots) {
       const status = getSlotStatus(s.id);
+      const offline = isSensorOffline(s.id);
+      const alert = getSensorAlert(s.id);
       const tileId = String(s.id);
       let tile = existingTiles[tileId];
 
       if (!tile) {
-        // Create new tile
         tile = _createSlotTile(s);
         grid.appendChild(tile);
       }
 
-      // Update tile state
-      tile.className = `slot ${status === "OCCUPIED" ? "occupied" : "free"}`;
-      tile.querySelector(".slotState").textContent = status;
+      // Update state class
+      let tileClass = `slot ${status === "OCCUPIED" ? "occupied" : "free"}`;
+      if (offline) tileClass += " sensor-offline";
+      if (alert) tileClass += " sensor-alert";
+      tile.className = tileClass;
+      tile.querySelector(".slotState").textContent = offline ? "OFFLINE" : status;
 
+      // Meta: since timestamp + sensor health indicators
       const sinceTs = sinceById[s.id];
-      let sinceText = "";
+      let metaHtml = "";
       if (sinceTs) {
         try {
           const d = new Date(sinceTs);
-          if (!isNaN(d.getTime())) sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          if (!isNaN(d.getTime())) metaHtml = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         } catch { }
       }
-
-      // Build meta HTML: since + plates + pending recheck
-      let metaHtml = sinceText;
-      const plates = slotPlates[s.id];
-      if (plates && plates.length > 0 && status === "OCCUPIED") {
-        metaHtml += '<div class="slot-plates">' +
-          plates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ') +
-          '</div>';
+      if (alert) {
+        const alertIcon = alert.type === "battery_low" ? "&#x1F50B;" : "&#x1F321;";
+        const alertLabel = alert.type === "battery_low" ? "Battery low" : "Temp high";
+        metaHtml += `<div class="slot-health-alert">${alertIcon} ${alertLabel}</div>`;
       }
-      const pending = pendingRechecks[s.id];
-      if (pending) {
-        metaHtml += '<div class="slot-pending-recheck">⏳ Recheck pending</div>';
+      if (offline) {
+        metaHtml += '<div class="slot-health-alert">&#x26A0; Sensor offline</div>';
       }
       tile.querySelector(".slotMeta").innerHTML = metaHtml;
-
-      // Update calibrate button state
-      _updateCalibrateBtnState(tile.querySelector(".slot-calibrate-btn"), s.id);
     }
   }
 }
 
-/** Create a fresh slot tile DOM element. */
 function _createSlotTile(s) {
   const tile = document.createElement("div");
   tile.dataset.slotId = String(s.id);
 
   const top = document.createElement("div");
   top.className = "slotTop";
-
   const name = document.createElement("div");
   name.className = "slotName";
   name.textContent = s.name || `Slot ${s.id}`;
-
   const badge = document.createElement("div");
   badge.className = "slotState";
   top.appendChild(name);
@@ -804,57 +647,9 @@ function _createSlotTile(s) {
   const meta = document.createElement("div");
   meta.className = "slotMeta";
 
-  const calibrateBtn = document.createElement("button");
-  calibrateBtn.className = "slot-calibrate-btn";
-  calibrateBtn.setAttribute("data-slot-id", s.id);
-  calibrateBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    handleSlotCalibrate(s.id, calibrateBtn);
-  });
-
   tile.appendChild(top);
   tile.appendChild(meta);
-  tile.appendChild(calibrateBtn);
   return tile;
-}
-
-/** Update calibrate button visual state without recreating it. */
-function _updateCalibrateBtnState(btn, slotId) {
-  if (!btn) return;
-  if (calibratingSlots.has(slotId)) {
-    btn.disabled = true;
-    btn.classList.add("loading");
-    btn.classList.remove("error");
-    btn.innerHTML = `
-      <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-      </svg>
-      ...
-    `;
-  } else if (failedSlots.has(slotId)) {
-    btn.classList.add("error");
-    btn.classList.remove("loading");
-    btn.title = failedSlots.get(slotId) || "Calibration failed";
-    btn.disabled = false;
-    btn.innerHTML = `
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <line x1="18" y1="6" x2="6" y2="18"/>
-        <line x1="6" y1="6" x2="18" y2="18"/>
-      </svg>
-      Failed
-    `;
-  } else {
-    btn.disabled = false;
-    btn.classList.remove("loading", "error");
-    btn.title = "";
-    btn.innerHTML = `
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-      </svg>
-      Calibrate
-    `;
-  }
 }
 
 function updateKPIs() {
@@ -864,6 +659,8 @@ function updateKPIs() {
   const totalEl = document.getElementById('kpiTotalSlots');
   const occEl = document.getElementById('kpiOccupancy');
   const zonesEl = document.getElementById('kpiZones');
+  const sensorsEl = document.getElementById('kpiSensors');
+  const alertsEl = document.getElementById('kpiAlerts');
 
   if (totalEl) totalEl.textContent = totals.total.toLocaleString();
   if (zonesEl) zonesEl.textContent = Object.keys(zones).length;
@@ -875,21 +672,29 @@ function updateKPIs() {
     if (pct > 80) occEl.classList.add('kpi-value--high');
     else if (pct < 30) occEl.classList.add('kpi-value--low');
   }
-}
 
-async function fetchKPIChallans() {
-  try {
-    const res = await fetch('/analytics/summary?range=24h');
-    const data = await res.json();
-    const el = document.getElementById('kpiChallans');
-    if (el) el.textContent = (data.challans_generated || 0).toLocaleString();
-  } catch {}
+  // Sensors online
+  if (sensorsEl) {
+    const now = Date.now();
+    let online = 0;
+    for (const sid of Object.keys(sensorLastseen)) {
+      try {
+        const d = new Date(sensorLastseen[sid]);
+        if ((now - d.getTime()) < SENSOR_OFFLINE_THRESHOLD_MS) online++;
+      } catch { }
+    }
+    const total = Object.keys(sensorLastseen).length || totals.total;
+    sensorsEl.textContent = total > 0 ? `${online}/${total}` : '--';
+  }
+
+  // Device alerts
+  if (alertsEl) {
+    alertsEl.textContent = Object.keys(sensorAlerts).length;
+  }
 }
 
 function refreshLayout() {
   const zones = computeZoneStats();
-  const totals = computeTotals(zones);
-  renderSummary(totals.free, totals.total);
   renderZones(zones);
   renderZoneSections(zones);
   updateKPIs();
@@ -899,83 +704,18 @@ function prependLog(obj) {
   const list = document.getElementById("logList");
   const item = document.createElement("div");
   item.className = "logItem";
-
   const line = document.createElement("div");
   line.className = "logLine";
   line.textContent = humanEvent(obj);
-
   const ts = document.createElement("div");
   ts.className = "logTs";
   ts.textContent = fmtTs(obj.ts);
-
   item.appendChild(line);
   item.appendChild(ts);
-
   list.insertBefore(item, list.firstChild);
 }
 
-// Alerts functions
-async function loadAlerts() {
-  try {
-    const res = await fetch('/alerts?limit=100');
-    const data = await res.json();
-
-    alertsCache = data.alerts || [];
-    alertsLoadedOnce = true;
-
-    renderAlerts(alertsCache);
-  } catch (err) {
-    console.error('Failed to load alerts:', err);
-    document.getElementById('alertsEmpty').style.display = 'flex';
-    document.getElementById('alertsList').style.display = 'none';
-  }
-}
-
-function renderAlerts(alerts) {
-  const container = document.getElementById('alertsList');
-  const emptyState = document.getElementById('alertsEmpty');
-
-  if (alerts.length === 0) {
-    container.style.display = 'none';
-    emptyState.style.display = 'flex';
-    return;
-  }
-
-  container.style.display = 'flex';
-  emptyState.style.display = 'none';
-
-  const html = alerts.map((alert, index) => {
-    const ts = new Date(alert.ts);
-    const timeStr = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const dateStr = ts.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    const stateClass = alert.new_state === 'OCCUPIED' ? 'occupied' : 'free';
-    const stateIcon = alert.new_state === 'OCCUPIED' ? '🚗' : '✅';
-
-    const licensePlates = alert.license_plates && alert.license_plates.length > 0
-      ? alert.license_plates
-      : (alert.license_plate && alert.license_plate !== 'UNKNOWN' ? [alert.license_plate] : []);
-    const platesHtml = licensePlates.length > 0
-      ? licensePlates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ')
-      : '';
-
-    return `
-      <div class="alert-card ${stateClass}">
-        <div class="alert-icon-compact">${stateIcon}</div>
-        <div class="alert-content">
-          <div class="alert-header">
-            <span class="alert-slot">${escapeHtml(alert.slot_name)}</span>
-            <span class="alert-zone">Zone ${escapeHtml(alert.zone)}</span>
-            <span class="alert-state-badge ${stateClass}">${escapeHtml(alert.new_state)}</span>
-            ${platesHtml ? `<span class="alert-plates-inline">${platesHtml}</span>` : ''}
-          </div>
-        </div>
-        <div class="alert-time-compact">${dateStr} ${timeStr}</div>
-      </div>
-    `;
-  }).join('');
-
-  container.innerHTML = html;
-}
+// ── Init ─────────────────────────────────────────────────────────────────────
 
 async function init() {
   const res = await fetch("/state");
@@ -985,8 +725,9 @@ async function init() {
   stateById = data.state_by_id || {};
   sinceById = data.since_by_id || {};
   serverZoneStats = data.zones || null;
+  sensorLastseen = data.sensor_lastseen || {};
+  sensorAlerts = data.sensor_alerts || {};
 
-  // Collapse all zones by default when slot count is large
   if (slots.length > 200) {
     const zoneKeys = new Set(slots.map(s => s.zone || "A"));
     for (const z of zoneKeys) collapsedZones.add(z);
@@ -994,32 +735,15 @@ async function init() {
 
   refreshLayout();
 
-  // Initialize challans KPI as pending, then fetch async
-  const kpiChallansEl = document.getElementById('kpiChallans');
-  if (kpiChallansEl) kpiChallansEl.textContent = '--';
-  fetchKPIChallans();
-  setInterval(fetchKPIChallans, 30000);
-
-  const recent = (data.recent_events || []).slice();
-  for (const e of recent) {
-    prependLog(e);
-  }
-
-  // Load pending rechecks on startup
-  fetchPendingRechecks();
-  // Poll pending rechecks every 15 seconds
-  setInterval(fetchPendingRechecks, 15000);
-
   const es = new EventSource("/events");
   es.onmessage = (msg) => {
     try {
       const obj = JSON.parse(msg.data);
+
       if (obj.event === "snapshot") {
         const occupied = new Set(obj.occupied_ids || []);
         for (const s of slots) {
           stateById[s.id] = occupied.has(s.id) ? "OCCUPIED" : "FREE";
-          // Clear plates when slot becomes free
-          if (!occupied.has(s.id)) delete slotPlates[s.id];
         }
         serverZoneStats = obj.zone_stats || null;
         refreshLayout();
@@ -1032,102 +756,33 @@ async function init() {
         if (!isNaN(id)) {
           stateById[id] = obj.new_state;
           sinceById[id] = obj.ts;
-          if (obj.new_state === "FREE") delete slotPlates[id];
+          sensorLastseen[id] = obj.ts;
         }
         refreshLayout();
         prependLog(obj);
 
-        if (alertsLoadedOnce) {
-          alertsCache.unshift(obj);
-          alertsCache = alertsCache.slice(0, 100);
-          const alertsTab = document.getElementById('alerts-tab');
-          if (alertsTab && alertsTab.classList.contains('active')) {
-            renderAlerts(alertsCache);
-          }
+        // Live update state changes tab if active
+        const scTab = document.getElementById('state-changes-tab');
+        if (scTab && scTab.classList.contains('active')) {
+          stateChangesCache.unshift(obj);
+          stateChangesCache = stateChangesCache.slice(0, 100);
+          renderStateChanges(stateChangesCache);
         }
       }
 
-      // Track detected plates on slot tiles
-      if (obj.event === "camera_capture") {
+      if (obj.event === "device_alert") {
         const id = parseSlotId(obj);
-        if (!isNaN(id) && obj.license_plates && obj.license_plates.length > 0) {
-          slotPlates[id] = obj.license_plates;
-          refreshLayout();
+        if (!isNaN(id)) {
+          sensorAlerts[id] = { type: obj.alert_type, ts: obj.ts };
+          sensorLastseen[id] = obj.ts;
         }
-      }
-
-      // Refresh pending rechecks when a challan completes
-      if (obj.event === "challan_completed") {
-        fetchPendingRechecks();
+        refreshLayout();
+        prependLog(obj);
       }
     } catch (e) {
       // ignore parse errors
     }
   };
-}
-
-async function fetchPendingRechecks() {
-  try {
-    const res = await fetch('/challans/pending');
-    const data = await res.json();
-    const newPending = {};
-    for (const p of (data.pending || [])) {
-      if (p.slot_id != null) newPending[p.slot_id] = p;
-    }
-    const changed = JSON.stringify(pendingRechecks) !== JSON.stringify(newPending);
-    pendingRechecks = newPending;
-    if (changed) refreshLayout();
-  } catch (e) {
-    // silently ignore
-  }
-}
-
-async function handleSlotCalibrate(slotId, btn) {
-  if (calibratingSlots.has(slotId)) return;
-  failedSlots.delete(slotId);
-  calibratingSlots.add(slotId);
-  _updateCalibrateBtnState(btn, slotId);
-
-  try {
-    const res = await fetch(`/calibrate/${slotId}`, { method: "POST" });
-    if (!res.ok) throw new Error(`Server returned ${res.status}`);
-    const data = await res.json();
-    if (!data.success) throw new Error(data.message || "Calibration failed");
-
-    calibratingSlots.delete(slotId);
-    const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-    if (!currentBtn) return;
-
-    // Show success briefly
-    currentBtn.classList.remove("loading");
-    currentBtn.classList.add("success");
-    currentBtn.disabled = true;
-    currentBtn.innerHTML = `
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polyline points="20 6 9 17 4 12"/>
-      </svg>
-      Done!
-    `;
-    const slot = slots.find(s => s.id === slotId);
-    prependLog({ event: "calibration", ts: new Date().toISOString(), slot_name: slot ? slot.name : `Slot ${slotId}`, new_state: "CALIBRATED" });
-
-    setTimeout(() => {
-      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-      if (b) { b.classList.remove("success"); _updateCalibrateBtnState(b, slotId); }
-    }, 2000);
-  } catch (err) {
-    console.error("Calibration error:", err);
-    calibratingSlots.delete(slotId);
-    failedSlots.set(slotId, err.message || "Calibration failed");
-    const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-    if (currentBtn) _updateCalibrateBtnState(currentBtn, slotId);
-
-    setTimeout(() => {
-      failedSlots.delete(slotId);
-      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-      if (b && b.classList.contains("error")) _updateCalibrateBtnState(b, slotId);
-    }, 5000);
-  }
 }
 
 init();

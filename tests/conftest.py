@@ -64,27 +64,4 @@ def _bootstrap_schema(conn):
             payload JSONB
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS challan_events (
-            id BIGSERIAL PRIMARY KEY,
-            challan_id TEXT UNIQUE NOT NULL,
-            slot_id INTEGER NOT NULL,
-            license_plate TEXT,
-            confidence FLOAT,
-            status TEXT NOT NULL DEFAULT 'no_plate',
-            ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            metadata JSONB
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS camera_captures (
-            id BIGSERIAL PRIMARY KEY,
-            slot_id INTEGER NOT NULL,
-            camera_id TEXT NOT NULL,
-            ts TIMESTAMPTZ NOT NULL,
-            image_path TEXT NOT NULL,
-            ocr_result JSONB,
-            backend TEXT NOT NULL DEFAULT 'openai'
-        )
-    """)
     conn.commit()

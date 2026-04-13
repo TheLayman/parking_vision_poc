@@ -1,4 +1,4 @@
-"""PostgreSQL client for Smart Parking Enforcement.
+"""PostgreSQL client for Smart Parking Dashboard POC.
 
 Workers use get_connection() — one persistent connection per process.
 The API server uses get_pool() — thread-safe connection pool.
@@ -89,55 +89,6 @@ def insert_occupancy_event(
             c.execute(sql, args)
 
 
-def insert_challan_event(
-    challan_id: str,
-    slot_id: int,
-    license_plate: str = None,
-    confidence: float = None,
-    status: str = "no_plate",
-    ts: datetime = None,
-    metadata: dict = None,
-    *,
-    conn: psycopg.Connection = None,
-):
-    ts = ts or datetime.now(timezone.utc)
-    _meta = json.dumps(metadata) if metadata else None
-    sql = (
-        "INSERT INTO challan_events "
-        "(challan_id, slot_id, license_plate, confidence, status, ts, metadata) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (challan_id) DO NOTHING"
-    )
-    args = (challan_id, slot_id, license_plate, confidence, status, ts, _meta)
-    if conn:
-        conn.execute(sql, args)
-    else:
-        with get_pool().connection() as c:
-            c.execute(sql, args)
-
-
-def insert_camera_capture(
-    slot_id: int,
-    camera_id: str,
-    ts: datetime,
-    image_path: str,
-    ocr_result: dict = None,
-    backend: str = "openai",
-    *,
-    conn: psycopg.Connection = None,
-):
-    _ocr = json.dumps(ocr_result) if ocr_result else None
-    sql = (
-        "INSERT INTO camera_captures (slot_id, camera_id, ts, image_path, ocr_result, backend) "
-        "VALUES (%s, %s, %s, %s, %s, %s)"
-    )
-    args = (slot_id, camera_id, ts, image_path, _ocr, backend)
-    if conn:
-        conn.execute(sql, args)
-    else:
-        with get_pool().connection() as c:
-            c.execute(sql, args)
-
 
 # ── Query helpers ─────────────────────────────────────────────────────────────
 
@@ -179,78 +130,3 @@ def query_occupancy_events(
     return result
 
 
-def query_challan_events(
-    cutoff: datetime = None,
-    zone: str = None,
-    challan_only: bool = False,
-    since: str = None,
-    limit: int = 500,
-    offset: int = 0,
-) -> list[dict]:
-    conditions = []
-    params: list = []
-    if cutoff:
-        conditions.append("ts >= %s")
-        params.append(cutoff)
-    if since:
-        conditions.append("ts >= %s")
-        params.append(since)
-    if challan_only:
-        conditions.append("status = %s")
-        params.append("confirmed")
-    if zone:
-        conditions.append("metadata->>'zone' = %s")
-        params.append(zone)
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.extend([limit, offset])
-    sql = (
-        f"SELECT challan_id, slot_id, license_plate, confidence, status, ts, metadata "
-        f"FROM challan_events {where} ORDER BY ts DESC LIMIT %s OFFSET %s"
-    )
-    with get_pool().connection() as c:
-        rows = c.execute(sql, params).fetchall()
-    result = []
-    for row in rows:
-        meta = _json_col(row["metadata"])
-        result.append({
-            "challan_id": row["challan_id"],
-            "slot_id": row["slot_id"],
-            "license_plate": row["license_plate"],
-            "confidence": row["confidence"],
-            "status": row["status"],
-            "ts": row["ts"],
-            "metadata": meta,
-        })
-    return result
-
-
-def query_camera_captures(
-    slot_id: int = None,
-    limit: int = 200,
-    offset: int = 0,
-) -> list[dict]:
-    conditions = []
-    params: list = []
-    if slot_id is not None:
-        conditions.append("slot_id = %s")
-        params.append(slot_id)
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.extend([limit, offset])
-    sql = (
-        f"SELECT slot_id, camera_id, ts, image_path, ocr_result, backend "
-        f"FROM camera_captures {where} ORDER BY ts DESC LIMIT %s OFFSET %s"
-    )
-    with get_pool().connection() as c:
-        rows = c.execute(sql, params).fetchall()
-    result = []
-    for row in rows:
-        ocr = _json_col(row["ocr_result"])
-        result.append({
-            "slot_id": row["slot_id"],
-            "camera_id": row["camera_id"],
-            "ts": row["ts"],
-            "image_path": row["image_path"],
-            "ocr_result": ocr,
-            "backend": row["backend"],
-        })
-    return result

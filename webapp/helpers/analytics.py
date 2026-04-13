@@ -1,4 +1,4 @@
-"""Occupancy analytics: time-series, dwell times, incidents, and challan stats."""
+"""Occupancy analytics: time-series, dwell times, and incidents."""
 
 from __future__ import annotations
 
@@ -10,19 +10,15 @@ from pathlib import Path
 # ── Event parsing (Postgres-backed, replaces JSONL) ──────────────────────────
 
 def parse_events_from_log(event_log_path: Path, cutoff: datetime | None) -> dict:
-    """Return categorised event lists by querying PostgreSQL.
+    """Return occupancy state changes by querying PostgreSQL.
 
-    The *event_log_path* parameter is ignored in production — all events are
-    stored in Postgres (occupancy_events and challan_events tables).
-
-    Returns the same shape as the legacy JSONL parser so all callers above
-    (build_occupancy_series, calculate_dwell_times, etc.) are unchanged:
-        {"snapshots": [], "state_changes": [...], "challans": [...]}
+    The *event_log_path* parameter is ignored — all events are stored in Postgres.
+    Returns ``{"snapshots": [], "state_changes": [...]}``.
     """
     try:
-        from db.client import query_occupancy_events, query_challan_events
+        from db.client import query_occupancy_events
     except ImportError:
-        return {"snapshots": [], "state_changes": [], "challans": []}
+        return {"snapshots": [], "state_changes": []}
 
     state_changes: list[dict] = []
     try:
@@ -49,32 +45,7 @@ def parse_events_from_log(event_log_path: Path, cutoff: datetime | None) -> dict
         import logging
         logging.getLogger(__name__).error("query_occupancy_events failed: %s", e)
 
-    challans: list[dict] = []
-    try:
-        ch_rows = query_challan_events(cutoff=cutoff)
-        for row in ch_rows:
-            meta = row.get("metadata") or {}
-            ts = row["ts"]
-            if isinstance(ts, str):
-                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-
-            challans.append({
-                "ts": ts,
-                "plate_text": row.get("license_plate") or "",
-                "slot_id": row["slot_id"],
-                "slot_name": meta.get("slot_name", str(row["slot_id"])),
-                "zone": meta.get("zone", "A"),
-                "challan": row.get("status") == "confirmed",
-                "lat": meta.get("lat"),
-                "lng": meta.get("lng"),
-            })
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error("query_challan_events failed: %s", e)
-
-    return {"snapshots": [], "state_changes": state_changes, "challans": challans}
+    return {"snapshots": [], "state_changes": state_changes}
 
 
 # ── Analytics functions (unchanged) ─────────────────────────────────────────
@@ -169,28 +140,6 @@ def build_hourly_incidents(state_changes: list,
             "zones": zones,
         })
     return result
-
-
-def build_challan_summary(challans: list, zone: str | None = None) -> dict:
-    """Summarise challan events."""
-    filtered = challans if zone is None else [c for c in challans if c.get("zone") == zone]
-    confirmed = sum(1 for c in filtered if c.get("challan"))
-    cleared = sum(1 for c in filtered if not c.get("challan"))
-
-    by_zone: dict[str, dict[str, int]] = defaultdict(lambda: {"confirmed": 0, "cleared": 0})
-    for c in challans:
-        z = c.get("zone", "A")
-        if c.get("challan"):
-            by_zone[z]["confirmed"] += 1
-        else:
-            by_zone[z]["cleared"] += 1
-
-    return {
-        "total": len(filtered),
-        "confirmed": confirmed,
-        "cleared": cleared,
-        "by_zone": dict(by_zone),
-    }
 
 
 def predict_occupancy(occupancy_series: list) -> dict:
