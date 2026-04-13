@@ -24,6 +24,7 @@ data/camera_snapshots/
 .env
 .env.local
 .env.*.local
+.env.production
 
 # IDE
 .vscode/
@@ -31,7 +32,6 @@ data/camera_snapshots/
 *.swp
 *.swo
 *~
-*.claude/
 
 # OS
 .DS_Store
@@ -40,3 +40,4 @@ desktop.ini
 
 # Logs
 *.log
+.gstack/

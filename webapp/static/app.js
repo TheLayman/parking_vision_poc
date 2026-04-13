@@ -1,9 +1,25 @@
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
 function fmtTs(ts) {
   try {
     const d = new Date(ts);
     if (!isNaN(d.getTime())) return d.toLocaleString();
   } catch { }
   return String(ts || "");
+}
+
+function filenameFromPath(path) {
+  if (!path) return null;
+  return path.split('/').pop().split('\\').pop();
+}
+
+function parseSlotId(obj) {
+  const raw = obj.slot_id;
+  return typeof raw === 'number' ? raw : Number(raw);
 }
 
 function computeCols(count) {
@@ -42,10 +58,81 @@ function switchTab(tabId) {
   }
 }
 
+// ── Tab visibility settings ─────────────────────────────────────────────────
+const TAB_VIS_KEY = 'parking_tab_visibility';
+
+function _loadTabVisibility() {
+  try {
+    const saved = localStorage.getItem(TAB_VIS_KEY);
+    if (saved) return JSON.parse(saved);
+  } catch {}
+  return { dashboard: true, analytics: true, alerts: true, challans: true };
+}
+
+function _saveTabVisibility(vis) {
+  localStorage.setItem(TAB_VIS_KEY, JSON.stringify(vis));
+}
+
+function toggleTabSettings() {
+  document.getElementById('tabSettingsDropdown').classList.toggle('open');
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+  const wrap = document.querySelector('.tab-settings-wrap');
+  if (wrap && !wrap.contains(e.target)) {
+    document.getElementById('tabSettingsDropdown').classList.remove('open');
+  }
+});
+
+function toggleTabVisibility(tabKey, visible) {
+  const vis = _loadTabVisibility();
+  vis[tabKey] = visible;
+  _saveTabVisibility(vis);
+  _applyTabVisibility(vis);
+}
+
+function _applyTabVisibility(vis) {
+  if (!vis) vis = _loadTabVisibility();
+  // Tab buttons (all tabs now have data-tab, including Challans)
+  document.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+    const key = btn.dataset.tab;
+    if (key && vis[key] !== undefined) {
+      btn.style.display = vis[key] ? '' : 'none';
+    }
+  });
+  // Sync checkboxes
+  document.querySelectorAll('[data-tab-toggle]').forEach(cb => {
+    const key = cb.getAttribute('data-tab-toggle');
+    if (vis[key] !== undefined) cb.checked = vis[key];
+  });
+  // If the currently active tab is hidden, switch to the first visible one
+  const activeBtn = document.querySelector('.tab-btn.active[data-tab]');
+  if (activeBtn && activeBtn.style.display === 'none') {
+    const firstVisible = document.querySelector('.tab-btn[data-tab]:not([style*="display: none"])');
+    if (firstVisible) switchTab(firstVisible.dataset.tab);
+  }
+}
+
+// Apply on page load
+document.addEventListener('DOMContentLoaded', function() {
+  _applyTabVisibility();
+  // Handle ?tab= query param from cross-page navigation
+  const params = new URLSearchParams(window.location.search);
+  const requestedTab = params.get('tab');
+  if (requestedTab && ['dashboard', 'analytics', 'alerts', 'challans'].includes(requestedTab)) {
+    switchTab(requestedTab);
+  }
+});
+
 // Chart instances
-let occupancyChart = null;
-let dwellChart = null;
-let predictionChart = null;
+let hourlyIncidentsChart = null;
+let dwellDistributionChart = null;
+let challanDonutChart = null;
+let zoneComparisonChart = null;
+
+// Analytics data cache (to avoid re-fetching on zone filter change)
+let analyticsDataCache = null;
 
 // Alerts state
 let alertsCache = [];
@@ -53,11 +140,13 @@ let alertsLoadedOnce = false;
 
 // Zone colors for charts
 const zoneColors = {
-  'A': { bg: 'rgba(99, 102, 241, 0.2)', border: '#6366f1' },
-  'B': { bg: 'rgba(16, 185, 129, 0.2)', border: '#10b981' },
+  'A': { bg: 'rgba(59, 130, 246, 0.2)', border: '#3b82f6' },
+  'B': { bg: 'rgba(34, 197, 94, 0.2)', border: '#22c55e' },
   'C': { bg: 'rgba(245, 158, 11, 0.2)', border: '#f59e0b' },
   'D': { bg: 'rgba(239, 68, 68, 0.2)', border: '#ef4444' },
-  'E': { bg: 'rgba(168, 85, 247, 0.2)', border: '#a855f7' }
+  'E': { bg: 'rgba(139, 92, 246, 0.2)', border: '#8b5cf6' },
+  'F': { bg: 'rgba(6, 182, 212, 0.2)', border: '#06b6d4' },
+  'G': { bg: 'rgba(244, 114, 182, 0.2)', border: '#f472b6' }
 };
 
 function getZoneColor(zone) {
@@ -70,100 +159,186 @@ const chartDefaults = {
   maintainAspectRatio: false,
   plugins: {
     legend: {
-      labels: { color: '#c5cee0', font: { family: 'Inter' } }
+      labels: { color: '#475569', font: { family: 'Inter' } }
     }
   },
   scales: {
     x: {
-      ticks: { color: '#8b96b0', font: { family: 'Inter' } },
-      grid: { color: 'rgba(42, 51, 80, 0.5)' }
+      ticks: { color: '#64748b', font: { family: 'Inter' } },
+      grid: { color: 'rgba(0, 0, 0, 0.06)' }
     },
     y: {
-      ticks: { color: '#8b96b0', font: { family: 'Inter' } },
-      grid: { color: 'rgba(42, 51, 80, 0.5)' }
+      ticks: { color: '#64748b', font: { family: 'Inter' } },
+      grid: { color: 'rgba(0, 0, 0, 0.06)' }
     }
   }
 };
 
 async function loadAnalytics() {
   const range = document.getElementById('timeRange')?.value || '24h';
+  const zone = document.getElementById('zoneFilter')?.value || '';
 
   try {
-    const res = await fetch(`/analytics/summary?range=${range}`);
+    const url = `/analytics/summary?range=${range}` + (zone ? `&zone=${zone}` : '');
+    const res = await fetch(url);
     const data = await res.json();
 
-    const hasData = data.occupancy_series && data.occupancy_series.length > 0;
+    analyticsDataCache = data;
+
+    const hasData = data.total_incidents > 0 || data.challans_generated > 0;
 
     // Show/hide empty state
     document.querySelector('.analytics-grid').style.display = hasData ? 'grid' : 'none';
     document.querySelector('.stats-row').style.display = hasData ? 'grid' : 'none';
     document.getElementById('analyticsEmpty').style.display = hasData ? 'none' : 'flex';
 
+    // Populate zone filter dropdown (preserve selection)
+    populateZoneFilter(data.zones || []);
+
     if (!hasData) return;
 
-    renderOccupancyChart(data.occupancy_series);
-    renderDwellChart(data.dwell_stats);
-    renderPredictionChart(data.predictions, data.current_occupancy);
-    renderStatsRow(data);
-    renderPredictionsGrid(data.predictions, data.current_occupancy);
+    renderIncidentStats(data);
+    renderHourlyIncidentsChart(data.hourly_incidents, zone);
+    renderDwellDistributionChart(data.dwell_distribution, zone);
+    renderChallanDonutChart(data.challan_summary);
+    renderZoneComparisonChart(data.zone_stats, data.zones);
 
   } catch (err) {
     console.error('Failed to load analytics:', err);
   }
 }
 
-function renderOccupancyChart(series) {
-  const ctx = document.getElementById('occupancyChart')?.getContext('2d');
+function onAnalyticsFilterChange() {
+  loadAnalytics();
+}
+
+function populateZoneFilter(zones) {
+  const select = document.getElementById('zoneFilter');
+  if (!select) return;
+  const current = select.value;
+  // Keep "All Zones" as first option
+  const options = '<option value="">All Zones</option>' +
+    zones.map(z => `<option value="${z}"${z === current ? ' selected' : ''}>Zone ${z}</option>`).join('');
+  select.innerHTML = options;
+}
+
+function renderIncidentStats(data) {
+  document.getElementById('statIncidents').textContent = data.total_incidents || 0;
+  const avgMin = data.avg_parking_minutes;
+  document.getElementById('statAvgDuration').textContent = avgMin > 0 ? `${avgMin} min` : '--';
+  document.getElementById('statChallans').textContent = data.challans_generated || 0;
+
+  const dist = data.dwell_distribution || {};
+  document.getElementById('statGt15').textContent = dist.gt_15m || 0;
+}
+
+function renderHourlyIncidentsChart(hourlyData, selectedZone) {
+  const ctx = document.getElementById('hourlyIncidentsChart')?.getContext('2d');
   if (!ctx) return;
 
-  // Destroy existing chart
-  if (occupancyChart) {
-    occupancyChart.destroy();
+  if (hourlyIncidentsChart) {
+    hourlyIncidentsChart.destroy();
   }
 
-  // Get all zones from data
-  const zones = new Set();
-  series.forEach(entry => {
-    Object.keys(entry.zones).forEach(z => zones.add(z));
+  // Update badge
+  const badge = document.getElementById('hourlyChartBadge');
+  if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
+
+  const labels = (hourlyData || []).map(entry => {
+    const d = new Date(entry.hour);
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   });
 
-  // Build datasets
-  const datasets = Array.from(zones).sort().map(zone => {
-    const color = getZoneColor(zone);
-    return {
-      label: `Zone ${zone}`,
-      data: series.map(entry => entry.zones[zone] || 0),
+  let datasets;
+
+  if (!selectedZone) {
+    // Collect all zones present
+    const allZones = new Set();
+    (hourlyData || []).forEach(entry => {
+      Object.keys(entry.zones || {}).forEach(z => allZones.add(z));
+    });
+    const zoneList = Array.from(allZones).sort();
+
+    if (zoneList.length <= 1) {
+      const counts = (hourlyData || []).map(e => e.all || 0);
+      const peakVal = Math.max(...counts, 0);
+      const peakIdx = peakVal > 0 ? counts.indexOf(peakVal) : -1;
+      datasets = [{
+        label: 'Incidents',
+        data: counts,
+        backgroundColor: counts.map((v, i) => i === peakIdx
+          ? 'rgba(239, 68, 68, 0.95)'
+          : 'rgba(239, 68, 68, 0.45)'),
+        borderColor: '#ef4444',
+        borderWidth: 2,
+        borderRadius: 6,
+      }];
+    } else {
+      // Multiple zones — stacked bars
+      datasets = zoneList.map(zone => {
+        const color = getZoneColor(zone);
+        return {
+          label: `Zone ${zone}`,
+          data: (hourlyData || []).map(e => (e.zones || {})[zone] || 0),
+          backgroundColor: color.border + 'AA',
+          borderColor: color.border,
+          borderWidth: 1,
+          borderRadius: 4,
+        };
+      });
+    }
+  } else {
+    // Specific zone selected
+    const color = getZoneColor(selectedZone);
+    const counts = (hourlyData || []).map(e => (e.zones || {})[selectedZone] || 0);
+    const peakVal = Math.max(...counts, 0);
+    const peakIdx = peakVal > 0 ? counts.indexOf(peakVal) : -1;
+    datasets = [{
+      label: `Zone ${selectedZone}`,
+      data: counts,
+      backgroundColor: counts.map((v, i) => i === peakIdx
+        ? color.border + 'F0'
+        : color.border + '55'),
       borderColor: color.border,
-      backgroundColor: color.bg,
-      fill: true,
-      tension: 0.3
-    };
-  });
+      borderWidth: 2,
+      borderRadius: 6,
+    }];
+  }
 
-  // Format time labels
-  const labels = series.map(entry => {
-    const d = new Date(entry.time);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  });
-
-  occupancyChart = new Chart(ctx, {
-    type: 'line',
+  hourlyIncidentsChart = new Chart(ctx, {
+    type: 'bar',
     data: { labels, datasets },
     options: {
       ...chartDefaults,
       plugins: {
         ...chartDefaults.plugins,
-        title: { display: false }
+        title: { display: false },
+        tooltip: {
+          callbacks: {
+            title: (items) => items[0]?.label || '',
+            label: (item) => `${item.dataset.label}: ${item.raw} incident${item.raw !== 1 ? 's' : ''}`,
+          }
+        }
       },
       scales: {
         ...chartDefaults.scales,
+        x: {
+          ...chartDefaults.scales.x,
+          stacked: !selectedZone,
+          ticks: {
+            ...chartDefaults.scales.x.ticks,
+            maxRotation: 45,
+            autoSkip: true,
+            maxTicksLimit: 24,
+          }
+        },
         y: {
           ...chartDefaults.scales.y,
-          min: 0,
-          max: 100,
+          stacked: !selectedZone,
+          beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
-            callback: v => `${v}%`
+            callback: v => Number.isInteger(v) ? v : '',
           }
         }
       }
@@ -171,97 +346,185 @@ function renderOccupancyChart(series) {
   });
 }
 
-function renderDwellChart(dwellStats) {
-  const ctx = document.getElementById('dwellChart')?.getContext('2d');
+function renderDwellDistributionChart(dist, selectedZone) {
+  const ctx = document.getElementById('dwellDistributionChart')?.getContext('2d');
   if (!ctx) return;
 
-  if (dwellChart) {
-    dwellChart.destroy();
+  if (dwellDistributionChart) {
+    dwellDistributionChart.destroy();
   }
 
-  const zones = Object.keys(dwellStats).sort();
-  const values = zones.map(z => dwellStats[z]);
-  const colors = zones.map(z => getZoneColor(z));
+  const badge = document.getElementById('dwellChartBadge');
+  if (badge) badge.textContent = selectedZone ? `Zone ${selectedZone}` : 'All Zones';
 
-  dwellChart = new Chart(ctx, {
+  const d = dist || {};
+  const data = [d.gt_15m || 0, d.gt_30m || 0, d.gt_45m || 0, d.gt_1h || 0];
+  const labels = ['>15 min', '>30 min', '>45 min', '>1 hour'];
+
+  dwellDistributionChart = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: zones.map(z => `Zone ${z}`),
+      labels,
       datasets: [{
-        label: 'Avg Dwell Time (min)',
-        data: values,
-        backgroundColor: colors.map(c => c.bg),
-        borderColor: colors.map(c => c.border),
-        borderWidth: 2
+        label: 'Vehicles',
+        data,
+        backgroundColor: 'rgba(245, 158, 11, 0.7)',
+        borderColor: '#f59e0b',
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      indexAxis: 'y',
+      plugins: {
+        ...chartDefaults.plugins,
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (item) => ` ${item.raw} vehicle${item.raw !== 1 ? 's' : ''}`,
+          }
+        }
+      },
+      scales: {
+        x: {
+          ...chartDefaults.scales.x,
+          beginAtZero: true,
+          ticks: {
+            ...chartDefaults.scales.x.ticks,
+            callback: v => Number.isInteger(v) ? v : '',
+          }
+        },
+        y: { ...chartDefaults.scales.y }
+      }
+    }
+  });
+}
+
+function renderChallanDonutChart(challanSummary) {
+  const ctx = document.getElementById('challanDonutChart')?.getContext('2d');
+  if (!ctx) return;
+
+  if (challanDonutChart) {
+    challanDonutChart.destroy();
+  }
+
+  const confirmed = challanSummary?.confirmed || 0;
+  const cleared = challanSummary?.cleared || 0;
+  const total = confirmed + cleared;
+
+  const noData = total === 0;
+
+  challanDonutChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: noData ? ['No data'] : ['Challan Issued', 'Cleared'],
+      datasets: [{
+        data: noData ? [1] : [confirmed, cleared],
+        backgroundColor: noData
+          ? ['rgba(107, 114, 128, 0.3)']
+          : ['rgba(239, 68, 68, 0.7)', 'rgba(16, 185, 129, 0.7)'],
+        borderColor: noData
+          ? ['rgba(107, 114, 128, 0.5)']
+          : ['#ef4444', '#10b981'],
+        borderWidth: 2,
       }]
     },
     options: {
       ...chartDefaults,
       plugins: {
-        ...chartDefaults.plugins,
-        legend: { display: false }
-      },
-      scales: {
-        ...chartDefaults.scales,
-        y: {
-          ...chartDefaults.scales.y,
-          beginAtZero: true,
-          ticks: {
-            ...chartDefaults.scales.y.ticks,
-            callback: v => `${v} min`
+        legend: {
+          position: 'bottom',
+          labels: { color: '#475569', font: { family: 'Inter' }, padding: 16 }
+        },
+        tooltip: {
+          callbacks: {
+            label: (item) => noData
+              ? ' No challan data'
+              : ` ${item.label}: ${item.raw} (${total > 0 ? Math.round(item.raw / total * 100) : 0}%)`,
           }
         }
+      },
+      cutout: '65%',
+    },
+    plugins: [{
+      id: 'centreLabel',
+      afterDraw(chart) {
+        if (!chart.chartArea) return;
+        const { ctx: c, chartArea: { width, height, left, top } } = chart;
+        c.save();
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        const cx = left + width / 2;
+        const cy = top + height / 2;
+        c.fillStyle = '#1e293b';
+        c.font = 'bold 22px Inter';
+        c.fillText(noData ? '—' : total, cx, cy - 8);
+        c.font = '11px Inter';
+        c.fillStyle = '#94a3b8';
+        c.fillText('total', cx, cy + 12);
+        c.restore();
       }
-    }
+    }]
   });
 }
 
-function renderPredictionChart(predictions, currentOccupancy) {
-  const ctx = document.getElementById('predictionChart')?.getContext('2d');
+function renderZoneComparisonChart(zoneStats, zones) {
+  const ctx = document.getElementById('zoneComparisonChart')?.getContext('2d');
   if (!ctx) return;
 
-  if (predictionChart) {
-    predictionChart.destroy();
+  if (zoneComparisonChart) {
+    zoneComparisonChart.destroy();
   }
 
-  const zones = Object.keys(predictions).sort();
-  const predictedValues = zones.map(z => predictions[z]);
-  const currentValues = zones.map(z => currentOccupancy[z]?.percent || 0);
-  const colors = zones.map(z => getZoneColor(z));
+  const zoneList = zones || Object.keys(zoneStats || {});
 
-  predictionChart = new Chart(ctx, {
+  zoneComparisonChart = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: zones.map(z => `Zone ${z}`),
+      labels: zoneList.map(z => `Zone ${z}`),
       datasets: [
         {
-          label: 'Current',
-          data: currentValues,
-          backgroundColor: colors.map(c => c.bg),
-          borderColor: colors.map(c => c.border),
-          borderWidth: 2
+          label: 'Incidents',
+          data: zoneList.map(z => zoneStats?.[z]?.total_incidents || 0),
+          backgroundColor: 'rgba(99, 102, 241, 0.7)',
+          borderColor: '#6366f1',
+          borderWidth: 1,
+          borderRadius: 4,
         },
         {
-          label: 'Predicted',
-          data: predictedValues,
-          backgroundColor: colors.map(c => c.border + '80'),
-          borderColor: colors.map(c => c.border),
-          borderWidth: 2,
-          borderDash: [5, 5]
+          label: 'Challans',
+          data: zoneList.map(z => zoneStats?.[z]?.challans_generated || 0),
+          backgroundColor: 'rgba(239, 68, 68, 0.7)',
+          borderColor: '#ef4444',
+          borderWidth: 1,
+          borderRadius: 4,
         }
       ]
     },
     options: {
       ...chartDefaults,
+      plugins: {
+        ...chartDefaults.plugins,
+        tooltip: {
+          callbacks: {
+            afterBody: (items) => {
+              const z = zoneList[items[0]?.dataIndex];
+              const avg = zoneStats?.[z]?.avg_parking_minutes;
+              return avg ? [`Avg dwell: ${avg} min`] : [];
+            }
+          }
+        }
+      },
       scales: {
         ...chartDefaults.scales,
+        x: { ...chartDefaults.scales.x },
         y: {
           ...chartDefaults.scales.y,
-          min: 0,
-          max: 100,
+          beginAtZero: true,
           ticks: {
             ...chartDefaults.scales.y.ticks,
-            callback: v => `${v}%`
+            callback: v => Number.isInteger(v) ? v : '',
           }
         }
       }
@@ -269,82 +532,15 @@ function renderPredictionChart(predictions, currentOccupancy) {
   });
 }
 
-function renderStatsRow(data) {
-  const { summary, current_occupancy, dwell_stats } = data;
-
-  // Calculate overall stats
-  let totalOccupied = 0;
-  let totalSlots = 0;
-  Object.values(current_occupancy || {}).forEach(z => {
-    totalOccupied += z.occupied || 0;
-    totalSlots += z.total || 0;
-  });
-
-  const overallPct = totalSlots > 0 ? ((totalOccupied / totalSlots) * 100).toFixed(1) : 0;
-
-  // Average dwell time across all zones
-  const dwellValues = Object.values(dwell_stats || {});
-  const avgDwell = dwellValues.length > 0
-    ? (dwellValues.reduce((a, b) => a + b, 0) / dwellValues.length).toFixed(1)
-    : '--';
-
-  // Update stat cards
-  document.getElementById('statOccupancy').textContent = `${overallPct}%`;
-  document.getElementById('statDwell').textContent = avgDwell !== '--' ? `${avgDwell} min` : '--';
-  document.getElementById('statEvents').textContent = summary?.total_events || 0;
-  document.getElementById('statPoints').textContent = summary?.data_points || 0;
-}
-
-function renderPredictionsGrid(predictions, currentOccupancy) {
-  const container = document.getElementById('predictionsGrid');
-  if (!container) return;
-
-  const zones = Object.keys(predictions || {}).sort();
-
-  if (zones.length === 0) {
-    container.innerHTML = '<div class="prediction-loading">Not enough data for predictions yet</div>';
-    return;
-  }
-
-  const html = zones.map(zone => {
-    const current = currentOccupancy[zone]?.percent || 0;
-    const predicted = predictions[zone] || 0;
-    const diff = predicted - current;
-    const trendClass = diff > 2 ? 'up' : diff < -2 ? 'down' : 'stable';
-    const trendIcon = diff > 2 ? '↑' : diff < -2 ? '↓' : '→';
-    const trendText = diff > 2 ? 'Rising' : diff < -2 ? 'Falling' : 'Stable';
-    const color = getZoneColor(zone);
-
-    return `
-      <div class="prediction-card" style="border-left: 3px solid ${color.border}">
-        <div class="prediction-header">
-          <span class="prediction-zone">Zone ${zone}</span>
-          <span class="prediction-trend ${trendClass}">${trendIcon} ${trendText}</span>
-        </div>
-        <div class="prediction-values">
-          <div class="prediction-current">
-            <span class="prediction-label">Current</span>
-            <span class="prediction-value">${current.toFixed(0)}%</span>
-          </div>
-          <div class="prediction-arrow">→</div>
-          <div class="prediction-next">
-            <span class="prediction-label">Predicted</span>
-            <span class="prediction-value" style="color: ${color.border}">${predicted.toFixed(0)}%</span>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  container.innerHTML = html;
-}
-
 let slots = [];
 let stateById = {};
 let sinceById = {};
-let collapsedZones = new Set();
+let serverZoneStats = null; // use server-provided zone stats when available
+let collapsedZones = new Set(); // populated after init if slot count > threshold
 let calibratingSlots = new Set(); // Track slots currently being calibrated
 let failedSlots = new Map(); // Track slots that failed calibration with error message
+let slotPlates = {}; // slot_id -> [plate1, plate2, ...] from camera_capture SSE events
+let pendingRechecks = {}; // slot_id -> {plates: [...], slot_name, ...}
 
 function getSlotStatus(slotId) {
   const raw = stateById[slotId] || "FREE";
@@ -352,19 +548,17 @@ function getSlotStatus(slotId) {
 }
 
 function computeZoneStats() {
-  /** @type {Record<string, { total: number, occupied: number, free: number }>} */
-  const zones = {};
+  // Prefer server-provided zone stats to avoid duplicate computation
+  if (serverZoneStats) return serverZoneStats;
 
+  const zones = {};
   for (const s of slots) {
     const zoneKey = s.zone || "A";
     if (!zones[zoneKey]) zones[zoneKey] = { total: 0, occupied: 0, free: 0 };
-
     zones[zoneKey].total += 1;
-    const status = getSlotStatus(s.id);
-    if (status === "OCCUPIED") zones[zoneKey].occupied += 1;
+    if (getSlotStatus(s.id) === "OCCUPIED") zones[zoneKey].occupied += 1;
     else zones[zoneKey].free += 1;
   }
-
   return zones;
 }
 
@@ -379,8 +573,7 @@ function computeTotals(zones) {
 }
 
 function renderSummary(freeCount, totalCount) {
-  const el = document.getElementById("summary");
-  el.textContent = `Free: ${freeCount}/${totalCount}`;
+  // Summary display removed
 }
 
 function renderZones(zones) {
@@ -389,158 +582,308 @@ function renderZones(zones) {
   const keys = Object.keys(zones || {}).sort();
   for (const k of keys) {
     const z = zones[k];
+    const pct = z.total > 0 ? (z.occupied / z.total * 100) : 0;
+
     const chip = document.createElement("div");
     chip.className = "zoneChip";
-    chip.textContent = `Zone ${k}: Occupancy (${z.occupied}/${z.total})`;
+    chip.setAttribute("data-zone", k);
+
+    // Top row: zone name + counts
+    const label = document.createElement("div");
+    label.className = "zoneChip-label";
+    label.innerHTML = `<strong>Zone ${escapeHtml(k)}</strong> <span style="color:var(--muted)">${z.occupied}/${z.total}</span>`;
+
+    // Progress bar
+    const barEl = document.createElement("div");
+    barEl.className = "zoneChip-bar";
+    const fill = document.createElement("div");
+    fill.className = "zoneChip-bar-fill";
+    fill.style.width = pct + "%";
+    // Color: green < 50%, yellow 50-80%, red > 80%
+    if (pct > 80) fill.style.background = "var(--occupied)";
+    else if (pct > 50) fill.style.background = "#f59e0b";
+    else fill.style.background = "var(--free)";
+    barEl.appendChild(fill);
+
+    chip.appendChild(label);
+    chip.appendChild(barEl);
+
+    // Click to scroll to zone section and expand it
+    chip.addEventListener("click", () => {
+      const section = document.getElementById("zone-section-" + k);
+      if (section) {
+        collapsedZones.delete(k);
+        refreshLayout();
+        setTimeout(() => {
+          section.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 50);
+      }
+    });
+
     bar.appendChild(chip);
   }
 }
 
 function renderZoneSections(zones) {
   const container = document.getElementById("zoneSections");
-  container.innerHTML = "";
-
   const zoneKeys = Object.keys(zones || {}).sort();
+
+  // Build a set of expected section IDs for cleanup
+  const expectedIds = new Set(zoneKeys.map(k => `zone-section-${k}`));
+
+  // Remove sections that no longer exist
+  for (const child of Array.from(container.children)) {
+    if (!expectedIds.has(child.id)) child.remove();
+  }
+
   for (const zoneKey of zoneKeys) {
     const z = zones[zoneKey];
     const isCollapsed = collapsedZones.has(zoneKey);
+    const sectionId = `zone-section-${zoneKey}`;
+    let section = document.getElementById(sectionId);
 
-    const section = document.createElement("section");
-    section.className = "zoneSection";
+    // Create section skeleton if it doesn't exist yet
+    if (!section) {
+      section = document.createElement("section");
+      section.id = sectionId;
+      section.className = "zoneSection";
+
+      const header = document.createElement("div");
+      header.className = "zoneHeader";
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "zoneTitleRow";
+
+      const toggle = document.createElement("button");
+      toggle.className = "zoneToggle";
+      toggle.type = "button";
+      toggle.addEventListener("click", () => {
+        if (collapsedZones.has(zoneKey)) collapsedZones.delete(zoneKey);
+        else collapsedZones.add(zoneKey);
+        refreshLayout();
+      });
+
+      const title = document.createElement("div");
+      title.className = "zoneTitle";
+
+      titleRow.appendChild(toggle);
+      titleRow.appendChild(title);
+
+      const subtitle = document.createElement("div");
+      subtitle.className = "zoneSubtitle";
+
+      header.appendChild(titleRow);
+      header.appendChild(subtitle);
+      section.appendChild(header);
+
+      const grid = document.createElement("div");
+      grid.className = "zoneSlotGrid";
+      section.appendChild(grid);
+
+      container.appendChild(section);
+    }
+
+    // Update header text
     if (isCollapsed) section.classList.add("collapsed");
+    else section.classList.remove("collapsed");
 
-    const header = document.createElement("div");
-    header.className = "zoneHeader";
-
-    const titleRow = document.createElement("div");
-    titleRow.className = "zoneTitleRow";
-
-    const toggle = document.createElement("button");
-    toggle.className = "zoneToggle";
-    toggle.type = "button";
+    const toggle = section.querySelector(".zoneToggle");
+    toggle.textContent = isCollapsed ? "▸" : "▾";
     toggle.setAttribute("aria-label", isCollapsed ? `Expand Zone ${zoneKey}` : `Collapse Zone ${zoneKey}`);
     toggle.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
-    toggle.textContent = isCollapsed ? "▸" : "▾";
-    toggle.addEventListener("click", () => {
-      if (collapsedZones.has(zoneKey)) collapsedZones.delete(zoneKey);
-      else collapsedZones.add(zoneKey);
-      refreshLayout();
-    });
 
-    const title = document.createElement("div");
-    title.className = "zoneTitle";
-    title.textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
+    section.querySelector(".zoneTitle").textContent = `Zone ${zoneKey}: Occupancy (${z.occupied}/${z.total})`;
+    section.querySelector(".zoneSubtitle").textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
 
-    titleRow.appendChild(toggle);
-    titleRow.appendChild(title);
-
-    const subtitle = document.createElement("div");
-    subtitle.className = "zoneSubtitle";
-    subtitle.textContent = `Free ${z.free} • Occupied ${z.occupied} • Total ${z.total}`;
-
-    header.appendChild(titleRow);
-    header.appendChild(subtitle);
-    section.appendChild(header);
+    // Occupancy bar
+    let occBar = section.querySelector(".zone-occupancy-bar");
+    if (!occBar) {
+      occBar = document.createElement("div");
+      occBar.className = "zone-occupancy-bar";
+      const occFill = document.createElement("div");
+      occFill.className = "zone-occupancy-bar-fill";
+      occBar.appendChild(occFill);
+      section.querySelector(".zoneHeader").appendChild(occBar);
+    }
+    const occPct = z.total > 0 ? (z.occupied / z.total * 100) : 0;
+    const occFill = occBar.querySelector(".zone-occupancy-bar-fill");
+    occFill.style.width = occPct + "%";
+    if (occPct > 80) occFill.style.background = "var(--occupied)";
+    else if (occPct > 50) occFill.style.background = "#f59e0b";
+    else occFill.style.background = "var(--free)";
 
     if (isCollapsed) {
-      container.appendChild(section);
+      // Clear grid when collapsed
+      const grid = section.querySelector(".zoneSlotGrid");
+      if (grid) grid.innerHTML = "";
       continue;
     }
 
-    const grid = document.createElement("div");
-    grid.className = "zoneSlotGrid";
-
+    // Diff-update slot tiles
+    const grid = section.querySelector(".zoneSlotGrid");
     const zoneSlots = slots
-      .filter((s) => (s.zone || "A") === zoneKey)
+      .filter(s => (s.zone || "A") === zoneKey)
       .slice()
       .sort((a, b) => a.id - b.id);
 
-    grid.style.setProperty("--cols", String(computeCols(zoneSlots.length)));
+    // Build a map of existing tiles by slot id
+    const existingTiles = {};
+    for (const tile of Array.from(grid.children)) {
+      const sid = tile.dataset.slotId;
+      if (sid) existingTiles[sid] = tile;
+    }
+
+    const expectedSlotIds = new Set(zoneSlots.map(s => String(s.id)));
+
+    // Remove tiles for slots no longer in this zone
+    for (const [sid, tile] of Object.entries(existingTiles)) {
+      if (!expectedSlotIds.has(sid)) tile.remove();
+    }
 
     for (const s of zoneSlots) {
       const status = getSlotStatus(s.id);
-      const tile = document.createElement("div");
+      const tileId = String(s.id);
+      let tile = existingTiles[tileId];
+
+      if (!tile) {
+        // Create new tile
+        tile = _createSlotTile(s);
+        grid.appendChild(tile);
+      }
+
+      // Update tile state
       tile.className = `slot ${status === "OCCUPIED" ? "occupied" : "free"}`;
-
-      const top = document.createElement("div");
-      top.className = "slotTop";
-
-      const name = document.createElement("div");
-      name.className = "slotName";
-      name.textContent = s.name || `Slot ${s.id}`;
-
-      const badge = document.createElement("div");
-      badge.className = "slotState";
-      badge.textContent = status;
-
-      top.appendChild(name);
-      top.appendChild(badge);
-
-      const meta = document.createElement("div");
-      meta.className = "slotMeta";
+      tile.querySelector(".slotState").textContent = status;
 
       const sinceTs = sinceById[s.id];
       let sinceText = "";
       if (sinceTs) {
         try {
           const d = new Date(sinceTs);
-          if (!isNaN(d.getTime())) {
-            sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          }
+          if (!isNaN(d.getTime())) sinceText = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         } catch { }
       }
 
-      meta.innerHTML = sinceText;
-
-      // Calibrate button for this slot
-      const calibrateBtn = document.createElement("button");
-      calibrateBtn.className = "slot-calibrate-btn";
-      calibrateBtn.setAttribute("data-slot-id", s.id);
-      
-      // Preserve loading state if calibration is in progress
-      if (calibratingSlots.has(s.id)) {
-        calibrateBtn.disabled = true;
-        calibrateBtn.classList.add("loading");
-        calibrateBtn.innerHTML = `
-          <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-          </svg>
-          ...
-        `;
-      } else if (failedSlots.has(s.id)) {
-        calibrateBtn.classList.add("error");
-        calibrateBtn.title = failedSlots.get(s.id) || "Calibration failed";
-        calibrateBtn.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-          Failed
-        `;
-      } else {
-        calibrateBtn.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-          </svg>
-          Calibrate
-        `;
+      // Build meta HTML: since + plates + pending recheck
+      let metaHtml = sinceText;
+      const plates = slotPlates[s.id];
+      if (plates && plates.length > 0 && status === "OCCUPIED") {
+        metaHtml += '<div class="slot-plates">' +
+          plates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ') +
+          '</div>';
       }
-      calibrateBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        handleSlotCalibrate(s.id, calibrateBtn);
-      });
+      const pending = pendingRechecks[s.id];
+      if (pending) {
+        metaHtml += '<div class="slot-pending-recheck">⏳ Recheck pending</div>';
+      }
+      tile.querySelector(".slotMeta").innerHTML = metaHtml;
 
-      tile.appendChild(top);
-      tile.appendChild(meta);
-      tile.appendChild(calibrateBtn);
-
-      grid.appendChild(tile);
+      // Update calibrate button state
+      _updateCalibrateBtnState(tile.querySelector(".slot-calibrate-btn"), s.id);
     }
-
-    section.appendChild(grid);
-    container.appendChild(section);
   }
+}
+
+/** Create a fresh slot tile DOM element. */
+function _createSlotTile(s) {
+  const tile = document.createElement("div");
+  tile.dataset.slotId = String(s.id);
+
+  const top = document.createElement("div");
+  top.className = "slotTop";
+
+  const name = document.createElement("div");
+  name.className = "slotName";
+  name.textContent = s.name || `Slot ${s.id}`;
+
+  const badge = document.createElement("div");
+  badge.className = "slotState";
+  top.appendChild(name);
+  top.appendChild(badge);
+
+  const meta = document.createElement("div");
+  meta.className = "slotMeta";
+
+  const calibrateBtn = document.createElement("button");
+  calibrateBtn.className = "slot-calibrate-btn";
+  calibrateBtn.setAttribute("data-slot-id", s.id);
+  calibrateBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    handleSlotCalibrate(s.id, calibrateBtn);
+  });
+
+  tile.appendChild(top);
+  tile.appendChild(meta);
+  tile.appendChild(calibrateBtn);
+  return tile;
+}
+
+/** Update calibrate button visual state without recreating it. */
+function _updateCalibrateBtnState(btn, slotId) {
+  if (!btn) return;
+  if (calibratingSlots.has(slotId)) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+    btn.classList.remove("error");
+    btn.innerHTML = `
+      <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+      </svg>
+      ...
+    `;
+  } else if (failedSlots.has(slotId)) {
+    btn.classList.add("error");
+    btn.classList.remove("loading");
+    btn.title = failedSlots.get(slotId) || "Calibration failed";
+    btn.disabled = false;
+    btn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"/>
+        <line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+      Failed
+    `;
+  } else {
+    btn.disabled = false;
+    btn.classList.remove("loading", "error");
+    btn.title = "";
+    btn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+      </svg>
+      Calibrate
+    `;
+  }
+}
+
+function updateKPIs() {
+  const zones = computeZoneStats();
+  const totals = computeTotals(zones);
+
+  const totalEl = document.getElementById('kpiTotalSlots');
+  const occEl = document.getElementById('kpiOccupancy');
+  const zonesEl = document.getElementById('kpiZones');
+
+  if (totalEl) totalEl.textContent = totals.total.toLocaleString();
+  if (zonesEl) zonesEl.textContent = Object.keys(zones).length;
+
+  if (occEl) {
+    const pct = totals.total > 0 ? ((totals.total - totals.free) / totals.total * 100) : 0;
+    occEl.textContent = pct.toFixed(1) + '%';
+    occEl.className = 'kpi-value';
+    if (pct > 80) occEl.classList.add('kpi-value--high');
+    else if (pct < 30) occEl.classList.add('kpi-value--low');
+  }
+}
+
+async function fetchKPIChallans() {
+  try {
+    const res = await fetch('/analytics/summary?range=24h');
+    const data = await res.json();
+    const el = document.getElementById('kpiChallans');
+    if (el) el.textContent = (data.challans_generated || 0).toLocaleString();
+  } catch {}
 }
 
 function refreshLayout() {
@@ -549,6 +892,7 @@ function refreshLayout() {
   renderSummary(totals.free, totals.total);
   renderZones(zones);
   renderZoneSections(zones);
+  updateKPIs();
 }
 
 function prependLog(obj) {
@@ -597,72 +941,35 @@ function renderAlerts(alerts) {
     return;
   }
 
-  container.style.display = 'grid';
+  container.style.display = 'flex';
   emptyState.style.display = 'none';
 
   const html = alerts.map((alert, index) => {
     const ts = new Date(alert.ts);
-    const timeStr = ts.toLocaleString();
+    const timeStr = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = ts.toLocaleDateString([], { month: 'short', day: 'numeric' });
     const stateClass = alert.new_state === 'OCCUPIED' ? 'occupied' : 'free';
     const stateIcon = alert.new_state === 'OCCUPIED' ? '🚗' : '✅';
 
-    // Handle image
-    let imageHtml = '';
-    if (alert.image_path) {
-      const filename = alert.image_path.split('/').pop().split('\\').pop();
-      imageHtml = `
-        <div class="alert-image">
-          <img src="/snapshots/${filename}" alt="Slot ${alert.slot_name}" loading="lazy" />
-        </div>
-      `;
-    } else {
-      imageHtml = `
-        <div class="alert-no-image">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-            <circle cx="8.5" cy="8.5" r="1.5"/>
-            <polyline points="21 15 16 10 5 21"/>
-          </svg>
-          <span>No image</span>
-        </div>
-      `;
-    }
-
-    // Handle license plate
-    const licensePlate = alert.license_plate || 'UNKNOWN';
-    const hasPlate = licensePlate !== 'UNKNOWN';
-    const plateClass = hasPlate ? 'has-plate' : 'no-plate';
+    const licensePlates = alert.license_plates && alert.license_plates.length > 0
+      ? alert.license_plates
+      : (alert.license_plate && alert.license_plate !== 'UNKNOWN' ? [alert.license_plate] : []);
+    const platesHtml = licensePlates.length > 0
+      ? licensePlates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join(' ')
+      : '';
 
     return `
-      <div class="alert-card ${stateClass}" style="--index: ${index}">
-        ${imageHtml}
+      <div class="alert-card ${stateClass}">
+        <div class="alert-icon-compact">${stateIcon}</div>
         <div class="alert-content">
           <div class="alert-header">
-            <span class="alert-icon">${stateIcon}</span>
-            <span class="alert-slot">${alert.slot_name}</span>
-            <span class="alert-zone">Zone ${alert.zone}</span>
-            <span class="alert-state-badge ${stateClass}">${alert.new_state}</span>
-          </div>
-          <div class="alert-details">
-            <div class="alert-transition">
-              <span class="prev-state">${alert.prev_state}</span>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="5" y1="12" x2="19" y2="12"/>
-                <polyline points="12 5 19 12 12 19"/>
-              </svg>
-              <span class="new-state">${alert.new_state}</span>
-            </div>
-            <div class="alert-license-plate ${plateClass}">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <rect x="2" y="7" width="20" height="10" rx="2" ry="2"/>
-                <line x1="6" y1="11" x2="6" y2="13"/>
-                <line x1="18" y1="11" x2="18" y2="13"/>
-              </svg>
-              <span class="plate-text">${licensePlate}</span>
-            </div>
-            <div class="alert-time">${timeStr}</div>
+            <span class="alert-slot">${escapeHtml(alert.slot_name)}</span>
+            <span class="alert-zone">Zone ${escapeHtml(alert.zone)}</span>
+            <span class="alert-state-badge ${stateClass}">${escapeHtml(alert.new_state)}</span>
+            ${platesHtml ? `<span class="alert-plates-inline">${platesHtml}</span>` : ''}
           </div>
         </div>
+        <div class="alert-time-compact">${dateStr} ${timeStr}</div>
       </div>
     `;
   }).join('');
@@ -677,13 +984,31 @@ async function init() {
   slots = (data.slots || []).slice().sort((a, b) => a.id - b.id);
   stateById = data.state_by_id || {};
   sinceById = data.since_by_id || {};
+  serverZoneStats = data.zones || null;
+
+  // Collapse all zones by default when slot count is large
+  if (slots.length > 200) {
+    const zoneKeys = new Set(slots.map(s => s.zone || "A"));
+    for (const z of zoneKeys) collapsedZones.add(z);
+  }
 
   refreshLayout();
+
+  // Initialize challans KPI as pending, then fetch async
+  const kpiChallansEl = document.getElementById('kpiChallans');
+  if (kpiChallansEl) kpiChallansEl.textContent = '--';
+  fetchKPIChallans();
+  setInterval(fetchKPIChallans, 30000);
 
   const recent = (data.recent_events || []).slice();
   for (const e of recent) {
     prependLog(e);
   }
+
+  // Load pending rechecks on startup
+  fetchPendingRechecks();
+  // Poll pending rechecks every 15 seconds
+  setInterval(fetchPendingRechecks, 15000);
 
   const es = new EventSource("/events");
   es.onmessage = (msg) => {
@@ -693,36 +1018,47 @@ async function init() {
         const occupied = new Set(obj.occupied_ids || []);
         for (const s of slots) {
           stateById[s.id] = occupied.has(s.id) ? "OCCUPIED" : "FREE";
+          // Clear plates when slot becomes free
+          if (!occupied.has(s.id)) delete slotPlates[s.id];
         }
+        serverZoneStats = obj.zone_stats || null;
         refreshLayout();
         return;
       }
 
       if (obj.event === "slot_state_changed") {
-        if (typeof obj.slot_id === "number") {
-          stateById[obj.slot_id] = obj.new_state;
-          sinceById[obj.slot_id] = obj.ts;
-        } else {
-          const id = Number(obj.slot_id);
-          if (!isNaN(id)) {
-            stateById[id] = obj.new_state;
-            sinceById[id] = obj.ts;
-          }
+        serverZoneStats = null;
+        const id = parseSlotId(obj);
+        if (!isNaN(id)) {
+          stateById[id] = obj.new_state;
+          sinceById[id] = obj.ts;
+          if (obj.new_state === "FREE") delete slotPlates[id];
         }
         refreshLayout();
         prependLog(obj);
 
-        // Update alerts if loaded
         if (alertsLoadedOnce) {
           alertsCache.unshift(obj);
-          alertsCache = alertsCache.slice(0, 100); // Keep only 100 most recent
-
-          // Re-render if alerts tab is active
+          alertsCache = alertsCache.slice(0, 100);
           const alertsTab = document.getElementById('alerts-tab');
           if (alertsTab && alertsTab.classList.contains('active')) {
             renderAlerts(alertsCache);
           }
         }
+      }
+
+      // Track detected plates on slot tiles
+      if (obj.event === "camera_capture") {
+        const id = parseSlotId(obj);
+        if (!isNaN(id) && obj.license_plates && obj.license_plates.length > 0) {
+          slotPlates[id] = obj.license_plates;
+          refreshLayout();
+        }
+      }
+
+      // Refresh pending rechecks when a challan completes
+      if (obj.event === "challan_completed") {
+        fetchPendingRechecks();
       }
     } catch (e) {
       // ignore parse errors
@@ -730,112 +1066,66 @@ async function init() {
   };
 }
 
+async function fetchPendingRechecks() {
+  try {
+    const res = await fetch('/challans/pending');
+    const data = await res.json();
+    const newPending = {};
+    for (const p of (data.pending || [])) {
+      if (p.slot_id != null) newPending[p.slot_id] = p;
+    }
+    const changed = JSON.stringify(pendingRechecks) !== JSON.stringify(newPending);
+    pendingRechecks = newPending;
+    if (changed) refreshLayout();
+  } catch (e) {
+    // silently ignore
+  }
+}
+
 async function handleSlotCalibrate(slotId, btn) {
-  // Prevent duplicate calibration requests
   if (calibratingSlots.has(slotId)) return;
-  
-  // Clear any previous failed state
   failedSlots.delete(slotId);
-  
   calibratingSlots.add(slotId);
-  const originalContent = btn.innerHTML;
-  
-  // Show loading state
-  btn.disabled = true;
-  btn.classList.add("loading");
-  btn.innerHTML = `
-    <svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-    </svg>
-    ...
-  `;
-  
+  _updateCalibrateBtnState(btn, slotId);
+
   try {
     const res = await fetch(`/calibrate/${slotId}`, { method: "POST" });
-    
-    if (!res.ok) {
-      throw new Error(`Server returned ${res.status}`);
-    }
-    
+    if (!res.ok) throw new Error(`Server returned ${res.status}`);
     const data = await res.json();
-    
+    if (!data.success) throw new Error(data.message || "Calibration failed");
+
     calibratingSlots.delete(slotId);
-    
-    // Re-query the button in case DOM was rebuilt
     const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
     if (!currentBtn) return;
-    
-    if (data.success) {
-      // Show success feedback
-      currentBtn.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="20 6 9 17 4 12"/>
-        </svg>
-        Done!
-      `;
-      currentBtn.classList.remove("loading");
-      currentBtn.classList.add("success");
-      currentBtn.disabled = true;
-      
-      // Log calibration event
-      const slot = slots.find(s => s.id === slotId);
-      const slotName = slot ? slot.name : `Slot ${slotId}`;
-      const logItem = {
-        event: "calibration",
-        ts: new Date().toISOString(),
-        slot_name: slotName,
-        new_state: "CALIBRATED"
-      };
-      prependLog(logItem);
-      
-      // Reset button after 2 seconds
-      setTimeout(() => {
-        const btnToReset = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-        if (btnToReset) {
-          btnToReset.innerHTML = originalContent;
-          btnToReset.disabled = false;
-          btnToReset.classList.remove("success");
-        }
-      }, 2000);
-    } else {
-      throw new Error(data.message || "Calibration failed");
-    }
+
+    // Show success briefly
+    currentBtn.classList.remove("loading");
+    currentBtn.classList.add("success");
+    currentBtn.disabled = true;
+    currentBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+      Done!
+    `;
+    const slot = slots.find(s => s.id === slotId);
+    prependLog({ event: "calibration", ts: new Date().toISOString(), slot_name: slot ? slot.name : `Slot ${slotId}`, new_state: "CALIBRATED" });
+
+    setTimeout(() => {
+      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
+      if (b) { b.classList.remove("success"); _updateCalibrateBtnState(b, slotId); }
+    }, 2000);
   } catch (err) {
     console.error("Calibration error:", err);
     calibratingSlots.delete(slotId);
     failedSlots.set(slotId, err.message || "Calibration failed");
-    
-    // Re-query the button in case DOM was rebuilt
     const currentBtn = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-    if (currentBtn) {
-      currentBtn.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="18" y1="6" x2="6" y2="18"/>
-          <line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-        Failed
-      `;
-      currentBtn.title = err.message || "Calibration failed";
-      currentBtn.classList.remove("loading");
-      currentBtn.classList.add("error");
-      currentBtn.disabled = false; // Allow retry
-    }
-    
-    // Clear error state after 5 seconds
+    if (currentBtn) _updateCalibrateBtnState(currentBtn, slotId);
+
     setTimeout(() => {
       failedSlots.delete(slotId);
-      const btnToReset = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
-      if (btnToReset && btnToReset.classList.contains("error")) {
-        btnToReset.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
-          </svg>
-          Calibrate
-        `;
-        btnToReset.title = "";
-        btnToReset.classList.remove("error");
-      }
+      const b = document.querySelector(`.slot-calibrate-btn[data-slot-id="${slotId}"]`);
+      if (b && b.classList.contains("error")) _updateCalibrateBtnState(b, slotId);
     }, 5000);
   }
 }

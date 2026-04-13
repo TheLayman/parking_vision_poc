@@ -1,0 +1,27 @@
+[Unit]
+Description=Smart Parking API (gunicorn + uvicorn)
+After=network.target redis-server.service postgresql.service
+Requires=redis-server.service postgresql.service
+
+[Service]
+Type=simple
+User=parking
+Group=parking
+WorkingDirectory=/opt/parking
+EnvironmentFile=/opt/parking/.env.production
+ExecStart=/opt/parking/venv/bin/gunicorn \
+    -w 6 \
+    -k uvicorn.workers.UvicornWorker \
+    --bind 127.0.0.1:8000 \
+    --timeout 60 \
+    --access-logfile - \
+    --error-logfile - \
+    webapp.server:app
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=parking-api
+
+[Install]
+WantedBy=multi-user.target

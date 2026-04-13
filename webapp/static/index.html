@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Parking Vision Dashboard</title>
+    <title>Unauthorized Parking Detection</title>
     <link rel="stylesheet" href="/static/styles.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,24 +20,99 @@
             <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
             <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
           </svg>
-          Smart Parking Dashboard
+          Unauthorized Parking Detection
         </div>
         <div class="tab-bar">
           <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
           <button class="tab-btn" data-tab="analytics" onclick="switchTab('analytics')">Analytics</button>
           <button class="tab-btn" data-tab="alerts" onclick="switchTab('alerts')">Alerts</button>
+          <a class="tab-btn" href="/challan-dashboard" data-tab="challans" style="text-decoration:none;">Challans</a>
         </div>
       </div>
-      <div class="summary" id="summary"></div>
+      <div class="topbar-right">
+        <div class="tab-settings-wrap">
+          <button class="tab-settings-btn" onclick="toggleTabSettings()" title="Show/Hide Tabs">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+          <div class="tab-settings-dropdown" id="tabSettingsDropdown">
+            <div class="tab-settings-title">Visible Tabs</div>
+            <label class="tab-toggle">
+              <span>Dashboard</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('dashboard', this.checked)" data-tab-toggle="dashboard">
+            </label>
+            <label class="tab-toggle">
+              <span>Analytics</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('analytics', this.checked)" data-tab-toggle="analytics">
+            </label>
+            <label class="tab-toggle">
+              <span>Alerts</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('alerts', this.checked)" data-tab-toggle="alerts">
+            </label>
+            <label class="tab-toggle">
+              <span>Challans</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('challans', this.checked)" data-tab-toggle="challans">
+            </label>
+          </div>
+        </div>
+      </div>
     </header>
 
     <!-- Dashboard Tab -->
     <main class="layout tab-content active" id="dashboard-tab">
+      <!-- KPI Summary Row -->
+      <div class="kpi-row" id="kpiRow">
+        <div class="kpi-card kpi-card--slots">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1" y="3" width="15" height="13" rx="2"/><path d="M16 8h2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-2"/><path d="M6 21v-2"/><path d="M12 21v-2"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiTotalSlots">--</div>
+            <div class="kpi-label">Total Slots</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--occupancy">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiOccupancy">--%</div>
+            <div class="kpi-label">Occupancy Rate</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--challans">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiChallans">--</div>
+            <div class="kpi-label">Active Challans</div>
+          </div>
+        </div>
+        <div class="kpi-card kpi-card--zones">
+          <div class="kpi-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+          </div>
+          <div class="kpi-info">
+            <div class="kpi-value" id="kpiZones">--</div>
+            <div class="kpi-label">Zones Online</div>
+          </div>
+        </div>
+      </div>
+      <!-- Main content grid -->
       <section class="gridPane">
         <div class="zoneBar" id="zoneBar"></div>
         <div class="zoneSections" id="zoneSections"></div>
       </section>
-
       <aside class="sidePane">
         <div class="sideHeader">
           <div class="sideTitle">Change Log</div>
@@ -51,11 +126,14 @@
     <main class="analytics-tab tab-content" id="analytics-tab">
       <div class="analytics-header">
         <div class="analytics-header-left">
-          <h2 class="analytics-title">📊 Advanced Analytics & Insights</h2>
-          <p class="analytics-subtitle">Real-time zone performance and predictive analytics</p>
+          <h2 class="analytics-title">📊 Unauthorized Parking Analytics</h2>
+          <p class="analytics-subtitle">Incident tracking, dwell distribution, and challan insights</p>
         </div>
         <div class="analytics-controls">
-          <select id="timeRange" class="time-dropdown" onchange="loadAnalytics()">
+          <select id="zoneFilter" class="time-dropdown" onchange="onAnalyticsFilterChange()">
+            <option value="">All Zones</option>
+          </select>
+          <select id="timeRange" class="time-dropdown" onchange="onAnalyticsFilterChange()">
             <option value="1h">Last 1 Hour</option>
             <option value="6h">Last 6 Hours</option>
             <option value="24h" selected>Last 24 Hours</option>
@@ -67,77 +145,77 @@
 
       <!-- Stats Row -->
       <div class="stats-row" id="statsRow">
-        <div class="stat-card">
-          <div class="stat-icon">🚗</div>
+        <div class="stat-card stat-card--incidents">
+          <div class="stat-icon">🚨</div>
           <div class="stat-info">
-            <div class="stat-value" id="statOccupancy">--</div>
-            <div class="stat-label">Current Occupancy</div>
+            <div class="stat-value" id="statIncidents">--</div>
+            <div class="stat-label">Total Incidents</div>
           </div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card stat-card--duration">
           <div class="stat-icon">⏱️</div>
           <div class="stat-info">
-            <div class="stat-value" id="statDwell">--</div>
-            <div class="stat-label">Avg Dwell Time</div>
+            <div class="stat-value" id="statAvgDuration">--</div>
+            <div class="stat-label">Avg Parking Duration</div>
           </div>
         </div>
-        <div class="stat-card">
-          <div class="stat-icon">📈</div>
+        <div class="stat-card stat-card--challans">
+          <div class="stat-icon">📋</div>
           <div class="stat-info">
-            <div class="stat-value" id="statEvents">--</div>
-            <div class="stat-label">State Changes</div>
+            <div class="stat-value" id="statChallans">--</div>
+            <div class="stat-label">Challans Generated</div>
           </div>
         </div>
-        <div class="stat-card">
-          <div class="stat-icon">📍</div>
+        <div class="stat-card stat-card--gt15">
+          <div class="stat-icon">⏳</div>
           <div class="stat-info">
-            <div class="stat-value" id="statPoints">--</div>
-            <div class="stat-label">Data Points</div>
+            <div class="stat-value" id="statGt15">--</div>
+            <div class="stat-label">Parked &gt;15 min</div>
           </div>
         </div>
       </div>
 
       <div class="analytics-grid">
-        <!-- Main occupancy chart - full width -->
+        <!-- Row 1: Hourly Incidents — full width -->
         <div class="chart-card chart-card-wide">
           <div class="chart-header">
-            <div class="chart-title">📈 Zone Occupancy Over Time</div>
-            <div class="chart-badge">Live Data</div>
+            <div class="chart-title">📈 Hourly Unauthorized Parking Incidents</div>
+            <div class="chart-badge" id="hourlyChartBadge">All Zones</div>
           </div>
           <div class="chart-container chart-container-lg">
-            <canvas id="occupancyChart"></canvas>
+            <canvas id="hourlyIncidentsChart"></canvas>
           </div>
         </div>
 
-        <!-- Two charts side by side -->
+        <!-- Row 2: Dwell Distribution (left) -->
         <div class="chart-card">
           <div class="chart-header">
-            <div class="chart-title">⏱️ Average Dwell Time</div>
-            <div class="chart-badge">By Zone</div>
+            <div class="chart-title">⏳ Dwell Time Distribution</div>
+            <div class="chart-badge" id="dwellChartBadge">All Zones</div>
           </div>
           <div class="chart-container">
-            <canvas id="dwellChart"></canvas>
+            <canvas id="dwellDistributionChart"></canvas>
           </div>
         </div>
 
+        <!-- Row 2: Challan Split (right) -->
         <div class="chart-card">
           <div class="chart-header">
-            <div class="chart-title">🔮 Predicted Occupancy</div>
-            <div class="chart-badge">SMA Model</div>
+            <div class="chart-title">📋 Challan Outcome</div>
           </div>
           <div class="chart-container">
-            <canvas id="predictionChart"></canvas>
+            <canvas id="challanDonutChart"></canvas>
           </div>
         </div>
 
-        <!-- Predictions panel -->
-        <div class="chart-card chart-card-wide predictions-panel">
+        <!-- Row 3: Per-Zone Comparison — full width -->
+        <div class="chart-card chart-card-wide">
           <div class="chart-header">
-            <div class="chart-title">🎯 Zone Trend Predictions</div>
-            <div class="chart-badge">Next Period</div>
+            <div class="chart-title">🗂 Zone Comparison</div>
+            <div class="chart-badge" id="zoneChartBadge">Incidents vs Challans</div>
           </div>
-          <div id="predictionsGrid" class="predictions-grid">
-            <div class="prediction-loading">Calculating predictions...</div>
+          <div class="chart-container">
+            <canvas id="zoneComparisonChart"></canvas>
           </div>
         </div>
       </div>
@@ -145,7 +223,7 @@
       <div id="analyticsEmpty" class="analytics-empty" style="display: none;">
         <div class="empty-icon">📊</div>
         <div class="empty-title">No data for selected range</div>
-        <div class="empty-hint">Try selecting a wider time range or wait for more occupancy events.</div>
+        <div class="empty-hint">Try selecting a wider time range or wait for more parking events.</div>
       </div>
     </main>
 

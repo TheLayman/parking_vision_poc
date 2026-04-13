@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Challan Dashboard — Unauthorized Parking Detection</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      /* ── Challan-specific styles ─────────────────────────────────── */
+      .challan-page { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+      .challan-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 24px; flex-wrap: wrap; gap: 16px;
+      }
+      .challan-header-left { display: flex; flex-direction: column; gap: 4px; }
+      .challan-title { font-size: 1.5rem; font-weight: 700; color: var(--text); }
+      .challan-subtitle { font-size: 0.875rem; color: var(--muted); }
+
+      .challan-controls { display: flex; gap: 12px; align-items: center; }
+      .challan-filter {
+        padding: 8px 14px; border-radius: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0;
+        color: var(--text); font-family: inherit; font-size: 0.8125rem; cursor: pointer;
+        box-shadow: var(--neu-raised-xs);
+      }
+      .challan-filter:hover { border-color: var(--accent); box-shadow: 0 1px 3px rgba(99, 102, 241, 0.15); }
+      .refresh-btn {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 14px; border-radius: 12px;
+        background: #ffffff; border: 1px solid #e2e8f0;
+        color: var(--text-secondary); font-size: 0.8125rem;
+        cursor: pointer; transition: all 0.2s;
+        box-shadow: var(--neu-raised-xs);
+      }
+      .refresh-btn:hover { border-color: var(--accent); box-shadow: 0 1px 3px rgba(99, 102, 241, 0.15); color: var(--text); }
+
+      .back-link {
+        display: inline-flex; align-items: center; gap: 6px;
+        color: var(--accent-bright); text-decoration: none; font-size: 0.875rem;
+        margin-bottom: 16px; transition: color 0.2s;
+      }
+      .back-link:hover { color: var(--text); }
+
+      /* Stats row */
+      .challan-stats {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 16px; margin-bottom: 24px;
+      }
+      .challan-stat {
+        background: #ffffff; border: 1px solid #e2e8f0; border-radius: 14px;
+        padding: 16px 20px; display: flex; align-items: center; gap: 14px;
+        box-shadow: var(--neu-raised);
+      }
+      .challan-stat-icon { font-size: 1.5rem; }
+      .challan-stat-value { font-size: 1.25rem; font-weight: 700; color: var(--text); }
+      .challan-stat-label { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+
+      /* Table */
+      .challan-table-wrap {
+        background: #ffffff; border: 1px solid #e2e8f0;
+        border-radius: 14px; overflow: hidden;
+        box-shadow: var(--neu-raised);
+      }
+      .challan-table {
+        width: 100%; border-collapse: collapse; font-size: 0.8125rem;
+      }
+      .challan-table th {
+        text-align: left; padding: 14px 16px; font-weight: 600; font-size: 0.75rem;
+        color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
+        border-bottom: 1px solid var(--border); background: #f8fafc;
+        position: sticky; top: 0;
+      }
+      .challan-table td {
+        padding: 12px 16px; border-bottom: 1px solid var(--border);
+        color: var(--text-secondary); vertical-align: middle;
+      }
+      .challan-table tr:last-child td { border-bottom: none; }
+      .challan-table tr:hover td { background: var(--panel-hover); }
+
+      .plate-badge {
+        display: inline-block; padding: 4px 10px; border-radius: 6px;
+        font-weight: 600; font-family: 'Courier New', monospace; font-size: 0.875rem;
+        letter-spacing: 0.08em;
+        background: rgba(99, 102, 241, 0.08); color: #6366f1;
+        border: 1px solid rgba(99, 102, 241, 0.2);
+      }
+
+      .challan-badge {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.75rem;
+      }
+      .challan-badge.yes {
+        background: rgba(239, 68, 68, 0.08); color: #dc2626;
+        border: 1px solid rgba(239, 68, 68, 0.2);
+      }
+      .challan-badge.no {
+        background: rgba(34, 197, 94, 0.08); color: #16a34a;
+        border: 1px solid rgba(34, 197, 94, 0.2);
+      }
+
+      .location-link {
+        color: var(--accent); text-decoration: none; font-size: 0.82em;
+      }
+      .location-link:hover { text-decoration: underline; }
+
+      .thumb {
+        width: 80px; height: 56px; object-fit: cover; border-radius: 6px;
+        border: 1px solid var(--border); cursor: pointer;
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .thumb:hover { transform: scale(1.08); box-shadow: var(--shadow-md); }
+
+      .no-thumb {
+        width: 80px; height: 56px; border-radius: 6px;
+        background: #f1f5f9; border: 1px solid var(--border);
+        display: flex; align-items: center; justify-content: center;
+        color: var(--muted); font-size: 0.65rem;
+      }
+
+      .thumb-load-btn {
+        width: 80px; height: 56px; border-radius: 6px;
+        border: 1px dashed var(--border);
+        background: #f1f5f9;
+        color: var(--muted);
+        font-size: 0.68rem;
+        cursor: pointer;
+        transition: border-color 0.2s, color 0.2s;
+      }
+      .thumb-load-btn:hover {
+        border-color: var(--accent);
+        color: var(--text);
+      }
+
+      .challan-empty {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 80px 20px; color: var(--muted); text-align: center;
+      }
+      .challan-empty .empty-icon { font-size: 3rem; margin-bottom: 16px; opacity: 0.5; }
+      .challan-empty .empty-title { font-size: 1.125rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }
+      .challan-empty .empty-hint { font-size: 0.875rem; }
+
+      /* Lightbox */
+      .lightbox {
+        display: none; position: fixed; inset: 0; z-index: 1000;
+        background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(8px);
+        align-items: center; justify-content: center; cursor: pointer;
+      }
+      .lightbox.active { display: flex; }
+      .lightbox img {
+        max-width: 90vw; max-height: 85vh; border-radius: 12px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+      }
+      .lightbox-close {
+        position: absolute; top: 20px; right: 24px;
+        background: none; border: none; color: #fff; font-size: 2rem;
+        cursor: pointer; opacity: 0.7; transition: opacity 0.2s;
+      }
+      .lightbox-close:hover { opacity: 1; }
+
+      @media (max-width: 768px) {
+        .challan-table { font-size: 0.75rem; }
+        .challan-table th, .challan-table td { padding: 10px 10px; }
+        .thumb { width: 60px; height: 42px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="title">
+          <svg class="logo-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+            <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+            <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+            <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
+          </svg>
+          Unauthorized Parking Detection
+        </div>
+        <div class="tab-bar">
+          <a class="tab-btn" href="/" data-tab="dashboard" style="text-decoration:none;">Dashboard</a>
+          <a class="tab-btn" href="/?tab=analytics" data-tab="analytics" style="text-decoration:none;">Analytics</a>
+          <a class="tab-btn" href="/?tab=alerts" data-tab="alerts" style="text-decoration:none;">Alerts</a>
+          <a class="tab-btn active" href="/challan-dashboard" data-tab="challans" style="text-decoration:none;">Challans</a>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="tab-settings-wrap">
+          <button class="tab-settings-btn" onclick="toggleTabSettings()" title="Show/Hide Tabs">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+          <div class="tab-settings-dropdown" id="tabSettingsDropdown">
+            <div class="tab-settings-title">Visible Tabs</div>
+            <label class="tab-toggle">
+              <span>Dashboard</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('dashboard', this.checked)" data-tab-toggle="dashboard">
+            </label>
+            <label class="tab-toggle">
+              <span>Analytics</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('analytics', this.checked)" data-tab-toggle="analytics">
+            </label>
+            <label class="tab-toggle">
+              <span>Alerts</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('alerts', this.checked)" data-tab-toggle="alerts">
+            </label>
+            <label class="tab-toggle">
+              <span>Challans</span>
+              <input type="checkbox" checked onchange="toggleTabVisibility('challans', this.checked)" data-tab-toggle="challans">
+            </label>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="challan-page">
+
+      <!-- Stats -->
+      <div class="challan-stats" id="challanStats">
+        <div class="challan-stat">
+          <div class="challan-stat-icon">📋</div>
+          <div>
+            <div class="challan-stat-value" id="statTotal">--</div>
+            <div class="challan-stat-label">Unique Plates</div>
+          </div>
+        </div>
+        <div class="challan-stat">
+          <div class="challan-stat-icon">🚨</div>
+          <div>
+            <div class="challan-stat-value" id="statChallans">--</div>
+            <div class="challan-stat-label">Challans Issued</div>
+          </div>
+        </div>
+        <div class="challan-stat">
+          <div class="challan-stat-icon">✅</div>
+          <div>
+            <div class="challan-stat-value" id="statCleared">--</div>
+            <div class="challan-stat-label">Cleared</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="challan-header">
+        <div class="challan-header-left">
+          <h2 class="challan-title">🚗 Parking Violation Records <span class="live-indicator" id="sseIndicator" style="display:none;"><span class="live-dot"></span>LIVE</span></h2>
+          <p class="challan-subtitle">Vehicles detected staying more than 2 minutes</p>
+        </div>
+        <div class="challan-controls">
+          <select class="challan-filter" id="zoneFilter" onchange="loadChallans()">
+            <option value="">All Zones</option>
+          </select>
+          <select class="challan-filter" id="dateFilter" onchange="loadChallans()">
+            <option value="">All Time</option>
+            <option value="today">Today</option>
+            <option value="7d">Last 7 Days</option>
+            <option value="30d">Last 30 Days</option>
+          </select>
+          <select class="challan-filter" id="filterSelect" onchange="loadChallans()">
+            <option value="all">All Records</option>
+            <option value="challan">Challans Only</option>
+            <option value="cleared">Cleared Only</option>
+          </select>
+          <button class="refresh-btn" onclick="loadChallans()" title="Refresh">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+            </svg>
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div class="challan-table-wrap" id="challanTableWrap">
+        <table class="challan-table">
+          <thead>
+            <tr>
+              <th>Plate</th>
+              <th>1st Detection</th>
+              <th>Photo</th>
+              <th>2nd Detection (Latest)</th>
+              <th>Photo</th>
+              <th>Location</th>
+              <th>Challan</th>
+            </tr>
+          </thead>
+          <tbody id="challanBody">
+            <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:40px;">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Empty state -->
+      <div id="challanEmpty" class="challan-empty" style="display: none;">
+        <div class="empty-icon">📋</div>
+        <div class="empty-title">No challan records yet</div>
+        <div class="empty-hint">Records will appear here when vehicles are detected staying too long.</div>
+      </div>
+    </main>
+
+    <!-- Lightbox overlay -->
+    <div class="lightbox" id="lightbox" onclick="closeLightbox()">
+      <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+      <img id="lightboxImg" src="" alt="Full size" />
+    </div>
+
+    <script>
+      function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+      }
+
+      function fmtTime(ts) {
+        try {
+          const d = new Date(ts);
+          if (!isNaN(d.getTime())) return d.toLocaleString();
+        } catch {}
+        return String(ts || "—");
+      }
+
+      function filenameFromPath(path) {
+        if (!path) return null;
+        return path.split('/').pop().split('\\').pop();
+      }
+
+      const INITIAL_IMAGE_ROWS = 5;
+
+      function openLightbox(src) {
+        document.getElementById('lightboxImg').src = src;
+        document.getElementById('lightbox').classList.add('active');
+      }
+
+      function closeLightbox() {
+        document.getElementById('lightbox').classList.remove('active');
+      }
+
+      document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+      // ── Date filter helpers ───────────────────────────────────────
+      function getSinceISO(dateFilter) {
+        if (!dateFilter) return null;
+        const now = new Date();
+        if (dateFilter === 'today') {
+          const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          return start.toISOString();
+        }
+        const days = dateFilter === '7d' ? 7 : dateFilter === '30d' ? 30 : 0;
+        if (days > 0) return new Date(now.getTime() - days * 86400000).toISOString();
+        return null;
+      }
+
+      // ── Populate zone filter from /state ──────────────────────────
+      async function populateZoneFilter() {
+        try {
+          const res = await fetch('/state');
+          const data = await res.json();
+          const zones = Object.keys(data.zones || {}).sort();
+          const sel = document.getElementById('zoneFilter');
+          for (const z of zones) {
+            const opt = document.createElement('option');
+            opt.value = z;
+            opt.textContent = `Zone ${z}`;
+            sel.appendChild(opt);
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // ── Load challans ─────────────────────────────────────────────
+      async function loadChallans() {
+        const filter = document.getElementById('filterSelect').value;
+        const zoneVal = document.getElementById('zoneFilter').value;
+        const dateVal = document.getElementById('dateFilter').value;
+        const challanOnly = filter === 'challan' ? 'true' : 'false';
+
+        const params = new URLSearchParams({ limit: '500', challan_only: challanOnly });
+        if (zoneVal) params.set('zone', zoneVal);
+        const since = getSinceISO(dateVal);
+        if (since) params.set('since', since);
+
+        try {
+          const res = await fetch(`/challans?${params}`);
+          const data = await res.json();
+          let records = data.challans || [];
+
+          // Client-side filter for "cleared"
+          if (filter === 'cleared') {
+            records = records.filter(r => !r.challan);
+          }
+
+          renderTable(records);
+        } catch (err) {
+          console.error('Failed to load challans:', err);
+        }
+      }
+
+      function updateStats(plateGroups) {
+        const totalPlates = plateGroups.length;
+        const challanCount = plateGroups.filter(g => g.challan).length;
+        const clearedCount = totalPlates - challanCount;
+        document.getElementById('statTotal').textContent = totalPlates;
+        document.getElementById('statChallans').textContent = challanCount;
+        document.getElementById('statCleared').textContent = clearedCount;
+      }
+
+      // ── Image HTML helpers ────────────────────────────────────────
+      function thumbHtml(path, alt, shouldLoad) {
+        const f = filenameFromPath(path);
+        if (!f) return '<div class="no-thumb">No image</div>';
+        const src = `/snapshots/${escapeHtml(f)}`;
+        const safeAlt = escapeHtml(alt);
+        if (shouldLoad) {
+          return `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${safeAlt}" loading="lazy" /></a>`;
+        }
+        return `<button class="thumb-load-btn" type="button" data-src="${src}" data-alt="${safeAlt}" onclick="loadThumb(this)">Load image</button>`;
+      }
+
+      function loadThumb(btn) {
+        if (!btn) return;
+        const src = btn.dataset.src;
+        const alt = btn.dataset.alt || 'snapshot';
+        if (!src) return;
+        btn.outerHTML = `<a href="${src}" target="_blank" rel="noopener noreferrer"><img class="thumb" src="${src}" alt="${alt}" loading="lazy" /></a>`;
+      }
+
+      function platesChips(plates) {
+        if (!plates || plates.length === 0) return '';
+        return '<div class="second-plates-detail">' +
+          plates.map(p => `<span class="plate-badge-sm">${escapeHtml(p)}</span>`).join('') +
+          '</div>';
+      }
+
+      // ── Group records by capture session ────────────────────────────
+      // Each capture_session_id represents one independent detection cycle
+      // (first capture → recheck). Grouping by plate alone would merge
+      // unrelated events at different slots/times into a single row,
+      // making it look like the recheck window was hours instead of ~70s.
+      function groupByPlate(records) {
+        const map = new Map();
+        for (const r of records) {
+          const plate = r.plate_text || 'UNKNOWN';
+          // Use capture_session_id + plate as the primary key so that
+          // multiple plates from the same capture each get their own row.
+          // Fall back to plate alone for legacy records without a session id.
+          const key = r.capture_session_id ? `${r.capture_session_id}_${plate}` : plate;
+          if (!map.has(key)) {
+            map.set(key, {
+              plate,
+              first_time: r.first_time,
+              first_image: r.first_image,
+              second_time: r.second_time,
+              second_image: r.second_image,
+              challan: !!r.challan,
+              lat: r.lat,
+              lng: r.lng,
+              slots: new Set([r.slot_name || '—']),
+            });
+          } else {
+            const g = map.get(key);
+            // Keep the earliest first detection
+            if (r.first_time && (!g.first_time || r.first_time < g.first_time)) {
+              g.first_time = r.first_time;
+              g.first_image = r.first_image;
+            }
+            // Keep the latest second detection
+            if (r.second_time && (!g.second_time || r.second_time > g.second_time)) {
+              g.second_time = r.second_time;
+              g.second_image = r.second_image;
+            }
+            // Challan = YES if any record says so
+            if (r.challan) g.challan = true;
+            if (r.slot_name) g.slots.add(r.slot_name);
+          }
+        }
+        // Convert Sets to arrays and return sorted by first_time descending
+        const groups = Array.from(map.values()).map(g => ({ ...g, slots: Array.from(g.slots) }));
+        groups.sort((a, b) => (b.first_time || '').localeCompare(a.first_time || ''));
+        return groups;
+      }
+
+      // ── Render per-plate table ─────────────────────────────────────
+      function renderTable(records) {
+        const tbody = document.getElementById('challanBody');
+        const emptyEl = document.getElementById('challanEmpty');
+        const tableWrap = document.getElementById('challanTableWrap');
+
+        const plateGroups = groupByPlate(records);
+
+        if (plateGroups.length === 0) {
+          tableWrap.style.display = 'none';
+          emptyEl.style.display = 'flex';
+          updateStats([]);
+          return;
+        }
+
+        tableWrap.style.display = 'block';
+        emptyEl.style.display = 'none';
+        updateStats(plateGroups);
+
+        let html = '';
+        plateGroups.forEach((g, index) => {
+          const shouldLoadImages = index < INITIAL_IMAGE_ROWS;
+          const challanBadge = g.challan
+            ? '<span class="challan-badge yes">🚨 YES</span>'
+            : '<span class="challan-badge no">✅ NO</span>';
+
+          const locationHtml = (g.lat != null && g.lng != null)
+            ? `<a href="https://www.google.com/maps?q=${g.lat},${g.lng}" target="_blank" rel="noopener noreferrer" class="location-link" title="Open in Google Maps">${g.lat.toFixed(5)}, ${g.lng.toFixed(5)}</a>`
+            : '—';
+
+          html += `<tr>
+            <td><span class="plate-badge">${escapeHtml(g.plate)}</span></td>
+            <td>${fmtTime(g.first_time)}</td>
+            <td>${thumbHtml(g.first_image, '1st detection', shouldLoadImages)}</td>
+            <td>${fmtTime(g.second_time)}</td>
+            <td>${thumbHtml(g.second_image, '2nd detection', shouldLoadImages)}</td>
+            <td>${locationHtml}</td>
+            <td>${challanBadge}</td>
+          </tr>`;
+        });
+
+        tbody.innerHTML = html;
+      }
+
+      // ── SSE for near-real-time updates ────────────────────────────
+      let challanSSE = null;
+      function startChallanSSE() {
+        challanSSE = new EventSource('/events');
+        document.getElementById('sseIndicator').style.display = 'inline-flex';
+
+        challanSSE.onmessage = (msg) => {
+          try {
+            const obj = JSON.parse(msg.data);
+            if (obj.event === 'challan_completed') {
+              loadChallans();
+            }
+          } catch (e) { /* ignore */ }
+        };
+
+        challanSSE.onerror = () => {
+          document.getElementById('sseIndicator').style.display = 'none';
+        };
+      }
+
+      // ── Init ──────────────────────────────────────────────────────
+      populateZoneFilter();
+      loadChallans();
+      startChallanSSE();
+
+      // Fallback polling every 60s (in case SSE drops)
+      setInterval(loadChallans, 60000);
+
+      // ── Tab visibility settings (shared with main dashboard) ──────
+      const TAB_VIS_KEY = 'parking_tab_visibility';
+
+      function _loadTabVisibility() {
+        try {
+          const saved = localStorage.getItem(TAB_VIS_KEY);
+          if (saved) return JSON.parse(saved);
+        } catch {}
+        return { dashboard: true, analytics: true, alerts: true, challans: true };
+      }
+
+      function _saveTabVisibility(vis) {
+        localStorage.setItem(TAB_VIS_KEY, JSON.stringify(vis));
+      }
+
+      function toggleTabSettings() {
+        document.getElementById('tabSettingsDropdown').classList.toggle('open');
+      }
+
+      document.addEventListener('click', function(e) {
+        const wrap = document.querySelector('.tab-settings-wrap');
+        if (wrap && !wrap.contains(e.target)) {
+          document.getElementById('tabSettingsDropdown').classList.remove('open');
+        }
+      });
+
+      function toggleTabVisibility(tabKey, visible) {
+        const vis = _loadTabVisibility();
+        vis[tabKey] = visible;
+        _saveTabVisibility(vis);
+        _applyTabVisibility(vis);
+      }
+
+      function _applyTabVisibility(vis) {
+        if (!vis) vis = _loadTabVisibility();
+        document.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+          const key = btn.dataset.tab;
+          if (key && vis[key] !== undefined) {
+            btn.style.display = vis[key] ? '' : 'none';
+          }
+        });
+        document.querySelectorAll('[data-tab-toggle]').forEach(cb => {
+          const key = cb.getAttribute('data-tab-toggle');
+          if (vis[key] !== undefined) cb.checked = vis[key];
+        });
+      }
+
+      _applyTabVisibility();
+    </script>
+  </body>
+</html>
