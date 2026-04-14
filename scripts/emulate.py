@@ -275,8 +275,17 @@ def seed_redis(r: redis.Redis, slots: list[dict]):
         offset = random.randint(0, 7200)
         since_map[sid] = (now - timedelta(seconds=offset)).isoformat()
 
+    # Seed sensor lastseen (simulate all sensors reported recently)
+    lastseen_map = {}
+    for slot in slots:
+        sid = str(slot["id"])
+        offset = random.randint(60, 5400)  # 1-90 min ago
+        lastseen_map[sid] = (now - timedelta(seconds=offset)).isoformat()
+
     pipe.hset("parking:slot:state", mapping=state_map)
     pipe.hset("parking:slot:since", mapping=since_map)
+    pipe.delete("parking:sensor:lastseen")
+    pipe.hset("parking:sensor:lastseen", mapping=lastseen_map)
     pipe.execute()
 
     occupied_count = sum(1 for v in state_map.values() if v == "OCCUPIED")

@@ -928,23 +928,30 @@ function showSlotPopover(slot, tileEl) {
   }
 
   popover.innerHTML = html;
+
+  // Position offscreen first so we can measure
+  popover.style.top = "-9999px";
+  popover.style.left = "-9999px";
   document.body.appendChild(popover);
 
-  // Position near the tile
-  const rect = tileEl.getBoundingClientRect();
-  const popoverRect = popover.getBoundingClientRect();
-  let top = rect.bottom + 8;
-  let left = rect.left + (rect.width / 2) - (popoverRect.width / 2);
+  // Use rAF to get correct dimensions after layout
+  requestAnimationFrame(() => {
+    const rect = tileEl.getBoundingClientRect();
+    const pw = popover.offsetWidth;
+    const ph = popover.offsetHeight;
+    let top = rect.bottom + 8;
+    let left = rect.left + (rect.width / 2) - (pw / 2);
 
-  // Keep within viewport
-  if (left < 8) left = 8;
-  if (left + popoverRect.width > window.innerWidth - 8) left = window.innerWidth - popoverRect.width - 8;
-  if (top + popoverRect.height > window.innerHeight - 8) {
-    top = rect.top - popoverRect.height - 8;
-  }
+    if (left < 8) left = 8;
+    if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+    if (top + ph > window.innerHeight - 8) {
+      top = rect.top - ph - 8;
+    }
+    if (top < 8) top = 8;
 
-  popover.style.top = top + "px";
-  popover.style.left = left + "px";
+    popover.style.top = top + "px";
+    popover.style.left = left + "px";
+  });
 
   // Wire calibrate button
   const calBtn = document.getElementById("popoverCalibrateBtn");
