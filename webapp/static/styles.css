@@ -451,23 +451,24 @@ html, body {
 
 /* ── Zone calibrate button ────────────────────────────────── */
 .zone-calibrate-btn {
-  padding: 5px 12px;
-  background: rgba(99, 102, 241, 0.08);
-  color: var(--accent);
-  border: 1px solid rgba(99, 102, 241, 0.25);
+  padding: 4px 10px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
   border-radius: 6px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
   white-space: nowrap;
   margin-left: 8px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 
 .zone-calibrate-btn:hover {
-  background: var(--accent);
-  color: #fff;
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+  filter: brightness(1.15);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
 }
 
 .zone-calibrate-btn:disabled {
