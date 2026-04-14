@@ -876,12 +876,15 @@ async function init() {
         refreshLayout();
         prependLog(obj);
 
-        // Live update state changes tab if active
+        // Live update state changes tab if active (respect zone filter)
         const scTab = document.getElementById('state-changes-tab');
         if (scTab && scTab.classList.contains('active')) {
-          stateChangesCache.unshift(obj);
-          stateChangesCache = stateChangesCache.slice(0, 100);
-          renderStateChanges(stateChangesCache);
+          const scZoneFilter = document.getElementById('stateChangesZoneFilter')?.value || '';
+          if (!scZoneFilter || obj.zone === scZoneFilter) {
+            stateChangesCache.unshift(obj);
+            stateChangesCache = stateChangesCache.slice(0, 100);
+            renderStateChanges(stateChangesCache);
+          }
         }
       }
 
@@ -893,6 +896,14 @@ async function init() {
         }
         refreshLayout();
         prependLog(obj);
+      }
+
+      // Clear device alert when sensor sends a normal occupancy update
+      if (obj.event === "slot_state_changed") {
+        const alertId = parseSlotId(obj);
+        if (!isNaN(alertId) && sensorAlerts[alertId]) {
+          delete sensorAlerts[alertId];
+        }
       }
     } catch (e) {
       // ignore parse errors

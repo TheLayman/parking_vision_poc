@@ -49,6 +49,30 @@ def get_redis() -> redis.Redis:
     return _redis_client
 
 
+def _decode_redis_hash(raw: dict) -> dict[int, str]:
+    """Decode a Redis hash with bytes keys/values to {int_id: str_value}."""
+    result = {}
+    for k, v in raw.items():
+        try:
+            sid = int(k.decode() if isinstance(k, bytes) else k)
+            result[sid] = v.decode() if isinstance(v, bytes) else str(v)
+        except Exception:
+            pass
+    return result
+
+
+def _decode_redis_hash_json(raw: dict) -> dict[int, dict]:
+    """Decode a Redis hash with JSON-encoded values to {int_id: dict}."""
+    result = {}
+    for k, v in raw.items():
+        try:
+            sid = int(k.decode() if isinstance(k, bytes) else k)
+            result[sid] = json.loads(v.decode() if isinstance(v, bytes) else v)
+        except Exception:
+            pass
+    return result
+
+
 # ── MQTT configuration ────────────────────────────────────────────────────────
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
@@ -229,19 +253,11 @@ def health():
     # Sensor health summary
     try:
         r = get_redis()
-        lastseen_raw = r.hgetall("parking:sensor:lastseen")
+        lastseen = _decode_redis_hash(r.hgetall("parking:sensor:lastseen"))
         now = datetime.now(timezone.utc)
-        total_sensors = len(lastseen_raw)
-        online = 0
-        for _sid, ts_bytes in lastseen_raw.items():
-            try:
-                ts_str = ts_bytes.decode() if isinstance(ts_bytes, bytes) else str(ts_bytes)
-                ts = datetime.fromisoformat(ts_str)
-                if (now - ts).total_seconds() < 6000:  # ~100 min
-                    online += 1
-            except Exception:
-                pass
-        status["sensors_total"] = total_sensors
+        online = sum(1 for ts_str in lastseen.values()
+                     if (now - datetime.fromisoformat(ts_str)).total_seconds() < 6000)
+        status["sensors_total"] = len(lastseen)
         status["sensors_online"] = online
     except Exception:
         pass
@@ -270,25 +286,8 @@ def state():
 
     # Augment with sensor health data
     try:
-        lastseen_raw = r.hgetall("parking:sensor:lastseen")
-        lastseen = {}
-        for k, v in lastseen_raw.items():
-            try:
-                sid = int(k.decode() if isinstance(k, bytes) else k)
-                lastseen[sid] = v.decode() if isinstance(v, bytes) else str(v)
-            except Exception:
-                pass
-        result["sensor_lastseen"] = lastseen
-
-        alerts_raw = r.hgetall("parking:sensor:alerts")
-        alerts = {}
-        for k, v in alerts_raw.items():
-            try:
-                sid = int(k.decode() if isinstance(k, bytes) else k)
-                alerts[sid] = json.loads(v.decode() if isinstance(v, bytes) else v)
-            except Exception:
-                pass
-        result["sensor_alerts"] = alerts
+        result["sensor_lastseen"] = _decode_redis_hash(r.hgetall("parking:sensor:lastseen"))
+        result["sensor_alerts"] = _decode_redis_hash_json(r.hgetall("parking:sensor:alerts"))
     except Exception:
         result["sensor_lastseen"] = {}
         result["sensor_alerts"] = {}
@@ -338,35 +337,31 @@ def get_state_changes(
 ):
     """Recent occupancy state transitions from Postgres."""
     try:
-        from db.client import get_pool
-        conditions = ["event_type IN ('FREE', 'OCCUPIED')"]
-        params: list = []
-        if zone:
-            conditions.append("payload->>'zone' = %s")
-            params.append(zone)
-        where = f"WHERE {' AND '.join(conditions)}"
-        params.extend([limit, offset])
-        sql = (
-            f"SELECT slot_id, event_type, device_eui, ts, payload "
-            f"FROM occupancy_events {where} ORDER BY ts DESC LIMIT %s OFFSET %s"
-        )
-        with get_pool().connection() as conn:
-            rows = conn.execute(sql, params).fetchall()
+        from db.client import query_occupancy_events
+        rows = query_occupancy_events(limit=limit)
 
         changes = []
         for row in rows:
-            payload = row["payload"] if isinstance(row["payload"], dict) else (
-                json.loads(row["payload"]) if row["payload"] else {})
+            if row["event_type"] not in ("OCCUPIED", "FREE"):
+                continue
+            payload = row.get("payload") or {}
+            row_zone = payload.get("zone", "A")
+            if zone and row_zone != zone:
+                continue
             ts = row["ts"]
             ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
             changes.append({
                 "ts": ts_str,
                 "slot_id": row["slot_id"],
                 "slot_name": payload.get("slot_name", str(row["slot_id"])),
-                "zone": payload.get("zone", "A"),
+                "zone": row_zone,
                 "prev_state": payload.get("prev_state", ""),
                 "new_state": row["event_type"],
             })
+
+        # Reverse to newest-first (query returns ASC)
+        changes.reverse()
+        changes = changes[:limit]
 
         return {"changes": changes, "total": len(changes), "limit": limit, "offset": offset}
     except Exception as e:
@@ -415,43 +410,33 @@ def analytics_summary(range: str = Query(default="24h"),
         end=now_ts if delta else None,
     )
 
-    # Per-zone stats
+    # Per-zone stats (reuse build_dwell_distribution for consistent buckets)
     occupancy_by_zone: dict[str, int] = defaultdict(int)
     for sc in state_changes:
         if sc.get("prev_state") == "FREE" and sc.get("new_state") == "OCCUPIED":
             occupancy_by_zone[sc["zone"]] += 1
-    dwells_by_zone: dict[str, list[float]] = defaultdict(list)
-    for d in all_dwells:
-        dwells_by_zone[d["zone"]].append(d["minutes"])
 
     zone_stats = {}
     for z in all_zones:
-        z_dwell_list = dwells_by_zone[z]
-        z_avg = round(sum(z_dwell_list) / len(z_dwell_list), 1) if z_dwell_list else 0
-        gt_15 = gt_30 = gt_45 = gt_60 = 0
-        for m in z_dwell_list:
-            if m > 15: gt_15 += 1
-            if m > 30: gt_30 += 1
-            if m > 45: gt_45 += 1
-            if m > 60: gt_60 += 1
+        z_dwell_dist = build_dwell_distribution(all_dwells, zone=z)
+        z_dwells = [d["minutes"] for d in all_dwells if d["zone"] == z]
+        z_avg = round(sum(z_dwells) / len(z_dwells), 1) if z_dwells else 0
         zone_stats[z] = {
             "total_occupancy_events": occupancy_by_zone[z],
             "avg_parking_minutes": z_avg,
-            "dwell_distribution": {"gt_15m": gt_15, "gt_30m": gt_30, "gt_45m": gt_45, "gt_1h": gt_60},
+            "dwell_distribution": z_dwell_dist,
         }
 
     # Current utilization from Redis
+    meta = load_slot_meta_by_id(SLOT_META_PATH)
+    total_slots = len(meta)
     try:
         r = get_redis()
         state_raw = r.hgetall("parking:slot:state")
-        meta = load_slot_meta_by_id(SLOT_META_PATH)
-        total_slots = len(meta)
         occupied = sum(1 for v in state_raw.values()
                        if (v.decode() if isinstance(v, bytes) else v) == "OCCUPIED")
         utilization_pct = round(occupied / total_slots * 100, 1) if total_slots else 0
     except Exception:
-        meta = load_slot_meta_by_id(SLOT_META_PATH)
-        total_slots = len(meta)
         utilization_pct = 0
 
     # Turnover rates

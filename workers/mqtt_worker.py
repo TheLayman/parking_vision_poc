@@ -54,6 +54,12 @@ end
 return 0
 """
 
+# ── Status codes (1-byte uplink from BMM350 firmware) ────────────────────────
+STATUS_FREE = "00"
+STATUS_OCCUPIED = "01"
+STATUS_BATTERY_LOW = "09"
+STATUS_TEMP_HIGH = "0a"
+STATUS_CALIBRATION_DONE = "cd"
 
 # ── Payload decoding ─────────────────────────────────────────────────────────
 
@@ -65,6 +71,26 @@ def decode_uplink(payload_base64: str) -> dict:
         log.error("decode_uplink error: %s", e)
         status = "unknown"
     return {"status": status, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# ── Device alert helper ───────────────────────────────────────────────────────
+
+def _handle_device_alert(r, db_conn, slot_id, slot_name, zone, device_eui, ts, ts_str, alert_type):
+    """Record a device health alert (battery_low / temperature_high)."""
+    log.warning("%s for slot %s", alert_type.replace("_", " ").upper(), slot_name)
+    r.hset("parking:sensor:alerts", str(slot_id),
+            json.dumps({"type": alert_type, "ts": ts_str}))
+    insert_occupancy_event(
+        slot_id=slot_id, event_type=alert_type, device_eui=device_eui,
+        ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
+    )
+    db_conn.commit()
+    r.publish("parking:events:live", json.dumps({
+        "event": "device_alert", "ts": ts_str,
+        "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
+        "alert_type": alert_type,
+    }))
+    return True
 
 
 # ── Core processing ───────────────────────────────────────────────────────────
@@ -105,56 +131,28 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
         zone = slot_meta.get("zone", "A")
 
         log.info("device=%s slot=%s status=%s", device_name, slot_name, status)
-
-        # Track sensor lastseen on every uplink
         r.hset("parking:sensor:lastseen", str(slot_id), ts_str)
 
-        # Extract RSSI from ChirpStack rxInfo if available
         rx_info = payload.get("rxInfo", [])
         if rx_info:
             best_rssi = max((ri.get("rssi", -999) for ri in rx_info), default=-999)
             if best_rssi > -999:
                 r.hset("parking:sensor:rssi", str(slot_id), str(best_rssi))
 
-        # Handle device health alerts (not occupancy state changes)
-        if status == "09":
-            log.warning("Battery LOW for slot %s", slot_name)
-            r.hset("parking:sensor:alerts", str(slot_id),
-                    json.dumps({"type": "battery_low", "ts": ts_str}))
-            insert_occupancy_event(
-                slot_id=slot_id, event_type="battery_low", device_eui=device_eui,
-                ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
-            )
-            db_conn.commit()
-            r.publish("parking:events:live", json.dumps({
-                "event": "device_alert", "ts": ts_str,
-                "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
-                "alert_type": "battery_low",
-            }))
-            return True
+        # Device health alerts
+        if status == STATUS_BATTERY_LOW:
+            return _handle_device_alert(
+                r, db_conn, slot_id, slot_name, zone, device_eui, ts, ts_str, "battery_low")
+        if status == STATUS_TEMP_HIGH:
+            return _handle_device_alert(
+                r, db_conn, slot_id, slot_name, zone, device_eui, ts, ts_str, "temperature_high")
 
-        if status == "0a":
-            log.warning("Temperature HIGH for slot %s", slot_name)
-            r.hset("parking:sensor:alerts", str(slot_id),
-                    json.dumps({"type": "temperature_high", "ts": ts_str}))
-            insert_occupancy_event(
-                slot_id=slot_id, event_type="temperature_high", device_eui=device_eui,
-                ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
-            )
-            db_conn.commit()
-            r.publish("parking:events:live", json.dumps({
-                "event": "device_alert", "ts": ts_str,
-                "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
-                "alert_type": "temperature_high",
-            }))
-            return True
-
-        # Map status to event_type
-        if status == "01":
+        # Occupancy state transitions
+        if status == STATUS_OCCUPIED:
             event_type, expected_state, new_state = "OCCUPIED", "FREE", "OCCUPIED"
-        elif status == "00":
+        elif status == STATUS_FREE:
             event_type, expected_state, new_state = "FREE", "OCCUPIED", "FREE"
-        elif status == "cd":
+        elif status == STATUS_CALIBRATION_DONE:
             log.info("Calibration Done for slot %s", slot_name)
             insert_occupancy_event(
                 slot_id=slot_id, event_type="calibration", device_eui=device_eui,
