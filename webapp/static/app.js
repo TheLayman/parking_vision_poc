@@ -17,7 +17,41 @@ function parseSlotId(obj) {
   return typeof raw === 'number' ? raw : Number(raw);
 }
 
+function timeAgo(ts) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "";
+    const diffMs = Date.now() - d.getTime();
+    if (diffMs < 0) return "just now";
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return "just now";
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const hours = Math.floor(diffMin / 60);
+    const mins = diffMin % 60;
+    if (hours < 24) {
+      return mins > 0 ? `${hours}h ${mins}m ago` : `${hours}h ago`;
+    }
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  } catch { return ""; }
+}
+
 function humanEvent(e) {
+  if (e.event === "calibration_started") {
+    const name = e.slot_name || `Slot ${e.slot_id}`;
+    return `${name} calibration started`;
+  }
+  if (e.event === "calibration_done") {
+    const name = e.slot_name || `Slot ${e.slot_id}`;
+    return `${name} calibration done`;
+  }
+  if (e.event === "bulk_calibration_started") {
+    const zone = e.zone || "all";
+    const total = e.total || "?";
+    return `Bulk calibration started (${total} slots, zone ${zone})`;
+  }
   if (e.event === "calibration") {
     return `${e.slot_name} calibrated`;
   }
@@ -521,8 +555,21 @@ let serverZoneStats = null;
 let sensorLastseen = {};
 let sensorAlerts = {};
 let collapsedZones = new Set();
+let calibratingSlots = {};
+let searchQuery = "";
+const SLOTS_PER_PAGE = 50;
+let zonePages = {};
 
 const SENSOR_OFFLINE_THRESHOLD_MS = 6000 * 1000; // ~100 minutes
+
+function filterSlotsBySearch(slotList) {
+  if (!searchQuery) return slotList;
+  const q = searchQuery.toLowerCase();
+  return slotList.filter(s => {
+    const name = (s.name || `Slot ${s.id}`).toLowerCase();
+    return name.includes(q);
+  });
+}
 
 function getSlotStatus(slotId) {
   return (stateById[slotId] || "FREE") === "OCCUPIED" ? "OCCUPIED" : "FREE";
@@ -642,8 +689,19 @@ function renderZoneSections(zones) {
 
       const title = document.createElement("div");
       title.className = "zoneTitle";
+
+      const calibrateZoneBtn = document.createElement("button");
+      calibrateZoneBtn.className = "zoneCalibrateBtn";
+      calibrateZoneBtn.type = "button";
+      calibrateZoneBtn.textContent = "Calibrate Zone";
+      calibrateZoneBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        calibrateZone(zoneKey, calibrateZoneBtn);
+      });
+
       titleRow.appendChild(toggle);
       titleRow.appendChild(title);
+      titleRow.appendChild(calibrateZoneBtn);
 
       const subtitle = document.createElement("div");
       subtitle.className = "zoneSubtitle";
@@ -693,9 +751,19 @@ function renderZoneSections(zones) {
 
     // Slot tiles
     const grid = section.querySelector(".zoneSlotGrid");
-    const zoneSlots = slots.filter(s => (s.zone || "A") === zoneKey).sort((a, b) => a.id - b.id);
+    const allZoneSlots = filterSlotsBySearch(
+      slots.filter(s => (s.zone || "A") === zoneKey)
+    ).sort((a, b) => a.id - b.id);
+
+    // Pagination
+    const currentPage = zonePages[zoneKey] || 1;
+    const visibleCount = currentPage * SLOTS_PER_PAGE;
+    const zoneSlots = allZoneSlots.slice(0, visibleCount);
+    const remaining = allZoneSlots.length - visibleCount;
+
     const existingTiles = {};
     for (const tile of Array.from(grid.children)) {
+      if (tile.classList.contains("showMoreBtn")) continue;
       const sid = tile.dataset.slotId;
       if (sid) existingTiles[sid] = tile;
     }
@@ -704,10 +772,15 @@ function renderZoneSections(zones) {
       if (!expectedSlotIds.has(sid)) tile.remove();
     }
 
+    // Remove old show-more button
+    const oldShowMore = grid.querySelector(".showMoreBtn");
+    if (oldShowMore) oldShowMore.remove();
+
     for (const s of zoneSlots) {
       const status = getSlotStatus(s.id);
       const offline = isSensorOffline(s.id);
       const alert = getSensorAlert(s.id);
+      const isCalibrating = !!calibratingSlots[s.id];
       const tileId = String(s.id);
       let tile = existingTiles[tileId];
 
@@ -720,27 +793,51 @@ function renderZoneSections(zones) {
       let tileClass = `slot ${status === "OCCUPIED" ? "occupied" : "free"}`;
       if (offline) tileClass += " sensor-offline";
       if (alert) tileClass += " sensor-alert";
+      if (isCalibrating) tileClass += " calibrating";
       tile.className = tileClass;
-      tile.querySelector(".slotState").textContent = offline ? "OFFLINE" : status;
 
-      // Meta: since timestamp + sensor health indicators
+      const stateEl = tile.querySelector(".slotState");
+      if (isCalibrating) {
+        stateEl.innerHTML = '<span class="calibrating-text">Calibrating...</span>';
+      } else {
+        stateEl.textContent = offline ? "OFFLINE" : status;
+      }
+
+      // Meta: duration + sensor health indicators
       const sinceTs = sinceById[s.id];
       let metaHtml = "";
+
+      // Duration in current state
       if (sinceTs) {
-        try {
-          const d = new Date(sinceTs);
-          if (!isNaN(d.getTime())) metaHtml = "Since " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        } catch { }
+        const ago = timeAgo(sinceTs);
+        if (ago) metaHtml += `<div class="slot-duration">${ago}</div>`;
+      }
+
+      // Sensor health
+      if (offline) {
+        metaHtml += '<div class="slot-health-alert">&#x26A0; Offline</div>';
       }
       if (alert) {
         const alertIcon = alert.type === "battery_low" ? "&#x1F50B;" : "&#x1F321;";
         const alertLabel = alert.type === "battery_low" ? "Battery low" : "Temp high";
         metaHtml += `<div class="slot-health-alert">${alertIcon} ${alertLabel}</div>`;
       }
-      if (offline) {
-        metaHtml += '<div class="slot-health-alert">&#x26A0; Sensor offline</div>';
+      if (isCalibrating) {
+        metaHtml += '<div class="slot-calibrating-badge">Calibrating...</div>';
       }
       tile.querySelector(".slotMeta").innerHTML = metaHtml;
+    }
+
+    // Show more button
+    if (remaining > 0) {
+      const showMoreBtn = document.createElement("button");
+      showMoreBtn.className = "showMoreBtn";
+      showMoreBtn.textContent = `Show more (${remaining} remaining)`;
+      showMoreBtn.addEventListener("click", () => {
+        zonePages[zoneKey] = (zonePages[zoneKey] || 1) + 1;
+        refreshLayout();
+      });
+      grid.appendChild(showMoreBtn);
     }
   }
 }
@@ -764,8 +861,198 @@ function _createSlotTile(s) {
 
   tile.appendChild(top);
   tile.appendChild(meta);
+
+  // Click handler to show popover
+  tile.addEventListener("click", (e) => {
+    e.stopPropagation();
+    showSlotPopover(s, tile);
+  });
+
   return tile;
 }
+
+// ── Slot Detail Popover ─────────────────────────────────────────────────────
+
+function showSlotPopover(slot, tileEl) {
+  hideSlotPopover();
+
+  const status = getSlotStatus(slot.id);
+  const offline = isSensorOffline(slot.id);
+  const alert = getSensorAlert(slot.id);
+  const isCalibrating = !!calibratingSlots[slot.id];
+  const sinceTs = sinceById[slot.id];
+  const lastSeen = sensorLastseen[slot.id];
+
+  const popover = document.createElement("div");
+  popover.id = "slotPopover";
+  popover.className = "slot-popover";
+
+  let stateText = isCalibrating ? "Calibrating" : (offline ? "OFFLINE" : status);
+  let stateClass = status === "OCCUPIED" ? "occupied" : "free";
+  if (isCalibrating) stateClass = "calibrating";
+
+  let html = `
+    <div class="popover-header">
+      <strong>${escapeHtml(slot.name || 'Slot ' + slot.id)}</strong>
+      <button class="popover-close" onclick="hideSlotPopover()">&times;</button>
+    </div>
+    <div class="popover-body">
+      <div class="popover-row"><span class="popover-label">Zone</span><span>${escapeHtml(slot.zone || 'A')}</span></div>
+      <div class="popover-row"><span class="popover-label">State</span><span class="popover-state ${stateClass}">${stateText}</span></div>
+  `;
+
+  if (sinceTs) {
+    const ago = timeAgo(sinceTs);
+    html += `<div class="popover-row"><span class="popover-label">Duration</span><span>${ago || '--'}</span></div>`;
+  }
+
+  if (lastSeen) {
+    html += `<div class="popover-row"><span class="popover-label">Last seen</span><span>${fmtTs(lastSeen)}</span></div>`;
+  }
+
+  if (alert) {
+    const alertLabel = alert.type === "battery_low" ? "Battery low" : "Temperature high";
+    html += `<div class="popover-row popover-alert"><span class="popover-label">Alert</span><span>${alertLabel}</span></div>`;
+  }
+
+  if (offline) {
+    html += `<div class="popover-row popover-alert"><span class="popover-label">Sensor</span><span>Offline</span></div>`;
+  }
+
+  html += `</div>`;
+
+  if (isCalibrating) {
+    html += `<div class="popover-footer"><button class="popover-calibrate-btn" disabled>Calibrating...</button></div>`;
+  } else {
+    html += `<div class="popover-footer"><button class="popover-calibrate-btn" id="popoverCalibrateBtn">Recalibrate</button></div>`;
+  }
+
+  popover.innerHTML = html;
+  document.body.appendChild(popover);
+
+  // Position near the tile
+  const rect = tileEl.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  let top = rect.bottom + 8;
+  let left = rect.left + (rect.width / 2) - (popoverRect.width / 2);
+
+  // Keep within viewport
+  if (left < 8) left = 8;
+  if (left + popoverRect.width > window.innerWidth - 8) left = window.innerWidth - popoverRect.width - 8;
+  if (top + popoverRect.height > window.innerHeight - 8) {
+    top = rect.top - popoverRect.height - 8;
+  }
+
+  popover.style.top = top + "px";
+  popover.style.left = left + "px";
+
+  // Wire calibrate button
+  const calBtn = document.getElementById("popoverCalibrateBtn");
+  if (calBtn) {
+    calBtn.addEventListener("click", async () => {
+      calBtn.disabled = true;
+      calBtn.textContent = "Sending...";
+      try {
+        const res = await fetch(`/calibrate/${slot.id}`, { method: "POST" });
+        if (res.ok) {
+          calibratingSlots[slot.id] = { ts: new Date().toISOString() };
+          calBtn.textContent = "Calibrating...";
+          refreshLayout();
+        } else {
+          const err = await res.json().catch(() => ({}));
+          calBtn.textContent = err.detail || "Failed";
+          setTimeout(() => { calBtn.textContent = "Recalibrate"; calBtn.disabled = false; }, 3000);
+        }
+      } catch {
+        calBtn.textContent = "Error";
+        setTimeout(() => { calBtn.textContent = "Recalibrate"; calBtn.disabled = false; }, 3000);
+      }
+    });
+  }
+
+  // Close on outside click
+  setTimeout(() => {
+    document.addEventListener("click", _popoverOutsideClick);
+  }, 0);
+}
+
+function _popoverOutsideClick(e) {
+  const popover = document.getElementById("slotPopover");
+  if (popover && !popover.contains(e.target)) {
+    hideSlotPopover();
+  }
+}
+
+function hideSlotPopover() {
+  const existing = document.getElementById("slotPopover");
+  if (existing) existing.remove();
+  document.removeEventListener("click", _popoverOutsideClick);
+}
+
+// ── Zone-level + Bulk Calibrate ─────────────────────────────────────────────
+
+async function calibrateZone(zoneKey, btnEl) {
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "Calibrating...";
+  }
+  try {
+    const res = await fetch("/calibrate/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ zone: zoneKey }),
+    });
+    const data = await res.json();
+    if (btnEl) {
+      btnEl.textContent = `Calibrating ${data.sent || 0} slots...`;
+      setTimeout(() => {
+        btnEl.textContent = "Calibrate Zone";
+        btnEl.disabled = false;
+      }, 5000);
+    }
+  } catch {
+    if (btnEl) {
+      btnEl.textContent = "Failed";
+      setTimeout(() => {
+        btnEl.textContent = "Calibrate Zone";
+        btnEl.disabled = false;
+      }, 3000);
+    }
+  }
+}
+
+async function calibrateAll() {
+  const btn = document.getElementById("calibrateAllBtn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Calibrating...";
+  }
+  try {
+    const res = await fetch("/calibrate/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (btn) {
+      btn.textContent = `Calibrating ${data.sent || 0} slots...`;
+      setTimeout(() => {
+        btn.textContent = "Calibrate All";
+        btn.disabled = false;
+      }, 5000);
+    }
+  } catch {
+    if (btn) {
+      btn.textContent = "Failed";
+      setTimeout(() => {
+        btn.textContent = "Calibrate All";
+        btn.disabled = false;
+      }, 3000);
+    }
+  }
+}
+
+// ── KPIs + Layout ───────────────────────────────────────────────────────────
 
 function updateKPIs() {
   const zones = computeZoneStats();
@@ -843,12 +1130,45 @@ async function init() {
   sensorLastseen = data.sensor_lastseen || {};
   sensorAlerts = data.sensor_alerts || {};
 
-  if (slots.length > 200) {
-    const zoneKeys = new Set(slots.map(s => s.zone || "A"));
-    for (const z of zoneKeys) collapsedZones.add(z);
+  // Load calibrating state from server
+  const serverCalibrating = data.calibrating || {};
+  for (const [sid, val] of Object.entries(serverCalibrating)) {
+    calibratingSlots[Number(sid)] = val;
   }
 
+  // Always start collapsed
+  const zoneKeys = new Set(slots.map(s => s.zone || "A"));
+  for (const z of zoneKeys) collapsedZones.add(z);
+
   refreshLayout();
+
+  // Wire up search input
+  const searchInput = document.getElementById("slotSearch");
+  if (searchInput) {
+    searchInput.addEventListener("input", (e) => {
+      searchQuery = e.target.value.trim();
+      zonePages = {}; // reset pagination on search
+      refreshLayout();
+    });
+  }
+
+  // Wire up calibrate-all button
+  const calAllBtn = document.getElementById("calibrateAllBtn");
+  if (calAllBtn) {
+    calAllBtn.addEventListener("click", calibrateAll);
+  }
+
+  // Load initial change log
+  try {
+    const scRes = await fetch("/state-changes?limit=20");
+    const scData = await scRes.json();
+    const changes = scData.changes || [];
+    for (let i = changes.length - 1; i >= 0; i--) {
+      prependLog(changes[i]);
+    }
+  } catch (err) {
+    console.error("Failed to load initial change log:", err);
+  }
 
   const es = new EventSource("/events");
   es.onmessage = (msg) => {
@@ -904,6 +1224,29 @@ async function init() {
         if (!isNaN(alertId) && sensorAlerts[alertId]) {
           delete sensorAlerts[alertId];
         }
+      }
+
+      // Calibration events
+      if (obj.event === "calibration_started") {
+        const id = parseSlotId(obj);
+        if (!isNaN(id)) {
+          calibratingSlots[id] = { ts: obj.ts };
+        }
+        refreshLayout();
+        prependLog(obj);
+      }
+
+      if (obj.event === "calibration_done") {
+        const id = parseSlotId(obj);
+        if (!isNaN(id)) {
+          delete calibratingSlots[id];
+        }
+        refreshLayout();
+        prependLog(obj);
+      }
+
+      if (obj.event === "bulk_calibration_started") {
+        prependLog(obj);
       }
     } catch (e) {
       // ignore parse errors

@@ -13,9 +13,12 @@ import os
 import paho.mqtt.client as mqtt
 import redis
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Query, Request, Response
+import base64
+
+from fastapi import FastAPI, Query, Request, Response, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from webapp.helpers.data_io import load_yaml
 from webapp.helpers.slot_meta import (
@@ -160,9 +163,20 @@ def on_mqtt_message(client, userdata, msg):
     """Non-blocking: push raw ChirpStack uplink to Redis Stream for mqtt_worker."""
     try:
         payload = json.loads(msg.payload)
-
-        # Enqueue to Redis Stream (O(1), non-blocking)
         r = get_redis()
+
+        # Update device map opportunistically (needed for downlink commands)
+        device_info = payload.get("deviceInfo", {})
+        dev_eui = device_info.get("devEui")
+        app_id = device_info.get("applicationId")
+        device_name = device_info.get("deviceName", "")
+        if dev_eui and app_id and device_name:
+            meta_by_id = load_slot_meta_by_id(SLOT_META_PATH)
+            slot_id = get_slot_id_by_device_name(device_name, meta_by_id)
+            if slot_id is not None:
+                r.hset("parking:device:map", str(slot_id),
+                       json.dumps({"applicationId": app_id, "devEui": dev_eui}))
+
         r.xadd(
             "parking:mqtt:events",
             {"payload": json.dumps(payload)},
@@ -284,13 +298,15 @@ def state():
     result = build_state_from_log(slot_ids=slot_ids, meta_by_id=meta_by_id,
                                      redis_client=r)
 
-    # Augment with sensor health data
+    # Augment with sensor health + calibration data
     try:
         result["sensor_lastseen"] = _decode_redis_hash(r.hgetall("parking:sensor:lastseen"))
         result["sensor_alerts"] = _decode_redis_hash_json(r.hgetall("parking:sensor:alerts"))
+        result["calibrating"] = _decode_redis_hash_json(r.hgetall("parking:slot:calibrating"))
     except Exception:
         result["sensor_lastseen"] = {}
         result["sensor_alerts"] = {}
+        result["calibrating"] = {}
 
     with _state_cache_lock:
         _state_cache = result
@@ -367,6 +383,97 @@ def get_state_changes(
     except Exception as e:
         log.error("Error fetching state changes: %s", e)
         return {"changes": [], "total": 0, "limit": limit, "offset": offset}
+
+
+# ── Calibration ──────────────────────────────────────────────────────────────
+
+CALIBRATION_COMMAND = "CC"
+
+
+def _send_downlink(slot_id: int, data_hex: str) -> bool:
+    """Send a downlink command to a sensor via MQTT."""
+    if _mqtt_client is None:
+        return False
+    r = get_redis()
+    raw = r.hget("parking:device:map", str(slot_id))
+    if not raw:
+        return False
+    info = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    app_id = info.get("applicationId")
+    dev_eui = info.get("devEui")
+    if not (app_id and dev_eui):
+        return False
+    topic = f"application/{app_id}/device/{dev_eui}/command/down"
+    data_b64 = base64.b64encode(bytes.fromhex(data_hex)).decode("ascii")
+    payload = {"devEui": dev_eui, "confirmed": False, "fPort": 2, "data": data_b64}
+    result = _mqtt_client.publish(topic, json.dumps(payload), qos=1)
+    return result.rc == 0
+
+
+@app.post("/calibrate/{slot_id}")
+def calibrate_slot(slot_id: int):
+    if not _send_downlink(slot_id, CALIBRATION_COMMAND):
+        r = get_redis()
+        mapped = r.hexists("parking:device:map", str(slot_id))
+        if not mapped:
+            raise HTTPException(status_code=404,
+                                detail="Device not mapped yet. Wait for an uplink first.")
+        raise HTTPException(status_code=500, detail="Failed to send calibration command")
+    r = get_redis()
+    r.hset("parking:slot:calibrating", str(slot_id),
+           json.dumps({"ts": datetime.now(timezone.utc).isoformat()}))
+    r.publish("parking:events:live", json.dumps({
+        "event": "calibration_started", "slot_id": slot_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }))
+    return {"success": True, "message": f"Calibration command sent to slot {slot_id}"}
+
+
+class BulkCalibrateRequest(BaseModel):
+    slot_ids: list[int] | None = None
+    zone: str | None = None
+
+
+@app.post("/calibrate/bulk")
+def calibrate_bulk(req: BulkCalibrateRequest):
+    meta = load_slot_meta_by_id(SLOT_META_PATH)
+    if req.slot_ids:
+        target_ids = [sid for sid in req.slot_ids if sid in meta]
+    elif req.zone:
+        target_ids = [sid for sid, m in meta.items() if m.get("zone") == req.zone]
+    else:
+        target_ids = list(meta.keys())
+
+    r = get_redis()
+    sent = 0
+    failed = 0
+    unmapped = 0
+    for sid in target_ids:
+        if not r.hexists("parking:device:map", str(sid)):
+            unmapped += 1
+            continue
+        if _send_downlink(sid, CALIBRATION_COMMAND):
+            r.hset("parking:slot:calibrating", str(sid),
+                   json.dumps({"ts": datetime.now(timezone.utc).isoformat()}))
+            sent += 1
+        else:
+            failed += 1
+
+    if sent > 0:
+        r.publish("parking:events:live", json.dumps({
+            "event": "bulk_calibration_started",
+            "total": sent, "zone": req.zone or "all",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }))
+
+    return {"sent": sent, "failed": failed, "unmapped": unmapped, "total": len(target_ids)}
+
+
+@app.get("/calibrate/status")
+def calibrate_status():
+    r = get_redis()
+    calibrating = _decode_redis_hash_json(r.hgetall("parking:slot:calibrating"))
+    return {"calibrating": calibrating, "count": len(calibrating)}
 
 
 @app.get("/analytics/summary")

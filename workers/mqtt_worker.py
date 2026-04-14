@@ -154,11 +154,16 @@ def process_mqtt_message(r: redis.Redis, db_conn, message_id: bytes, fields: dic
             event_type, expected_state, new_state = "FREE", "OCCUPIED", "FREE"
         elif status == STATUS_CALIBRATION_DONE:
             log.info("Calibration Done for slot %s", slot_name)
+            r.hdel("parking:slot:calibrating", str(slot_id))
             insert_occupancy_event(
                 slot_id=slot_id, event_type="calibration", device_eui=device_eui,
                 ts=ts, payload={"slot_name": slot_name, "zone": zone}, conn=db_conn,
             )
             db_conn.commit()
+            r.publish("parking:events:live", json.dumps({
+                "event": "calibration_done", "ts": ts_str,
+                "slot_id": slot_id, "slot_name": slot_name, "zone": zone,
+            }))
             return True
         else:
             return True
